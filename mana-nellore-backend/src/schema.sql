@@ -118,7 +118,10 @@ CREATE TABLE IF NOT EXISTS orders (
   cancel_reason text,
   timeline jsonb NOT NULL DEFAULT '[]',
   placed_at timestamptz NOT NULL DEFAULT now(),
-  delivered_at timestamptz
+  delivered_at timestamptz,
+  promised_at timestamptz,
+  pickup_photo text,
+  credits_used_paise int NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_restaurant ON orders(restaurant_id);
@@ -171,7 +174,8 @@ CREATE TABLE IF NOT EXISTS coupons (
   max_discount_paise int,
   valid_from timestamptz,
   valid_to timestamptz,
-  active boolean NOT NULL DEFAULT true
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS support_tickets (
@@ -226,3 +230,15 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+
+-- Customer credit ledger (grants +, spends -). Powers the 30-minute promise
+-- auto-credit and the cold-food apology credit. All money in paise.
+CREATE TABLE IF NOT EXISTS customer_credits (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  amount_paise int NOT NULL,
+  reason text NOT NULL,
+  order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_credits_user ON customer_credits(user_id);

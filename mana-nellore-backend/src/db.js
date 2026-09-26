@@ -15,8 +15,21 @@ function query(text, params) {
 async function initDb() {
   const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
   await pool.query(schema);
+  await migrate();
   await seed();
   console.log('Database ready');
+}
+
+// Idempotent column additions for tables created before these columns existed.
+async function migrate() {
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS promised_at timestamptz');
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_photo text');
+  await pool.query(
+    'ALTER TABLE orders ADD COLUMN IF NOT EXISTS credits_used_paise int NOT NULL DEFAULT 0'
+  );
+  await pool.query(
+    'ALTER TABLE coupons ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now()'
+  );
 }
 
 // Default pricing rules (paise). Admin can edit these live via /api/admin/pricing.
@@ -46,7 +59,9 @@ function defaultPricingRows() {
         { min_order_paise: 89900, max_distance_km: 5 },   // Rs 899+ up to 5 km
         { min_order_paise: 129900, max_distance_km: 8 }   // Rs 1299+ up to 8 km
       ]
-    }
+    },
+    promise_minutes: 30,          // 30-minute delivery promise shown to customers
+    apology_credit_paise: 5000    // Rs 50 auto-credit for a validated cold-food report
   };
 }
 
