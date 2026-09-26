@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Mana Nellore Ops — Admin Console</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- ============ LOGIN ============ -->
+  <div id="login-view" class="login-view">
+    <div class="login-card">
+      <div class="login-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/><path d="M10 20v-6h4v6"/>
+        </svg>
+      </div>
+      <h1>Mana Nellore Ops</h1>
+      <p class="login-sub">Admin / Operations Console</p>
+      <form id="login-form" autocomplete="off">
+        <label class="field">
+          <span>Phone</span>
+          <input id="login-phone" inputmode="numeric" placeholder="9000000001" required />
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="login-password" type="password" placeholder="••••••••" required />
+        </label>
+        <p class="login-hint">Seeded admin phone: <strong>9000000001</strong><br />Password was set during backend deploy.</p>
+        <p id="login-error" class="form-error" hidden></p>
+        <button type="submit" class="btn btn-primary btn-block" id="login-btn">Sign in</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ APP ============ -->
+  <div id="app-view" class="app hidden">
+    <aside id="sidebar" class="sidebar" aria-label="Admin navigation">
+      <div class="sidebar-brand">
+        <span class="brand-mark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/><path d="M10 20v-6h4v6"/>
+          </svg>
+        </span>
+        <span class="brand-text">Mana Nellore <em>Ops</em></span>
+      </div>
+      <nav id="nav" class="nav"></nav>
+      <div class="sidebar-foot">
+        <div class="api-note">API · mana-nellore.up.railway.app</div>
+        <button id="logout-btn" class="btn btn-ghost btn-block">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>
+          Sign out
+        </button>
+      </div>
+    </aside>
+    <div id="sidebar-scrim" class="scrim hidden"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button id="menu-btn" class="icon-btn" aria-label="Open navigation">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <h2 id="screen-title">Dashboard</h2>
+        <div class="topbar-right"><span id="admin-name" class="admin-name"></span></div>
+      </header>
+      <section id="screen" class="screen" aria-live="polite"></section>
+    </main>
+  </div>
+
+  <!-- ============ DRAWER ============ -->
+  <div id="drawer-scrim" class="scrim hidden"></div>
+  <aside id="drawer" class="drawer hidden" aria-label="Details panel"></aside>
+
+  <!-- ============ TOAST ============ -->
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
