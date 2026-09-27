@@ -6,6 +6,9 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  max: 25,                    // headroom for 1000+ concurrent app users polling
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 });
 
 function query(text, params) {
@@ -20,20 +23,109 @@ async function initDb() {
   console.log('Database ready');
 }
 
-// Idempotent column additions for tables created before these columns existed.
+// Idempotent migrations for databases created before these columns existed.
 async function migrate() {
-  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS promised_at timestamptz');
-  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_photo text');
-  await pool.query(
-    'ALTER TABLE orders ADD COLUMN IF NOT EXISTS credits_used_paise int NOT NULL DEFAULT 0'
-  );
-  await pool.query(
-    'ALTER TABLE coupons ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now()'
-  );
-  // Rider KYC documents (first-time registration)
-  await pool.query('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_no text');
-  await pool.query('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_photo text');
-  await pool.query('ALTER TABLE riders ADD COLUMN IF NOT EXISTS profile_photo text');
+  const q = (t) => pool.query(t);
+
+  // Role-splitting: one phone -> separate profile per role.
+  await q(`DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_phone_key') THEN
+      ALTER TABLE users DROP CONSTRAINT users_phone_key;
+    END IF;
+  END $$`);
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_phone_role_key') THEN
+      ALTER TABLE users ADD CONSTRAINT users_phone_role_key UNIQUE (phone, role);
+    END IF;
+  END $$`);
+  await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS dob date');
+  await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_student boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code text');
+  await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by uuid');
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_referred_by_fkey') THEN
+      ALTER TABLE users ADD CONSTRAINT users_referred_by_fkey
+        FOREIGN KEY (referred_by) REFERENCES users(id) ON DELETE SET NULL;
+    END IF;
+  END $$`);
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_referral_code_key') THEN
+      ALTER TABLE users ADD CONSTRAINT users_referral_code_key UNIQUE (referral_code);
+    END IF;
+  END $$`);
+
+  // Restaurants: verified badge, chef profile, GST, birthday dessert
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS verified boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS chef_name text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS chef_photo text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS chef_story text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS gstin text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS birthday_dessert boolean NOT NULL DEFAULT false');
+
+  // Menu items: meal slots, combos, allergens
+  await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS meal_slot text NOT NULL DEFAULT 'all'");
+  await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS is_combo boolean NOT NULL DEFAULT false');
+  await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS allergens jsonb NOT NULL DEFAULT '[]'");
+
+  // Orders: new lifecycle fields
+  await q(`DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'orders' AND column_name = 'promised_at')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'orders' AND column_name = 'eta_at') THEN
+      ALTER TABLE orders RENAME COLUMN promised_at TO eta_at;
+    END IF;
+  END $$`);
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS eta_at timestamptz');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_photo text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS packed_at timestamptz');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_photo text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS share_token text');
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_share_token_key') THEN
+      ALTER TABLE orders ADD CONSTRAINT orders_share_token_key UNIQUE (share_token);
+    END IF;
+  END $$`);
+  await q("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_type text NOT NULL DEFAULT 'delivery'");
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS table_id uuid');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_note text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS no_cutlery boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS tip_paise int NOT NULL DEFAULT 0');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_name text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_phone text');
+  // COD 'collected' status
+  await q('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_status_check');
+  await q(`ALTER TABLE orders ADD CONSTRAINT orders_payment_status_check
+    CHECK (payment_status IN ('pending','paid','failed','refunded','collected'))`);
+  // Remove wallet/credit remnants
+  await q('ALTER TABLE orders DROP COLUMN IF EXISTS credits_used_paise');
+  await q('DROP TABLE IF EXISTS customer_credits');
+
+  // Quest bonuses survive quest deletion
+  await q('ALTER TABLE rider_bonuses DROP CONSTRAINT IF EXISTS rider_bonuses_quest_id_fkey');
+  await q('ALTER TABLE rider_bonuses ALTER COLUMN quest_id DROP NOT NULL');
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'rider_bonuses_quest_id_fkey') THEN
+      ALTER TABLE rider_bonuses ADD CONSTRAINT rider_bonuses_quest_id_fkey
+        FOREIGN KEY (quest_id) REFERENCES quests(id) ON DELETE SET NULL;
+    END IF;
+  END $$`);
+
+  // Support tickets: resolution notes + photo attachments
+  await q('ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS resolution_note text');
+  await q('ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS photo_url text');
+
+  // Audit log: per-session staff name
+  await q('ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS staff_name text');
+
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_no text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_photo text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS profile_photo text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS cancelled_deliveries int NOT NULL DEFAULT 0');
+  await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now()');
+  await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS requires_student boolean NOT NULL DEFAULT false');
+
+  // Backfill share tokens for old orders
+  await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
+           WHERE share_token IS NULL`);
 }
 
 // Default pricing rules (paise). Admin can edit these live via /api/admin/pricing.
@@ -64,8 +156,8 @@ function defaultPricingRows() {
         { min_order_paise: 129900, max_distance_km: 8 }   // Rs 1299+ up to 8 km
       ]
     },
-    promise_minutes: 30,          // 30-minute delivery promise shown to customers
-    apology_credit_paise: 5000    // Rs 50 auto-credit for a validated cold-food report
+    eta_minutes: 30,              // Honest ETA estimate shown to customers (not a guarantee)
+    call_to_order_phone: ''       // support / phone-order line shown in the customer app
   };
 }
 
@@ -77,8 +169,8 @@ async function seed() {
     await pool.query(
       `INSERT INTO users (phone, name, role, password_hash)
        VALUES ($1, 'Admin', 'admin', $2)
-       ON CONFLICT (phone) DO UPDATE
-         SET role = 'admin', password_hash = EXCLUDED.password_hash`,
+       ON CONFLICT (phone, role) DO UPDATE
+         SET password_hash = EXCLUDED.password_hash`,
       [adminPhone, hash]
     );
   } else {
@@ -93,12 +185,9 @@ async function seed() {
     );
   }
 
-  // Seed a default delivery zone so the promise-time feature works out of the box.
-  await pool.query(
-    `INSERT INTO zones (name, promise_minutes, is_default)
-     SELECT 'Nellore City', 30, true
-     WHERE NOT EXISTS (SELECT 1 FROM zones)`
-  );
+  // Retire the promise-time delivery zones (feature removed); keep nothing reading them.
+  await pool.query('DROP TABLE IF EXISTS zones');
+  await pool.query(`UPDATE pricing_config SET key = 'eta_minutes' WHERE key = 'promise_minutes'`);
 }
 
 module.exports = { pool, query, initDb };

@@ -3,16 +3,23 @@
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- Users across all four apps (role decides which portal they can use)
+-- Users across all four apps. One phone number gets a SEPARATE profile per
+-- role (portal) — a customer profile and a rider profile on the same phone
+-- are two different users rows.
 CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  phone text UNIQUE NOT NULL,
+  phone text NOT NULL,
   name text,
   role text NOT NULL CHECK (role IN ('customer','restaurant_owner','rider','admin')),
   password_hash text,
   lat double precision,
   lng double precision,
-  created_at timestamptz NOT NULL DEFAULT now()
+  dob date,
+  is_student boolean NOT NULL DEFAULT false,
+  referral_code text UNIQUE,
+  referred_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (phone, role)
 );
 ALTER TABLE users ADD COLUMN IF NOT EXISTS lat double precision;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS lng double precision;
@@ -46,6 +53,12 @@ CREATE TABLE IF NOT EXISTS restaurants (
   closes_at time,
   commission_pct numeric NOT NULL DEFAULT 12,
   rating_avg numeric NOT NULL DEFAULT 0,
+  verified boolean NOT NULL DEFAULT false,
+  chef_name text,
+  chef_photo text,
+  chef_story text,
+  gstin text,
+  birthday_dessert boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -67,7 +80,11 @@ CREATE TABLE IF NOT EXISTS menu_items (
   veg boolean NOT NULL DEFAULT false,
   available boolean NOT NULL DEFAULT true,
   prep_minutes int NOT NULL DEFAULT 20,
-  sort_order int NOT NULL DEFAULT 0
+  sort_order int NOT NULL DEFAULT 0,
+  meal_slot text NOT NULL DEFAULT 'all'
+    CHECK (meal_slot IN ('all','breakfast','lunch','dinner')),
+  is_combo boolean NOT NULL DEFAULT false,
+  allergens jsonb NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_menu_restaurant ON menu_items(restaurant_id);
 
@@ -99,6 +116,7 @@ CREATE TABLE IF NOT EXISTS riders (
   lat double precision,
   lng double precision,
   rating_avg numeric NOT NULL DEFAULT 0,
+  cancelled_deliveries int NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -120,15 +138,25 @@ CREATE TABLE IF NOT EXISTS orders (
   total_paise int NOT NULL,
   payment_method text,
   payment_status text NOT NULL DEFAULT 'pending'
-    CHECK (payment_status IN ('pending','paid','failed','refunded')),
+    CHECK (payment_status IN ('pending','paid','failed','refunded','collected')),
   delivery_otp_hash text,
   cancel_reason text,
   timeline jsonb NOT NULL DEFAULT '[]',
   placed_at timestamptz NOT NULL DEFAULT now(),
   delivered_at timestamptz,
-  promised_at timestamptz,
+  eta_at timestamptz,
+  packed_at timestamptz,
   pickup_photo text,
-  credits_used_paise int NOT NULL DEFAULT 0
+  delivery_photo text,
+  share_token text UNIQUE,
+  order_type text NOT NULL DEFAULT 'delivery'
+    CHECK (order_type IN ('delivery','dinein')),
+  table_id uuid,
+  delivery_note text,
+  no_cutlery boolean NOT NULL DEFAULT false,
+  tip_paise int NOT NULL DEFAULT 0,
+  recipient_name text,
+  recipient_phone text
 );
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_restaurant ON orders(restaurant_id);
@@ -182,6 +210,7 @@ CREATE TABLE IF NOT EXISTS coupons (
   valid_from timestamptz,
   valid_to timestamptz,
   active boolean NOT NULL DEFAULT true,
+  requires_student boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -194,6 +223,8 @@ CREATE TABLE IF NOT EXISTS support_tickets (
   message text,
   status text NOT NULL DEFAULT 'open'
     CHECK (status IN ('open','in_progress','resolved','closed')),
+  resolution_note text,
+  photo_url text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_user ON support_tickets(user_id);
@@ -217,100 +248,6 @@ CREATE TABLE IF NOT EXISTS pricing_config (
   value jsonb NOT NULL
 );
 
--- Delivery zones: each zone has its own delivery-promise time (minutes).
--- The zone flagged is_default is used when no Maps-based zone matching is
--- available. At least one zone must exist; seed a default on first boot.
-CREATE TABLE IF NOT EXISTS zones (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  name text NOT NULL,
-  promise_minutes int NOT NULL DEFAULT 30 CHECK (promise_minutes > 0),
-  is_default boolean NOT NULL DEFAULT false,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS audit_logs (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  admin_id uuid REFERENCES users(id) ON DELETE SET NULL,
-  action text NOT NULL,
-  entity text,
-  entity_id text,
-  meta jsonb,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
-
-CREATE TABLE IF NOT EXISTS notifications (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title text NOT NULL,
-  body text,
-  read boolean NOT NULL DEFAULT false,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
-
--- Customer credit ledger (grants +, spends -). Powers the 30-minute promise
--- auto-credit and the cold-food apology credit. All money in paise.
-CREATE TABLE IF NOT EXISTS customer_credits (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  amount_paise int NOT NULL,
-  reason text NOT NULL,
-  order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_credits_user ON customer_credits(user_id);
-
--- Item customizations (e.g. "Spice Level": Mild/Medium/Spicy, "Add-ons": Extra Cheese +₹30)
-CREATE TABLE IF NOT EXISTS customization_groups (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  menu_item_id uuid NOT NULL REFERENCES menu_items(id) ON DELETE CASCADE,
-  name text NOT NULL,
-  required boolean NOT NULL DEFAULT false,
-  max_select int NOT NULL DEFAULT 1,
-  sort int NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS customization_options (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  group_id uuid NOT NULL REFERENCES customization_groups(id) ON DELETE CASCADE,
-  name text NOT NULL,
-  price_paise int NOT NULL DEFAULT 0,
-  sort int NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_cust_groups_item ON customization_groups(menu_item_id);
-CREATE INDEX IF NOT EXISTS idx_cust_opts_group ON customization_options(group_id);
-
--- Fingerprint (WebAuthn) credentials for rider login
-CREATE TABLE IF NOT EXISTS webauthn_credentials (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  credential_id text NOT NULL UNIQUE,
-  public_key text NOT NULL,
-  counter bigint NOT NULL DEFAULT 0,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_webauthn_user ON webauthn_credentials(user_id);
-
--- Single-use WebAuthn challenges (5-minute expiry)
-CREATE TABLE IF NOT EXISTS webauthn_challenges (
-  challenge text PRIMARY KEY,
-  user_id uuid REFERENCES users(id) ON DELETE CASCADE,
-  kind text NOT NULL,
-  expires_at timestamptz NOT NULL
-);
-
--- Rider SOS alerts (one-tap emergency with live location)
-CREATE TABLE IF NOT EXISTS sos_alerts (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  rider_id uuid NOT NULL REFERENCES riders(id) ON DELETE CASCADE,
-  lat numeric,
-  lng numeric,
-  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','acknowledged','resolved')),
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_sos_status ON sos_alerts(status);
-CREATE INDEX IF NOT EXISTS idx_sos_rider ON sos_alerts(rider_id);
-
 -- Rider quests/incentives configured by admin
 CREATE TABLE IF NOT EXISTS quests (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -323,11 +260,12 @@ CREATE TABLE IF NOT EXISTS quests (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- Quest bonuses awarded to riders (one per rider per quest)
+-- Quest bonuses awarded to riders (one per rider per quest).
+-- quest_id is SET NULL (not CASCADE) on quest delete so earned bonuses survive.
 CREATE TABLE IF NOT EXISTS rider_bonuses (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   rider_id uuid NOT NULL REFERENCES riders(id) ON DELETE CASCADE,
-  quest_id uuid NOT NULL REFERENCES quests(id) ON DELETE CASCADE,
+  quest_id uuid REFERENCES quests(id) ON DELETE SET NULL,
   amount_paise int NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (rider_id, quest_id)
@@ -336,3 +274,98 @@ CREATE INDEX IF NOT EXISTS idx_bonuses_rider ON rider_bonuses(rider_id);
 
 -- Customer food-photo reviews
 ALTER TABLE ratings ADD COLUMN IF NOT EXISTS photo_url text;
+
+-- Restaurant onboarding applications (in-app apply -> admin approval -> activation)
+CREATE TABLE IF NOT EXISTS restaurant_applications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  restaurant_name text NOT NULL,
+  owner_name text NOT NULL,
+  phone text NOT NULL,
+  address text,
+  lat double precision,
+  lng double precision,
+  fssai text,
+  photo_url text NOT NULL,
+  status text NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','approved','rejected')),
+  admin_note text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_applications_status ON restaurant_applications(status);
+
+-- "Call me back" support requests
+CREATE TABLE IF NOT EXISTS callback_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  phone text,
+  order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
+  reason text,
+  status text NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open','done')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_callbacks_status ON callback_requests(status);
+
+-- "Notify me when open" alerts
+CREATE TABLE IF NOT EXISTS restaurant_open_alerts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  restaurant_id uuid NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (user_id, restaurant_id)
+);
+
+-- Curated collections (Taste of Nellore, festival specials, ...)
+CREATE TABLE IF NOT EXISTS collections (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  description text,
+  image_url text,
+  active boolean NOT NULL DEFAULT true,
+  sort_order int NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS collection_restaurants (
+  collection_id uuid NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+  restaurant_id uuid NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  PRIMARY KEY (collection_id, restaurant_id)
+);
+
+-- Dine-in tables (QR ordering)
+CREATE TABLE IF NOT EXISTS tables (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  restaurant_id uuid NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  label text NOT NULL,
+  qr_token text UNIQUE NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tables_restaurant ON tables(restaurant_id);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_table_id_fkey') THEN
+    ALTER TABLE orders ADD CONSTRAINT orders_table_id_fkey
+      FOREIGN KEY (table_id) REFERENCES tables(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- Rider COD cash ledger (cash collected at the door, pending settlement)
+CREATE TABLE IF NOT EXISTS rider_cod_ledger (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  rider_id uuid NOT NULL REFERENCES riders(id) ON DELETE CASCADE,
+  order_id uuid UNIQUE NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  amount_paise int NOT NULL,
+  settled boolean NOT NULL DEFAULT false,
+  settled_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cod_rider ON rider_cod_ledger(rider_id);
+
+-- Student discount applications (college ID -> admin approval -> is_student)
+CREATE TABLE IF NOT EXISTS student_applications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id_photo text NOT NULL,
+  college text,
+  status text NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','approved','rejected')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);

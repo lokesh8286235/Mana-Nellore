@@ -203,39 +203,53 @@ async function deliveryDetail(orderId, riderId) {
   return { ...order, items: items.rows };
 }
 
-// GET /api/rider/deliveries/available — ready orders with no rider yet
+// GET /api/rider/deliveries/available — ready orders with no rider yet.
+// Sorted nearest-first by rider-to-restaurant distance when the rider's
+// location is known (proximity dispatch); oldest first as fallback.
 router.get(
   '/deliveries/available',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
     const { rows } = await db.query(
-      `SELECT o.id, o.total_paise, o.placed_at,
+      `SELECT o.id, o.total_paise, o.placed_at, o.payment_method,
               r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
               a.line1, a.city, a.lat AS addr_lat, a.lng AS addr_lng
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
        LEFT JOIN addresses a ON a.id = o.address_id
        WHERE o.status = 'ready' AND o.rider_id IS NULL
+         AND o.order_type = 'delivery'
        ORDER BY o.placed_at ASC LIMIT 20`
     );
     const config = await loadPricingConfig(db);
     const list = rows.map((o) => {
       let distanceKm = null;
       let payout = null;
+      let pickupKm = null;
       if (o.rest_lat != null && o.rest_lng != null && o.addr_lat != null && o.addr_lng != null) {
         distanceKm = haversineKm(o.rest_lat, o.rest_lng, o.addr_lat, o.addr_lng);
         payout = riderPayoutPaise(config.riderPayout, distanceKm);
+      }
+      // Rider-to-restaurant distance drives nearest-first sorting
+      if (rider.lat != null && rider.lng != null && o.rest_lat != null && o.rest_lng != null) {
+        pickupKm = haversineKm(Number(rider.lat), Number(rider.lng), Number(o.rest_lat), Number(o.rest_lng));
       }
       return {
         id: o.id,
         total_paise: o.total_paise,
         placed_at: o.placed_at,
+        payment_method: o.payment_method,
         restaurant_name: o.restaurant_name,
         address: [o.line1, o.city].filter(Boolean).join(', '),
         distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
+        pickup_km: pickupKm == null ? null : Math.round(pickupKm * 10) / 10,
         payout_paise: payout
       };
+    });
+    list.sort((a, b) => {
+      if (a.pickup_km != null && b.pickup_km != null) return a.pickup_km - b.pickup_km;
+      return new Date(a.placed_at) - new Date(b.placed_at);
     });
     res.json({ deliveries: list });
   })
@@ -305,6 +319,41 @@ router.post(
       JSON.stringify(timeline), order.id
     ]);
     await notify(order.customer_id, 'Rider assigned', 'Your rider is on the way to the restaurant.');
+    res.json({ ok: true });
+  })
+);
+
+// POST /api/rider/deliveries/:id/cancel { reason? } — rider releases the delivery.
+// Only before pickup: the order returns to the available pool for another rider.
+router.post(
+  '/deliveries/:id/cancel',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const { rows } = await db.query(
+      'SELECT * FROM orders WHERE id = $1 AND rider_id = $2',
+      [req.params.id, rider.id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ error: 'Delivery not found' });
+    if (!['ready'].includes(order.status)) {
+      return res.status(409).json({ error: 'Too late to cancel — the food is already picked up' });
+    }
+    const timeline = order.timeline || [];
+    timeline.push({
+      status: 'rider_cancelled', at: new Date().toISOString(), by: 'rider',
+      reason: req.body.reason || 'Rider cancelled'
+    });
+    await db.query(
+      'UPDATE orders SET rider_id = NULL, timeline = $1::jsonb WHERE id = $2',
+      [JSON.stringify(timeline), order.id]
+    );
+    await db.query(
+      'UPDATE riders SET cancelled_deliveries = COALESCE(cancelled_deliveries, 0) + 1 WHERE id = $1',
+      [rider.id]
+    );
+    await notify(order.customer_id, 'Finding you another rider 🛵',
+      'Your rider had to step away — we\u2019re assigning a new one right now.');
     res.json({ ok: true });
   })
 );
@@ -416,29 +465,60 @@ router.post(
       [rider.id, order.id, payout, distanceKm]
     );
     await transition(order.id, 'delivered', 'rider');
+
+    // COD: rider must explicitly confirm the exact cash amount collected.
     const cod = order.payment_method === 'cod' && order.payment_status === 'pending';
+    let paymentStatus = order.payment_status;
+    if (cod) {
+      const cashConfirmed = req.body.cash_confirmed === true;
+      const cashPaise = Math.round(Number(req.body.cash_amount_paise) || 0);
+      if (!cashConfirmed || cashPaise !== Number(order.total_paise)) {
+        return res.status(400).json({
+          error: `Please confirm you collected exactly Rs ${(order.total_paise / 100).toFixed(2)} in cash`
+        });
+      }
+      paymentStatus = 'collected';
+      await db.query(
+        `INSERT INTO rider_cod_ledger (rider_id, order_id, amount_paise)
+         VALUES ($1, $2, $3) ON CONFLICT (order_id) DO NOTHING`,
+        [rider.id, order.id, cashPaise]
+      );
+    }
+    const deliveryPhoto = req.body.delivery_photo || null;
     await db.query(
-      "UPDATE orders SET delivered_at = now(), payment_status = $1 WHERE id = $2",
-      [cod ? 'paid' : order.payment_status, order.id]
+      'UPDATE orders SET delivered_at = now(), payment_status = $1, delivery_photo = COALESCE($2, delivery_photo) WHERE id = $3',
+      [paymentStatus, deliveryPhoto, order.id]
     );
 
-    // 30-minute promise: late delivery auto-credits the delivery fee.
-    let lateCreditPaise = 0;
-    if (order.promised_at && new Date() > new Date(order.promised_at) && order.delivery_fee_paise > 0) {
-      lateCreditPaise = order.delivery_fee_paise;
-      await db.query(
-        `INSERT INTO customer_credits (user_id, amount_paise, reason, order_id)
-         VALUES ($1,$2,'late_delivery',$3)`,
-        [order.customer_id, lateCreditPaise, order.id]
-      );
-      await notify(order.customer_id, 'Late delivery — fee credited',
-        `Your order arrived after the promised time. Rs ${(lateCreditPaise / 100).toFixed(0)} has been credited to your account.`);
-    }
-
-    await notify(order.customer_id, 'Order delivered',
-      `Enjoy your meal! Please rate your experience.`);
+    await notify(order.customer_id, 'Delivered! 🍽️',
+      'Wash your hands — your food is here! Enjoy every bite. Loved it? Tap to rate ⭐');
     await checkQuests(rider.id);
-    res.json({ ok: true, status: 'delivered', payout_paise: payout, late_credit_paise: lateCreditPaise });
+    res.json({ ok: true, status: 'delivered', payout_paise: payout });
+  })
+);
+
+// GET /api/rider/cod-balance — cash in hand vs earnings vs amount owed
+router.get(
+  '/cod-balance',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const cash = await db.query(
+      `SELECT COALESCE(SUM(amount_paise), 0) AS s FROM rider_cod_ledger
+       WHERE rider_id = $1 AND settled = false`, [rider.id]
+    );
+    const earn = await db.query(
+      `SELECT COALESCE(SUM(amount_paise), 0) AS s FROM rider_payouts
+       WHERE rider_id = $1 AND status = 'pending'`, [rider.id]
+    );
+    const cashInHand = Number(cash.rows[0].s);
+    const pendingEarnings = Number(earn.rows[0].s);
+    res.json({
+      cash_in_hand_paise: cashInHand,
+      pending_earnings_paise: pendingEarnings,
+      // What the rider owes the company: cash collected minus their earnings
+      owes_company_paise: cashInHand - pendingEarnings
+    });
   })
 );
 

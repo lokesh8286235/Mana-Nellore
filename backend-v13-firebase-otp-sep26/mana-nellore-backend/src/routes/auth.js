@@ -23,23 +23,32 @@ function normalizePhone(input) {
 }
 
 // Shared find-or-create used by both OTP verification and Firebase login.
+async function makeReferralCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let code = 'MN';
+    for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    const chk = await db.query('SELECT 1 FROM users WHERE referral_code = $1', [code]);
+    if (!chk.rows[0]) return code;
+  }
+  return 'MN' + Date.now().toString(36).toUpperCase();
+}
+
+// One phone number gets a SEPARATE user profile per role (portal).
+// Logging into a different portal creates (or reuses) that portal's profile
+// and never changes an existing profile's role.
 async function findOrCreateUserByPhone(phone, role, name) {
-  let userRes = await db.query('SELECT * FROM users WHERE phone = $1', [phone]);
+  let userRes = await db.query(
+    'SELECT * FROM users WHERE phone = $1 AND role = $2',
+    [phone, role]
+  );
   let user = userRes.rows[0];
   if (!user) {
     const created = await db.query(
-      'INSERT INTO users (phone, name, role) VALUES ($1, $2, $3) RETURNING *',
-      [phone, name || null, role]
+      'INSERT INTO users (phone, name, role, referral_code) VALUES ($1, $2, $3, $4) RETURNING *',
+      [phone, name || null, role, await makeReferralCode()]
     );
     user = created.rows[0];
-    if (role === 'rider') {
-      await db.query('INSERT INTO riders (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [user.id]);
-    }
-  } else if (role && user.role !== role) {
-    // User is logging in as a different role — switch their active role.
-    // (Same phone can act as customer, rider, or restaurant owner.)
-    await db.query('UPDATE users SET role = $1 WHERE id = $2', [role, user.id]);
-    user.role = role;
     if (role === 'rider') {
       await db.query('INSERT INTO riders (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [user.id]);
     }
@@ -115,7 +124,6 @@ router.post(
       const { rows } = await db.query('SELECT name FROM users WHERE phone = $1', [phone]);
       return res.json({ ok: true, dev_code: code, existing_name: rows[0]?.name || null });
     }
-    console.log(`[OTP] ${phone}: ${code}`);
     const { rows } = await db.query('SELECT name FROM users WHERE phone = $1', [phone]);
     res.json({ ok: true, message: 'OTP sent', existing_name: rows[0]?.name || null });
   })
@@ -336,11 +344,12 @@ router.post(
   '/fingerprint/enrolled',
   ah(async (req, res) => {
     const phone = normalizePhone(req.body.phone);
+    const role = (req.body && req.body.role) || 'customer';
     if (!phone) return res.json({ enrolled: false });
     const { rows } = await db.query(
       `SELECT 1 FROM webauthn_credentials wc JOIN users u ON u.id = wc.user_id
-       WHERE u.phone = $1 LIMIT 1`,
-      [phone]
+       WHERE u.phone = $1 AND u.role = $2 LIMIT 1`,
+      [phone, role]
     );
     res.json({ enrolled: rows.length > 0 });
   })
@@ -352,8 +361,9 @@ router.post(
   ah(async (req, res) => {
     const rp = webAuthnRp(req);
     const phone = normalizePhone(req.body.phone);
+    const role = (req.body && req.body.role) || 'customer';
     if (!phone) return res.status(400).json({ error: 'Enter a valid 10-digit mobile number' });
-    const { rows: users } = await db.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    const { rows: users } = await db.query('SELECT id FROM users WHERE phone = $1 AND role = $2', [phone, role]);
     const user = users[0];
     if (!user) return res.status(404).json({ error: 'No account found for this number' });
     const { rows: creds } = await db.query(
@@ -380,7 +390,8 @@ router.post(
     const phone = normalizePhone(req.body && req.body.phone);
     const assertion = req.body && req.body.assertion;
     if (!phone || !assertion) return res.status(400).json({ error: 'Missing login data' });
-    const { rows: users } = await db.query('SELECT * FROM users WHERE phone = $1', [phone]);
+    const role = (req.body && req.body.role) || 'customer';
+    const { rows: users } = await db.query('SELECT * FROM users WHERE phone = $1 AND role = $2', [phone, role]);
     const user = users[0];
     if (!user) return res.status(404).json({ error: 'No account found for this number' });
     const { rows: chalRows } = await db.query(

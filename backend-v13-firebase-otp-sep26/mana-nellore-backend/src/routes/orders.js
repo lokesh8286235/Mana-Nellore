@@ -28,15 +28,19 @@ function newDeliveryOtp() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
-// POST /api/orders/quote { restaurant_id, address_id, items:[{menu_item_id, qty}], coupon_code?, use_credits? }
+// POST /api/orders/quote { restaurant_id, address_id?, items, coupon_code?, order_type?, table_id?, tip_paise? }
 // Read-only bill preview: returns the exact fee breakdown the customer will
 // pay, computed with the same pricing engine as order placement. No order created.
 router.post(
   '/quote',
   ah(async (req, res) => {
-    const { restaurant_id, address_id, items, coupon_code, use_credits } = req.body;
-    if (!restaurant_id || !address_id || !Array.isArray(items) || !items.length) {
-      return res.status(400).json({ error: 'restaurant_id, address_id and items are required' });
+    const { restaurant_id, address_id, items, coupon_code, order_type, table_id, tip_paise } = req.body;
+    const dineIn = order_type === 'dinein';
+    if (!restaurant_id || !Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: 'restaurant_id and items are required' });
+    }
+    if (!dineIn && !address_id) {
+      return res.status(400).json({ error: 'address_id is required for delivery orders' });
     }
     const rRes = await db.query(
       "SELECT id, lat, lng, commission_pct FROM restaurants WHERE id = $1 AND status = 'approved'",
@@ -45,12 +49,20 @@ router.post(
     const restaurant = rRes.rows[0];
     if (!restaurant) return res.status(404).json({ error: 'Restaurant not available' });
 
-    const aRes = await db.query('SELECT lat, lng FROM addresses WHERE id = $1 AND user_id = $2', [
-      address_id,
-      req.user.id
-    ]);
-    const address = aRes.rows[0];
-    if (!address) return res.status(400).json({ error: 'Delivery address not found' });
+    let address = null;
+    if (!dineIn) {
+      const aRes = await db.query('SELECT lat, lng FROM addresses WHERE id = $1 AND user_id = $2', [
+        address_id,
+        req.user.id
+      ]);
+      address = aRes.rows[0];
+      if (!address) return res.status(400).json({ error: 'Delivery address not found' });
+    } else if (table_id) {
+      const tRes = await db.query('SELECT id FROM tables WHERE id = $1 AND restaurant_id = $2', [
+        table_id, restaurant_id
+      ]);
+      if (!tRes.rows[0]) return res.status(400).json({ error: 'Table not found for this restaurant' });
+    }
 
     const ids = items.map((i) => i.menu_item_id);
     const mRes = await db.query(
@@ -58,20 +70,16 @@ router.post(
       [ids, restaurant_id]
     );
     const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
-
     let subtotal = 0;
     for (const it of items) {
       const m = menuById[it.menu_item_id];
-      const qty = Number(it.qty);
-      if (!m || !m.available || !Number.isInteger(qty) || qty <= 0) {
-        return res.status(400).json({ error: 'Cart contains an unavailable item' });
-      }
+      if (!m || !m.available) continue;
       let custExtra = 0;
       if (Array.isArray(it.customizations) && it.customizations.length) {
         const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
         if (optIds.length) {
           const oRes = await db.query(
-            `SELECT o.price_paise FROM customization_options o
+            `SELECT o.id, o.price_paise FROM customization_options o
              JOIN customization_groups g ON g.id = o.group_id
              WHERE o.id = ANY($1) AND g.menu_item_id = $2`,
             [optIds, m.id]
@@ -79,23 +87,29 @@ router.post(
           for (const o of oRes.rows) custExtra += Number(o.price_paise) || 0;
         }
       }
-      subtotal += (m.price_paise + custExtra) * qty;
+      subtotal += (m.price_paise + custExtra) * (Number(it.qty) || 1);
     }
 
+    // Coupon
     let discount = 0;
     let couponError = null;
     if (coupon_code) {
-      const cRes = await db.query('SELECT * FROM coupons WHERE code = $1 AND active = true', [
-        String(coupon_code).toUpperCase()
-      ]);
+      const cRes = await db.query(
+        'SELECT * FROM coupons WHERE code = $1 AND active = true',
+        [String(coupon_code).toUpperCase()]
+      );
       const coupon = cRes.rows[0];
       const now = new Date();
       if (!coupon) couponError = 'Invalid coupon code';
       else if (coupon.valid_from && new Date(coupon.valid_from) > now) couponError = 'Coupon not yet valid';
       else if (coupon.valid_to && new Date(coupon.valid_to) < now) couponError = 'Coupon expired';
-      else if (subtotal < coupon.min_order_paise)
+      else if (subtotal < coupon.min_order_paise) {
         couponError = `Coupon needs a minimum order of Rs ${(coupon.min_order_paise / 100).toFixed(0)}`;
-      else {
+      } else if (coupon.requires_student) {
+        const uRes = await db.query('SELECT is_student FROM users WHERE id = $1', [req.user.id]);
+        if (!uRes.rows[0] || !uRes.rows[0].is_student) couponError = 'This coupon is for verified students only';
+      }
+      if (!couponError) {
         discount =
           coupon.discount_type === 'flat'
             ? coupon.value
@@ -106,7 +120,7 @@ router.post(
     }
 
     let distanceKm = null;
-    if (restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
+    if (!dineIn && restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
       distanceKm = haversineKm(
         Number(restaurant.lat),
         Number(restaurant.lng),
@@ -115,49 +129,44 @@ router.post(
       );
     }
     const config = await loadPricingConfig(db);
+    const tipPaise = Math.max(0, Math.round(Number(tip_paise) || 0));
     const quote = computeQuote({
       config,
-      distanceKm,
+      distanceKm: dineIn ? 0 : distanceKm,
       subtotalPaise: subtotal,
       discountPaise: discount,
       commissionPct: restaurant.commission_pct
     });
 
-    let creditsUsed = 0;
-    let walletBalance = 0;
-    if (use_credits) {
-      const balRes = await db.query(
-        'SELECT COALESCE(SUM(amount_paise), 0) AS balance FROM customer_credits WHERE user_id = $1',
-        [req.user.id]
-      );
-      walletBalance = Number(balRes.rows[0].balance);
-      creditsUsed = Math.min(walletBalance, quote.totalPaise);
-    }
-
     res.json({
       bill: {
         subtotal_paise: subtotal,
         discount_paise: discount,
-        delivery_fee_paise: quote.deliveryFeePaise,
+        delivery_fee_paise: dineIn ? 0 : quote.deliveryFeePaise,
         platform_fee_paise: quote.platformFeePaise,
         tax_paise: quote.taxPaise,
-        credits_used_paise: creditsUsed,
-        total_paise: quote.totalPaise - creditsUsed
+        tip_paise: tipPaise,
+        total_paise: (dineIn ? 0 : quote.deliveryFeePaise) + quote.platformFeePaise + tipPaise + (subtotal - discount)
       },
-      wallet_balance_paise: walletBalance,
       coupon_error: couponError,
-      promise_minutes: Number(config.promiseMinutes) || 30
+      eta_minutes: Number(config.etaMinutes) || 30
     });
   })
 );
 
-// POST /api/orders { restaurant_id, address_id, items:[{menu_item_id, qty, instructions}], coupon_code?, payment_method? }
+// POST /api/orders { restaurant_id, address_id?, order_type?, table_id?, items:[{menu_item_id, qty, instructions, customizations}], coupon_code?, payment_method?, delivery_note?, no_cutlery?, tip_paise?, recipient_name?, recipient_phone? }
 router.post(
   '/',
   ah(async (req, res) => {
-    const { restaurant_id, address_id, items, coupon_code, payment_method } = req.body;
-    if (!restaurant_id || !address_id || !Array.isArray(items) || !items.length) {
-      return res.status(400).json({ error: 'restaurant_id, address_id and items are required' });
+    const { restaurant_id, address_id, items, coupon_code, payment_method,
+            order_type, table_id, delivery_note, no_cutlery, tip_paise,
+            recipient_name, recipient_phone } = req.body;
+    const dineIn = order_type === 'dinein';
+    if (!restaurant_id || !Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: 'restaurant_id and items are required' });
+    }
+    if (!dineIn && !address_id) {
+      return res.status(400).json({ error: 'address_id is required for delivery orders' });
     }
 
     const client = await db.pool.connect();
@@ -172,12 +181,21 @@ router.post(
       if (!restaurant) throw { status: 404, message: 'Restaurant not available' };
       if (!restaurant.is_open) throw { status: 400, message: 'Restaurant is currently closed' };
 
-      const aRes = await client.query(
-        'SELECT * FROM addresses WHERE id = $1 AND user_id = $2',
-        [address_id, req.user.id]
-      );
-      const address = aRes.rows[0];
-      if (!address) throw { status: 400, message: 'Delivery address not found' };
+      let address = null;
+      if (dineIn) {
+        if (!table_id) throw { status: 400, message: 'Table is required for dine-in orders' };
+        const tRes = await client.query(
+          'SELECT id FROM tables WHERE id = $1 AND restaurant_id = $2', [table_id, restaurant_id]
+        );
+        if (!tRes.rows[0]) throw { status: 400, message: 'Table not found for this restaurant' };
+      } else {
+        const aRes = await client.query(
+          'SELECT * FROM addresses WHERE id = $1 AND user_id = $2',
+          [address_id, req.user.id]
+        );
+        address = aRes.rows[0];
+        if (!address) throw { status: 400, message: 'Delivery address not found' };
+      }
 
       const ids = items.map((i) => i.menu_item_id);
       const mRes = await client.query(
@@ -238,6 +256,12 @@ router.post(
         if (subtotal < coupon.min_order_paise) {
           throw { status: 400, message: `Coupon needs a minimum order of Rs ${(coupon.min_order_paise / 100).toFixed(0)}` };
         }
+        if (coupon.requires_student) {
+          const uRes = await client.query('SELECT is_student FROM users WHERE id = $1', [req.user.id]);
+          if (!uRes.rows[0] || !uRes.rows[0].is_student) {
+            throw { status: 400, message: 'This coupon is for verified students only' };
+          }
+        }
         discount =
           coupon.discount_type === 'flat'
             ? coupon.value
@@ -249,55 +273,43 @@ router.post(
 
       // Distance + quote
       let distanceKm = null;
-      if (restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
+      if (!dineIn && restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
         distanceKm = haversineKm(restaurant.lat, restaurant.lng, address.lat, address.lng);
       }
       const config = await loadPricingConfig(client);
+      const tipPaise = Math.max(0, Math.round(Number(tip_paise) || 0));
       const quote = computeQuote({
         config,
-        distanceKm,
+        distanceKm: dineIn ? 0 : distanceKm,
         subtotalPaise: subtotal,
         discountPaise: discount,
         commissionPct: restaurant.commission_pct
       });
+      const deliveryFee = dineIn ? 0 : quote.deliveryFeePaise;
+      const finalTotal = (subtotal - discount) + deliveryFee + quote.platformFeePaise + tipPaise;
 
       const timeline = [{ status: 'placed', at: new Date().toISOString(), by: 'customer' }];
-
-      // Delivery promise clock starts at placement; wallet credits reduce the total.
-      const promiseMinutes = Number(config.promiseMinutes) || 30;
-      let creditsUsed = 0;
-      if (req.body.use_credits) {
-        const balRes = await client.query(
-          'SELECT COALESCE(SUM(amount_paise), 0) AS balance FROM customer_credits WHERE user_id = $1',
-          [req.user.id]
-        );
-        creditsUsed = Math.min(Number(balRes.rows[0].balance), quote.totalPaise);
-      }
-      const finalTotal = quote.totalPaise - creditsUsed;
+      const etaMinutes = Number(config.etaMinutes) || 30;
+      const shareToken = require('crypto').randomBytes(6).toString('hex');
 
       const oRes = await client.query(
         `INSERT INTO orders
-           (customer_id, restaurant_id, address_id, status,
+           (customer_id, restaurant_id, address_id, status, order_type, table_id,
             subtotal_paise, discount_paise, delivery_fee_paise, platform_fee_paise,
-            tax_paise, commission_paise, total_paise,
-            payment_method, payment_status, timeline, promised_at, credits_used_paise)
-         VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12::jsonb,
-                 now() + ($13 || ' minutes')::interval, $14)
+            tax_paise, commission_paise, total_paise, tip_paise,
+            delivery_note, no_cutlery, recipient_name, recipient_phone,
+            payment_method, payment_status, timeline, eta_at, share_token)
+         VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
+                 now() + ($20 || ' minutes')::interval, $21)
          RETURNING *`,
-        [req.user.id, restaurant_id, address_id,
-         subtotal, discount, quote.deliveryFeePaise, quote.platformFeePaise,
-         quote.taxPaise, quote.commissionPaise, finalTotal,
-         payment_method || 'upi', JSON.stringify(timeline), String(promiseMinutes), creditsUsed]
+        [req.user.id, restaurant_id, dineIn ? null : address_id, dineIn ? 'dinein' : 'delivery',
+         dineIn ? table_id : null,
+         subtotal, discount, deliveryFee, quote.platformFeePaise,
+         quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
+         delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
+         payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken]
       );
       const order = oRes.rows[0];
-
-      if (creditsUsed > 0) {
-        await client.query(
-          `INSERT INTO customer_credits (user_id, amount_paise, reason, order_id)
-           VALUES ($1, $2, 'order_payment', $3)`,
-          [req.user.id, -creditsUsed, order.id]
-        );
-      }
 
       for (const s of snapshots) {
         await client.query(
@@ -310,22 +322,25 @@ router.post(
 
       const ownerRes = await db.query('SELECT owner_id FROM restaurants WHERE id = $1', [restaurant_id]);
       if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
-        await notify(ownerRes.rows[0].owner_id, 'New order received',
-          `Order worth Rs ${(order.total_paise / 100).toFixed(2)} from ${restaurant.name}.`);
+        await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
+          `${dineIn ? 'Dine-in table order' : 'Delivery order'} worth Rs ${(order.total_paise / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
       }
+      await notify(req.user.id, 'Order placed ✅',
+        `${restaurant.name} got your order and the kitchen is firing up! 🔥`);
 
       res.status(201).json({
         order: { ...order, items: snapshots },
         breakdown: {
           subtotal_paise: subtotal,
           discount_paise: discount,
-          delivery_fee_paise: quote.deliveryFeePaise,
+          delivery_fee_paise: deliveryFee,
           platform_fee_paise: quote.platformFeePaise,
-          credits_used_paise: creditsUsed,
+          tip_paise: tipPaise,
           total_paise: finalTotal,
-          promise_minutes: promiseMinutes,
+          eta_minutes: etaMinutes,
           distance_km: distanceKm == null ? null : Math.round(distanceKm * 100) / 100,
-          coupon_id: couponId
+          coupon_id: couponId,
+          share_token: shareToken
         }
       });
     } catch (e) {
@@ -387,7 +402,13 @@ router.get(
   ah(async (req, res) => {
     const { rows } = await db.query(
       `SELECT o.*, r.name AS restaurant_name, r.image_url AS restaurant_image, r.phone AS restaurant_phone,
-              a.line1, a.line2, a.city, ru.name AS rider_name, ru.phone AS rider_phone
+              r.verified AS restaurant_verified, r.lat AS rest_lat, r.lng AS rest_lng,
+              rd.lat AS rider_lat, rd.lng AS rider_lng,
+              a.line1, a.line2, a.city,
+              ru.name AS rider_name, ru.phone AS rider_phone,
+              rd.profile_photo AS rider_photo, rd.rating_avg AS rider_rating,
+              (SELECT COUNT(*) FROM orders od
+               WHERE od.rider_id = rd.id AND od.status = 'delivered') AS rider_deliveries
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
        LEFT JOIN addresses a ON a.id = o.address_id
@@ -400,7 +421,38 @@ router.get(
     if (!order) return res.status(404).json({ error: 'Order not found' });
     delete order.delivery_otp_hash; // never expose to clients
     const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
-    res.json({ order: { ...order, items: items.rows } });
+    // Queue transparency: orders at this restaurant placed before mine, still active
+    let queueAhead = 0;
+    if (['placed', 'accepted', 'preparing'].includes(order.status)) {
+      const qRes = await db.query(
+        `SELECT COUNT(*) AS n FROM orders
+         WHERE restaurant_id = $1 AND placed_at < $2
+           AND status IN ('placed','accepted','preparing')`,
+        [order.restaurant_id, order.placed_at]
+      );
+      queueAhead = Number(qRes.rows[0].n);
+    }
+    // Restaurant no-response: still 'placed' after 5 minutes -> flag + nudge the kitchen once.
+    let noResponse = false;
+    if (order.status === 'placed') {
+      const minsWaiting = (Date.now() - new Date(order.placed_at).getTime()) / 60000;
+      noResponse = minsWaiting >= 5;
+      const nudged = (order.timeline || []).some((t) => t.status === 'no_response_nudge');
+      if (noResponse && !nudged) {
+        const rOwner = await db.query(
+          'SELECT owner_id FROM restaurants WHERE id = $1', [order.restaurant_id]
+        );
+        if (rOwner.rows[0]) {
+          await notify(rOwner.rows[0].owner_id, '⏰ Order waiting for your response!',
+            'An order has been waiting 5 minutes — please accept it so the customer isn\u2019t left hanging.');
+        }
+        const timeline = order.timeline || [];
+        timeline.push({ status: 'no_response_nudge', at: new Date().toISOString(), by: 'system' });
+        await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2',
+          [JSON.stringify(timeline), order.id]);
+      }
+    }
+    res.json({ order: { ...order, items: items.rows, queue_ahead: queueAhead, no_response: noResponse } });
   })
 );
 
@@ -509,13 +561,15 @@ router.post(
   })
 );
 
-// POST /api/orders/:id/report { type: 'cold_food', notes? } — one-tap issue report
-// on a delivered order. A validated cold-food report auto-issues the apology credit.
+// POST /api/orders/:id/report { type, notes? } — one-tap issue report
+// on a delivered order. Creates a support ticket for the ops team; no automatic
+// credits — every case is reviewed by a human.
 router.post(
   '/:id/report',
   ah(async (req, res) => {
     const { type, notes } = req.body;
-    if (type !== 'cold_food') return res.status(400).json({ error: 'Unknown report type' });
+    const allowed = ['cold_food', 'wrong_item', 'missing_item', 'late', 'other'];
+    if (!allowed.includes(type)) return res.status(400).json({ error: 'Unknown report type' });
     const { rows } = await db.query(
       'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
       [req.params.id, req.user.id]
@@ -526,28 +580,136 @@ router.post(
       return res.status(409).json({ error: 'You can report only delivered orders' });
     }
     const dup = await db.query(
-      "SELECT id FROM support_tickets WHERE order_id = $1 AND category = 'cold_food'",
-      [order.id]
+      'SELECT id FROM support_tickets WHERE order_id = $1 AND category = $2',
+      [order.id, type]
     );
     if (dup.rows[0]) return res.status(409).json({ error: 'This order was already reported' });
 
+    const subjects = {
+      cold_food: 'Food arrived cold',
+      wrong_item: 'Wrong item delivered',
+      missing_item: 'Item missing from order',
+      late: 'Order arrived late',
+      other: 'Issue with my order'
+    };
     const ticket = await db.query(
       `INSERT INTO support_tickets (user_id, order_id, category, subject, message)
-       VALUES ($1,$2,'cold_food','Food arrived cold',$3) RETURNING *`,
-      [req.user.id, order.id, notes || 'Customer reported the food arrived cold.']
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [req.user.id, order.id, type, subjects[type], notes || 'Customer reported an issue with this order.']
     );
-    const config = await loadPricingConfig(db);
-    const creditPaise = Number(config.apologyCreditPaise) || 0;
-    if (creditPaise > 0) {
-      await db.query(
-        `INSERT INTO customer_credits (user_id, amount_paise, reason, order_id)
-         VALUES ($1,$2,'cold_food_apology',$3)`,
-        [req.user.id, creditPaise, order.id]
-      );
-      await notify(req.user.id, 'Apology credit added',
-        `We're sorry your food arrived cold. Rs ${(creditPaise / 100).toFixed(0)} credit has been added to your account.`);
+    await notify(req.user.id, 'We got your report 🙏',
+      'Our team is looking into it right now. We will make this right — thank you for telling us.');
+    res.status(201).json({ ticket: ticket.rows[0] });
+  })
+);
+
+// GET /api/orders/:id/invoice — GST invoice data for the customer
+router.get(
+  '/:id/invoice',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT o.*, r.name AS restaurant_name, r.address AS restaurant_address, r.gstin,
+              r.phone AS restaurant_phone
+       FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.id = $1 AND o.customer_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
+    res.json({
+      invoice: {
+        invoice_no: 'MN-' + order.id.slice(0, 8).toUpperCase(),
+        date: order.placed_at,
+        restaurant: {
+          name: order.restaurant_name,
+          address: order.restaurant_address,
+          phone: order.restaurant_phone,
+          gstin: order.gstin
+        },
+        items: items.rows,
+        subtotal_paise: order.subtotal_paise,
+        discount_paise: order.discount_paise,
+        delivery_fee_paise: order.delivery_fee_paise,
+        platform_fee_paise: order.platform_fee_paise,
+        tip_paise: order.tip_paise,
+        total_paise: order.total_paise,
+        payment_method: order.payment_method,
+        payment_status: order.payment_status
+      }
+    });
+  })
+);
+
+// ---- Razorpay (key-ready; dormant until RAZORPAY_KEY_ID/SECRET are set) ----
+// POST /api/orders/:id/razorpay-order — create a Razorpay order for online payment
+router.post(
+  '/:id/razorpay-order',
+  ah(async (req, res) => {
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!keyId || !keySecret) {
+      return res.status(503).json({ error: 'Online payments are not configured yet' });
     }
-    res.status(201).json({ ticket: ticket.rows[0], credit_paise: creditPaise });
+    const { rows } = await db.query(
+      'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
+      [req.params.id, req.user.id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.payment_status !== 'pending') {
+      return res.status(409).json({ error: `Payment already ${order.payment_status}` });
+    }
+    const auth = Buffer.from(`${keyId}:${keySecret}`).toString('base64');
+    const rpRes = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        amount: order.total_paise,
+        currency: 'INR',
+        receipt: 'mn_' + order.id.slice(0, 24),
+        notes: { mana_order_id: order.id }
+      })
+    });
+    if (!rpRes.ok) {
+      return res.status(502).json({ error: 'Payment gateway error. Please try again.' });
+    }
+    const rpOrder = await rpRes.json();
+    res.json({ razorpay_order_id: rpOrder.id, amount_paise: order.total_paise, key_id: keyId });
+  })
+);
+
+// POST /api/orders/:id/razorpay-verify { razorpay_payment_id, razorpay_order_id, razorpay_signature }
+router.post(
+  '/:id/razorpay-verify',
+  ah(async (req, res) => {
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!keySecret) return res.status(503).json({ error: 'Online payments are not configured yet' });
+    const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.body || {};
+    if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'Missing payment verification data' });
+    }
+    const crypto = require('crypto');
+    const expected = crypto
+      .createHmac('sha256', keySecret)
+      .update(razorpay_order_id + '|' + razorpay_payment_id)
+      .digest('hex');
+    if (expected !== razorpay_signature) {
+      return res.status(400).json({ error: 'Payment verification failed' });
+    }
+    const { rows } = await db.query(
+      "SELECT * FROM orders WHERE id = $1 AND customer_id = $2 AND payment_status = 'pending'",
+      [req.params.id, req.user.id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found or already paid' });
+    await db.query("UPDATE orders SET payment_status = 'paid', payment_method = 'razorpay' WHERE id = $1", [order.id]);
+    const timeline = order.timeline || [];
+    timeline.push({ status: 'paid', at: new Date().toISOString(), by: 'razorpay' });
+    await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [JSON.stringify(timeline), order.id]);
+    await notify(order.customer_id, 'Payment successful ✅',
+      `Rs ${(order.total_paise / 100).toFixed(2)} paid. The kitchen is firing up! 🔥`);
+    res.json({ ok: true, payment_status: 'paid' });
   })
 );
 

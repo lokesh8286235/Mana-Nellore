@@ -7,10 +7,13 @@ const { authenticate, requireRole, ah } = require('../middleware/auth');
 const router = express.Router();
 router.use(authenticate, requireRole('admin'));
 
-async function audit(adminId, action, entity, entityId, meta) {
+// Per-session staff name: multiple staff may share one admin login, so every
+// mutating action records WHO did it. The admin app sends x-staff-name.
+async function audit(req, action, entity, entityId, meta) {
+  const staffName = req.headers['x-staff-name'] || req.body._staff_name || null;
   await db.query(
-    'INSERT INTO audit_logs (admin_id, action, entity, entity_id, meta) VALUES ($1,$2,$3,$4,$5::jsonb)',
-    [adminId, action, entity || null, entityId || null, JSON.stringify(meta || {})]
+    'INSERT INTO audit_logs (admin_id, staff_name, action, entity, entity_id, meta) VALUES ($1,$2,$3,$4,$5,$6::jsonb)',
+    [req.user.id, staffName, action, entity || null, entityId || null, JSON.stringify(meta || {})]
   );
 }
 
@@ -158,7 +161,7 @@ router.put(
       'UPDATE restaurants SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    await audit(req.user.id, `restaurant_${status}`, 'restaurant', req.params.id, {});
+    await audit(req, `restaurant_${status}`, 'restaurant', req.params.id, {});
     if (rows[0].owner_id) {
       await notify(rows[0].owner_id, 'Restaurant status update',
         `Your restaurant "${rows[0].name}" is now ${status}.`);
@@ -199,35 +202,9 @@ router.put(
       'UPDATE riders SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Rider not found' });
-    await audit(req.user.id, `rider_${status}`, 'rider', req.params.id, {});
+    await audit(req, `rider_${status}`, 'rider', req.params.id, {});
     await notify(rows[0].user_id, 'Rider account update', `Your rider account is now ${status}.`);
     res.json({ rider: rows[0] });
-  })
-);
-
-// ---- Customers ----
-router.get(
-  '/customers',
-  ah(async (req, res) => {
-    const params = [];
-    let where = '';
-    if (req.query.q) {
-      params.push(`%${req.query.q}%`);
-      where = `WHERE (u.name ILIKE $${params.length} OR u.phone ILIKE $${params.length} OR o.customer_id::text ILIKE $${params.length})`;
-    }
-    // Customers are defined as distinct customer_ids with orders (matches dashboard count);
-    // user profile data is joined when a matching users row exists.
-    const { rows } = await db.query(
-      `SELECT o.customer_id AS id, u.phone, u.name, MIN(o.placed_at) AS created_at,
-              COUNT(*) AS total_orders,
-              COALESCE(SUM(o.total_paise) FILTER (WHERE o.status != 'cancelled'), 0) AS lifetime_paise
-       FROM orders o LEFT JOIN users u ON u.id = o.customer_id
-       ${where}
-       GROUP BY o.customer_id, u.phone, u.name
-       ORDER BY created_at DESC LIMIT 100`,
-      params
-    );
-    res.json({ customers: rows });
   })
 );
 
@@ -243,15 +220,14 @@ router.get(
     }
     if (req.query.q) {
       params.push(`%${req.query.q}%`);
-      conds.push(`(r.name ILIKE $${params.length} OR u.phone ILIKE $${params.length})`);
+      conds.push(`r.name ILIKE $${params.length}`);
     }
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     const { rows } = await db.query(
-      `SELECT o.id, o.status, o.total_paise, o.payment_status, o.placed_at,
-              r.name AS restaurant_name, u.name AS customer_name, u.phone AS customer_phone
+      `SELECT o.id, o.status, o.total_paise, o.payment_method, o.payment_status, o.placed_at,
+              o.order_type, r.name AS restaurant_name
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
-       JOIN users u ON u.id = o.customer_id
        ${where} ORDER BY o.placed_at DESC LIMIT 100`,
       params
     );
@@ -263,11 +239,10 @@ router.get(
   '/orders/:id',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      `SELECT o.*, r.name AS restaurant_name, u.name AS customer_name, u.phone AS customer_phone,
+      `SELECT o.*, r.name AS restaurant_name,
               a.line1, a.line2, a.city, ru.name AS rider_name, ru.phone AS rider_phone
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
-       JOIN users u ON u.id = o.customer_id
        LEFT JOIN addresses a ON a.id = o.address_id
        LEFT JOIN riders rd ON rd.id = o.rider_id
        LEFT JOIN users ru ON ru.id = rd.user_id
@@ -298,7 +273,7 @@ router.post(
     await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
       JSON.stringify(timeline), order.id
     ]);
-    await audit(req.user.id, 'assign_rider', 'order', order.id, { rider_id });
+    await audit(req, 'assign_rider', 'order', order.id, { rider_id });
     await notify(rRes.rows[0].user_id, 'Delivery assigned',
       `Order from ${order.id.slice(0, 8)} was assigned to you by operations.`);
     res.json({ ok: true });
@@ -321,7 +296,7 @@ router.post(
       'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
       [req.body.reason || 'Cancelled by operations', refunded ? 'refunded' : order.payment_status, order.id]
     );
-    await audit(req.user.id, 'cancel_order', 'order', order.id, { reason: req.body.reason });
+    await audit(req, 'cancel_order', 'order', order.id, { reason: req.body.reason });
     await notify(order.customer_id, 'Order cancelled',
       `Your order was cancelled by operations.${refunded ? ' Your payment will be refunded.' : ''}`);
     res.json({ ok: true, refunded });
@@ -342,13 +317,13 @@ router.put(
   '/pricing',
   ah(async (req, res) => {
     const { key, value } = req.body;
-    const allowed = ['delivery_tiers', 'rider_payout_tiers', 'platform_fee_paise', 'default_commission_pct', 'free_delivery_rules', 'promise_minutes', 'apology_credit_paise'];
+    const allowed = ['delivery_tiers', 'rider_payout_tiers', 'platform_fee_paise', 'default_commission_pct', 'free_delivery_rules', 'eta_minutes', 'call_to_order_phone'];
     if (!allowed.includes(key)) return res.status(400).json({ error: 'Unknown pricing key' });
     const { rows } = await db.query(
       'UPDATE pricing_config SET value = $1::jsonb WHERE key = $2 RETURNING *',
       [JSON.stringify(value), key]
     );
-    await audit(req.user.id, 'pricing_update', 'pricing_config', key, { value });
+    await audit(req, 'pricing_update', 'pricing_config', key, { value });
     res.json({ pricing: rows[0] });
   })
 );
@@ -365,7 +340,7 @@ router.get(
 router.post(
   '/coupons',
   ah(async (req, res) => {
-    const { code, discount_type, value, min_order_paise, max_discount_paise, valid_from, valid_to, active } = req.body;
+    const { code, discount_type, value, min_order_paise, max_discount_paise, valid_from, valid_to, active, requires_student } = req.body;
     if (!code || !discount_type || value == null) {
       return res.status(400).json({ error: 'code, discount_type and value are required' });
     }
@@ -373,13 +348,13 @@ router.post(
       return res.status(400).json({ error: 'discount_type must be flat or percent' });
     }
     const { rows } = await db.query(
-      `INSERT INTO coupons (code, discount_type, value, min_order_paise, max_discount_paise, valid_from, valid_to, active)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      `INSERT INTO coupons (code, discount_type, value, min_order_paise, max_discount_paise, valid_from, valid_to, active, requires_student)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
       [String(code).toUpperCase(), discount_type, Math.round(Number(value)),
        min_order_paise || 0, max_discount_paise != null ? Math.round(Number(max_discount_paise)) : null,
-       valid_from || null, valid_to || null, active !== false]
+       valid_from || null, valid_to || null, active !== false, !!requires_student]
     );
-    await audit(req.user.id, 'coupon_create', 'coupon', rows[0].id, { code });
+    await audit(req, 'coupon_create', 'coupon', rows[0].id, { code });
     res.status(201).json({ coupon: rows[0] });
   })
 );
@@ -387,7 +362,7 @@ router.post(
 router.put(
   '/coupons/:id',
   ah(async (req, res) => {
-    const fields = ['discount_type', 'value', 'min_order_paise', 'max_discount_paise', 'valid_from', 'valid_to', 'active'];
+    const fields = ['discount_type', 'value', 'min_order_paise', 'max_discount_paise', 'valid_from', 'valid_to', 'active', 'requires_student'];
     const sets = [];
     const params = [];
     for (const f of fields) {
@@ -401,7 +376,7 @@ router.put(
     const { rows } = await db.query(
       `UPDATE coupons SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`, params);
     if (!rows[0]) return res.status(404).json({ error: 'Coupon not found' });
-    await audit(req.user.id, 'coupon_update', 'coupon', req.params.id, req.body);
+    await audit(req, 'coupon_update', 'coupon', req.params.id, req.body);
     res.json({ coupon: rows[0] });
   })
 );
@@ -410,7 +385,7 @@ router.delete(
   '/coupons/:id',
   ah(async (req, res) => {
     await db.query('DELETE FROM coupons WHERE id = $1', [req.params.id]);
-    await audit(req.user.id, 'coupon_delete', 'coupon', req.params.id, {});
+    await audit(req, 'coupon_delete', 'coupon', req.params.id, {});
     res.json({ ok: true });
   })
 );
@@ -461,7 +436,7 @@ router.post(
        VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
       [restaurant_id, period_start, period_end, gross, commission, refunds, net]
     );
-    await audit(req.user.id, 'settlement_create', 'settlement', rows[0].id, { restaurant_id, period_start, period_end });
+    await audit(req, 'settlement_create', 'settlement', rows[0].id, { restaurant_id, period_start, period_end });
     res.status(201).json({ settlement: rows[0] });
   })
 );
@@ -474,7 +449,7 @@ router.post(
       [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Settlement not found' });
-    await audit(req.user.id, 'settlement_paid', 'settlement', req.params.id, {});
+    await audit(req, 'settlement_paid', 'settlement', req.params.id, {});
     res.json({ settlement: rows[0] });
   })
 );
@@ -511,7 +486,7 @@ router.post(
     const tl = (await db.query('SELECT timeline FROM orders WHERE id = $1', [order.id])).rows[0].timeline || [];
     tl.push({ status: 'refunded', at: new Date().toISOString(), by: 'admin' });
     await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [JSON.stringify(tl), order.id]);
-    await audit(req.user.id, 'refund', 'order', order.id, { reason, amount_paise: order.total_paise });
+    await audit(req, 'refund', 'order', order.id, { reason, amount_paise: order.total_paise });
     await notify(order.customer_id, 'Refund issued',
       `Rs ${(order.total_paise / 100).toFixed(2)} has been refunded for your order.`);
     res.json({ ok: true, refunded_paise: order.total_paise });
@@ -546,17 +521,45 @@ router.get(
 router.put(
   '/tickets/:id',
   ah(async (req, res) => {
-    const { status } = req.body;
+    const { status, resolution_note } = req.body;
     if (!['open', 'in_progress', 'resolved', 'closed'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
+    // Closing a ticket REQUIRES a resolution note explaining refunded / not refunded.
+    if ((status === 'resolved' || status === 'closed') && !(resolution_note || '').trim()) {
+      return res.status(400).json({ error: 'A resolution note is required to close a ticket (refunded or not, and why)' });
+    }
     const { rows } = await db.query(
-      'UPDATE support_tickets SET status = $1 WHERE id = $2 RETURNING *',
-      [status, req.params.id]
+      `UPDATE support_tickets SET status = $1,
+         resolution_note = COALESCE($2, resolution_note)
+       WHERE id = $3 RETURNING *`,
+      [status, (resolution_note || '').trim() || null, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' });
-    await audit(req.user.id, 'ticket_update', 'support_ticket', req.params.id, { status });
+    await audit(req, 'ticket_update', 'support_ticket', req.params.id, { status });
+    if (status === 'resolved' || status === 'closed') {
+      await notify(rows[0].user_id, 'Support ticket resolved ✅',
+        `Resolution: ${rows[0].resolution_note}`);
+    }
     res.json({ ticket: rows[0] });
+  })
+);
+
+// GET /api/admin/tickets/:id — ticket + the customer's orders as transaction context (no customer PII)
+router.get(
+  '/tickets/:id',
+  ah(async (req, res) => {
+    const t = await db.query('SELECT * FROM support_tickets WHERE id = $1', [req.params.id]);
+    if (!t.rows[0]) return res.status(404).json({ error: 'Ticket not found' });
+    const ticket = t.rows[0];
+    const orders = await db.query(
+      `SELECT o.id, o.status, o.total_paise, o.payment_status, o.placed_at,
+              r.name AS restaurant_name
+       FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.customer_id = $1 ORDER BY o.placed_at DESC LIMIT 20`,
+      [ticket.user_id]
+    );
+    res.json({ ticket, customer_orders: orders.rows });
   })
 );
 
@@ -672,7 +675,7 @@ router.put(
       [status, req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'SOS alert not found' });
-    await audit(req.user.id, 'sos_' + status, 'sos_alert', req.params.id, {});
+    await audit(req, 'sos_' + status, 'sos_alert', req.params.id, {});
     res.json({ ok: true });
   })
 );
@@ -700,7 +703,7 @@ router.post(
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
       [b.name, b.target_deliveries, b.bonus_paise, b.starts_at, b.ends_at, b.active !== false]
     );
-    await audit(req.user.id, 'quest_create', 'quest', rows[0].id, { name: b.name });
+    await audit(req, 'quest_create', 'quest', rows[0].id, { name: b.name });
     res.json({ quest: rows[0] });
   })
 );
@@ -722,7 +725,7 @@ router.put(
       `UPDATE quests SET ${fields.join(', ')} WHERE id = $${vals.length} RETURNING *`, vals
     );
     if (!rows.length) return res.status(404).json({ error: 'Quest not found' });
-    await audit(req.user.id, 'quest_update', 'quest', req.params.id, b);
+    await audit(req, 'quest_update', 'quest', req.params.id, b);
     res.json({ quest: rows[0] });
   })
 );
@@ -733,7 +736,7 @@ router.delete(
   ah(async (req, res) => {
     const { rows } = await db.query('DELETE FROM quests WHERE id = $1 RETURNING id', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Quest not found' });
-    await audit(req.user.id, 'quest_delete', 'quest', req.params.id, {});
+    await audit(req, 'quest_delete', 'quest', req.params.id, {});
     res.json({ ok: true });
   })
 );
@@ -750,118 +753,267 @@ router.get(
   })
 );
 
-// ---- Delivery zones (per-zone promise time) ----
+// ---- Restaurant onboarding applications ----
 router.get(
-  '/zones',
+  '/applications',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      'SELECT * FROM zones ORDER BY is_default DESC, name ASC'
+      "SELECT * FROM restaurant_applications ORDER BY created_at DESC"
     );
-    res.json({ zones: rows });
+    res.json({ applications: rows });
   })
 );
 
-router.post(
-  '/zones',
+// PUT /api/admin/applications/:id { status: approved|rejected, admin_note? }
+// Approving creates the owner profile (separate role profile), the restaurant
+// (verified=true), and notifies the applicant.
+router.put(
+  '/applications/:id',
   ah(async (req, res) => {
-    const { name, promise_minutes } = req.body;
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: 'Zone name is required' });
+    const { status, admin_note } = req.body;
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
     }
-    const mins = Number(promise_minutes);
-    if (!mins || mins <= 0) {
-      return res.status(400).json({ error: 'Promise minutes must be a positive number' });
+    const aRes = await db.query('SELECT * FROM restaurant_applications WHERE id = $1', [req.params.id]);
+    const app = aRes.rows[0];
+    if (!app) return res.status(404).json({ error: 'Application not found' });
+    if (app.status !== 'pending') return res.status(409).json({ error: `Application already ${app.status}` });
+
+    await db.query('UPDATE restaurant_applications SET status = $1, admin_note = $2 WHERE id = $3',
+      [status, admin_note || null, app.id]);
+
+    if (status === 'approved') {
+      // Find or create the owner's restaurant_owner profile (same phone, own profile)
+      let uRes = await db.query(
+        "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner'", [app.phone]
+      );
+      let owner = uRes.rows[0];
+      if (!owner) {
+        const c = await db.query(
+          "INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner') RETURNING *",
+          [app.phone, app.owner_name]
+        );
+        owner = c.rows[0];
+      }
+      const rRes = await db.query(
+        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, verified, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,true,'approved') RETURNING *`,
+        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai]
+      );
+      await notify(owner.id, '🎉 Your restaurant is live!',
+        `"${app.restaurant_name}" is verified and open for business on Mana Nellore!`);
+      await audit(req, 'application_approved', 'restaurant', rRes.rows[0].id, { application_id: app.id });
+    } else {
+      await audit(req, 'application_rejected', 'restaurant_application', app.id, { admin_note });
     }
+    res.json({ ok: true, status });
+  })
+);
+
+// Restaurants missing a photo — chase list
+router.get(
+  '/restaurants-missing-photo',
+  ah(async (req, res) => {
     const { rows } = await db.query(
-      'INSERT INTO zones (name, promise_minutes) VALUES ($1, $2) RETURNING *',
-      [String(name).trim(), mins]
+      `SELECT id, name, status FROM restaurants
+       WHERE image_url IS NULL OR image_url = ''
+       ORDER BY created_at DESC`
     );
-    res.status(201).json({ zone: rows[0] });
+    res.json({ restaurants: rows });
+  })
+);
+
+// ---- Call-me-back requests ----
+router.get(
+  '/callbacks',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT c.*, u.name AS user_name FROM callback_requests c
+       JOIN users u ON u.id = c.user_id
+       WHERE c.status = 'open' ORDER BY c.created_at ASC`
+    );
+    res.json({ callbacks: rows });
   })
 );
 
 router.put(
-  '/zones/:id',
+  '/callbacks/:id',
   ah(async (req, res) => {
-    const { name, promise_minutes, is_default } = req.body;
-    const mins = Number(promise_minutes);
-    if (name != null && !String(name).trim()) {
-      return res.status(400).json({ error: 'Zone name cannot be empty' });
-    }
-    if (promise_minutes != null && (!mins || mins <= 0)) {
-      return res.status(400).json({ error: 'Promise minutes must be a positive number' });
-    }
-    // Only one default zone: setting one clears the others.
-    if (is_default === true) {
-      await db.query('UPDATE zones SET is_default = false');
-    }
     const { rows } = await db.query(
-      `UPDATE zones SET
-         name = COALESCE($2, name),
-         promise_minutes = COALESCE($3, promise_minutes),
-         is_default = COALESCE($4, is_default)
-       WHERE id = $1 RETURNING *`,
-      [
-        req.params.id,
-        name != null ? String(name).trim() : null,
-        promise_minutes != null ? mins : null,
-        is_default != null ? !!is_default : null,
-      ]
+      "UPDATE callback_requests SET status = 'done' WHERE id = $1 RETURNING *", [req.params.id]
     );
-    if (!rows[0]) return res.status(404).json({ error: 'Zone not found' });
-    res.json({ zone: rows[0] });
-  })
-);
-
-router.delete(
-  '/zones/:id',
-  ah(async (req, res) => {
-    const { rows } = await db.query('DELETE FROM zones WHERE id = $1 RETURNING *', [
-      req.params.id,
-    ]);
-    if (!rows[0]) return res.status(404).json({ error: 'Zone not found' });
-    if (rows[0].is_default) {
-      // Never leave the system without a default zone.
-      await db.query(
-        'UPDATE zones SET is_default = true WHERE id = (SELECT id FROM zones ORDER BY created_at LIMIT 1)'
-      );
-    }
+    if (!rows[0]) return res.status(404).json({ error: 'Callback not found' });
+    await audit(req, 'callback_done', 'callback_request', req.params.id, {});
+    await notify(rows[0].user_id, 'We called you back 📞',
+      'Thanks for your patience — our team has closed your callback request.');
     res.json({ ok: true });
   })
 );
 
-// ---- Promise-hit-rate stats (on-time vs late deliveries) ----
+// ---- Rider COD cash settlement ----
 router.get(
-  '/promise-stats',
+  '/rider-cod',
   ah(async (req, res) => {
-    const days = Math.min(Number(req.query.days) || 30, 365);
     const { rows } = await db.query(
-      `SELECT
-         COUNT(*) FILTER (WHERE status = 'delivered') AS delivered,
-         COUNT(*) FILTER (WHERE status = 'delivered' AND promised_at IS NOT NULL
-                          AND delivered_at <= promised_at) AS on_time,
-         COUNT(*) FILTER (WHERE status = 'delivered' AND promised_at IS NOT NULL
-                          AND delivered_at > promised_at) AS late,
-         ROUND(AVG(EXTRACT(EPOCH FROM (delivered_at - placed_at)) / 60)
-               FILTER (WHERE status = 'delivered')) AS avg_minutes
-       FROM orders
-       WHERE placed_at > now() - ($1 || ' days')::interval`,
-      [days]
+      `SELECT rd.id AS rider_id, u.name AS rider_name, u.phone AS rider_phone,
+              COALESCE(SUM(l.amount_paise) FILTER (WHERE l.settled = false), 0) AS cash_in_hand_paise,
+              COALESCE(SUM(p.amount_paise) FILTER (WHERE p.status = 'pending'), 0) AS pending_earnings_paise
+       FROM riders rd
+       JOIN users u ON u.id = rd.user_id
+       LEFT JOIN rider_cod_ledger l ON l.rider_id = rd.id
+       LEFT JOIN rider_payouts p ON p.rider_id = rd.id
+       GROUP BY rd.id, u.name, u.phone
+       HAVING COALESCE(SUM(l.amount_paise) FILTER (WHERE l.settled = false), 0) > 0
+       ORDER BY cash_in_hand_paise DESC`
     );
-    const s = rows[0] || {};
-    const delivered = Number(s.delivered) || 0;
-    const onTime = Number(s.on_time) || 0;
-    const late = Number(s.late) || 0;
     res.json({
-      days,
-      delivered,
-      on_time: onTime,
-      late,
-      hit_rate: delivered ? Math.round((onTime / delivered) * 100) : null,
-      avg_minutes: s.avg_minutes != null ? Number(s.avg_minutes) : null,
+      riders: rows.map((r) => ({
+        rider_id: r.rider_id,
+        rider_name: r.rider_name,
+        rider_phone: r.rider_phone,
+        cash_in_hand_paise: Number(r.cash_in_hand_paise),
+        pending_earnings_paise: Number(r.pending_earnings_paise),
+        owes_paise: Number(r.cash_in_hand_paise) - Number(r.pending_earnings_paise)
+      }))
     });
   })
 );
 
+// POST /api/admin/rider-cod/:riderId/settle — mark all unsettled COD as settled (cash received)
+router.post(
+  '/rider-cod/:riderId/settle',
+  ah(async (req, res) => {
+    const r = await db.query(
+      `UPDATE rider_cod_ledger SET settled = true, settled_at = now()
+       WHERE rider_id = $1 AND settled = false RETURNING amount_paise`,
+      [req.params.riderId]
+    );
+    const total = r.rows.reduce((a, x) => a + Number(x.amount_paise), 0);
+    await audit(req, 'cod_settled', 'rider', req.params.riderId, { amount_paise: total });
+    res.json({ ok: true, settled_paise: total, entries: r.rows.length });
+  })
+);
 
-module.exports = router;
+// ---- Student applications ----
+router.get(
+  '/student-applications',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT s.*, u.name, u.phone FROM student_applications s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.status = 'pending' ORDER BY s.created_at ASC`
+    );
+    res.json({ applications: rows });
+  })
+);
+
+router.put(
+  '/student-applications/:id',
+  ah(async (req, res) => {
+    const { status } = req.body;
+    if (!['approved', 'rejected'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    const { rows } = await db.query(
+      'UPDATE student_applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Application not found' });
+    if (status === 'approved') {
+      await db.query('UPDATE users SET is_student = true WHERE id = $1', [rows[0].user_id]);
+      await notify(rows[0].user_id, '🎓 Student discount unlocked!',
+        'Your student status is verified — look for the STUDENT10 coupon at checkout!');
+    }
+    await audit(req, 'student_' + status, 'student_application', req.params.id, {});
+    res.json({ ok: true });
+  })
+);
+
+// ---- Collections (Taste of Nellore, festival specials) ----
+router.get(
+  '/collections',
+  ah(async (req, res) => {
+    const { rows } = await db.query('SELECT * FROM collections ORDER BY sort_order, name');
+    for (const c of rows) {
+      const rs = await db.query(
+        `SELECT r.id, r.name FROM collection_restaurants cr
+         JOIN restaurants r ON r.id = cr.restaurant_id WHERE cr.collection_id = $1`,
+        [c.id]
+      );
+      c.restaurants = rs.rows;
+    }
+    res.json({ collections: rows });
+  })
+);
+
+router.post(
+  '/collections',
+  ah(async (req, res) => {
+    const { name, description, image_url, restaurant_ids, sort_order } = req.body;
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    const { rows } = await db.query(
+      `INSERT INTO collections (name, description, image_url, sort_order)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [name, description || null, image_url || null, sort_order || 0]
+    );
+    if (Array.isArray(restaurant_ids)) {
+      for (const rid of restaurant_ids) {
+        await db.query(
+          'INSERT INTO collection_restaurants (collection_id, restaurant_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+          [rows[0].id, rid]
+        );
+      }
+    }
+    await audit(req, 'collection_create', 'collection', rows[0].id, { name });
+    res.status(201).json({ collection: rows[0] });
+  })
+);
+
+router.put(
+  '/collections/:id',
+  ah(async (req, res) => {
+    const { name, description, image_url, active, sort_order, restaurant_ids } = req.body;
+    const { rows } = await db.query(
+      `UPDATE collections SET name = COALESCE($1, name), description = COALESCE($2, description),
+         image_url = COALESCE($3, image_url), active = COALESCE($4, active),
+         sort_order = COALESCE($5, sort_order)
+       WHERE id = $6 RETURNING *`,
+      [name || null, description || null, image_url || null,
+       active != null ? !!active : null, sort_order != null ? sort_order : null, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Collection not found' });
+    if (Array.isArray(restaurant_ids)) {
+      await db.query('DELETE FROM collection_restaurants WHERE collection_id = $1', [req.params.id]);
+      for (const rid of restaurant_ids) {
+        await db.query(
+          'INSERT INTO collection_restaurants (collection_id, restaurant_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+          [req.params.id, rid]
+        );
+      }
+    }
+    await audit(req, 'collection_update', 'collection', req.params.id, {});
+    res.json({ collection: rows[0] });
+  })
+);
+
+router.delete(
+  '/collections/:id',
+  ah(async (req, res) => {
+    await db.query('DELETE FROM collections WHERE id = $1', [req.params.id]);
+    await audit(req, 'collection_delete', 'collection', req.params.id, {});
+    res.json({ ok: true });
+  })
+);
+
+// ---- Verify a restaurant (✓ badge) ----
+router.put(
+  '/restaurants/:id/verify',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      'UPDATE restaurants SET verified = $1 WHERE id = $2 RETURNING id, verified',
+      [req.body.verified !== false, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    await audit(req, 'restaurant_verify', 'restaurant', req.params.id, { verified: rows[0].verified });
+    res.json({ ok: true, verified: rows[0].verified });
+  })
+);
+
+module.exports = router;module.exports = router;

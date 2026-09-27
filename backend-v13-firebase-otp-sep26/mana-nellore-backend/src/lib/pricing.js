@@ -38,10 +38,8 @@ async function loadPricingConfig(db) {
     ),
     freeDeliveryRules:
       (m.free_delivery_rules && m.free_delivery_rules.rules) || [],
-    promiseMinutes: Number(m.promise_minutes != null ? m.promise_minutes : 30),
-    apologyCreditPaise: Number(
-      m.apology_credit_paise != null ? m.apology_credit_paise : 5000
-    )
+    // Honest ETA estimate shown to customers ("Usually ~X min") — NOT a delivery promise.
+    etaMinutes: Number(m.eta_minutes != null ? m.eta_minutes : 30),
   };
 }
 
