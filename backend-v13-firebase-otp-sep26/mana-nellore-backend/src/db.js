@@ -187,6 +187,10 @@ async function seed() {
 
   // Retire the promise-time delivery zones (feature removed); keep nothing reading them.
   await pool.query('DROP TABLE IF EXISTS zones');
+  // Rename promise_minutes -> eta_minutes, but never violate the unique key if
+  // eta_minutes was already seeded above: drop the stale row instead.
+  await pool.query(`DELETE FROM pricing_config WHERE key = 'promise_minutes'
+    AND EXISTS (SELECT 1 FROM pricing_config WHERE key = 'eta_minutes')`);
   await pool.query(`UPDATE pricing_config SET key = 'eta_minutes' WHERE key = 'promise_minutes'`);
 }
 
