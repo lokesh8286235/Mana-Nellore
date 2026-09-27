@@ -92,6 +92,14 @@ async function migrate() {
   END $$`);
   await q("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_type text NOT NULL DEFAULT 'delivery'");
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS table_id uuid');
+  // Dine-in table link (added here, not in schema.sql, because on existing
+  // databases the table_id column only exists after the line above).
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_table_id_fkey') THEN
+      ALTER TABLE orders ADD CONSTRAINT orders_table_id_fkey
+        FOREIGN KEY (table_id) REFERENCES tables(id) ON DELETE SET NULL;
+    END IF;
+  END $$`);
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_note text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS no_cutlery boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS tip_paise int NOT NULL DEFAULT 0');

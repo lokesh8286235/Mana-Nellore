@@ -340,12 +340,9 @@ CREATE TABLE IF NOT EXISTS tables (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_tables_restaurant ON tables(restaurant_id);
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_table_id_fkey') THEN
-    ALTER TABLE orders ADD CONSTRAINT orders_table_id_fkey
-      FOREIGN KEY (table_id) REFERENCES tables(id) ON DELETE SET NULL;
-  END IF;
-END $$;
+-- NOTE: the orders.table_id foreign key is added in migrate() (db.js), AFTER
+-- the table_id column itself is added — it cannot live here because on an
+-- existing database the column does not exist yet when the schema runs.
 
 -- Rider COD cash ledger (cash collected at the door, pending settlement)
 CREATE TABLE IF NOT EXISTS rider_cod_ledger (
