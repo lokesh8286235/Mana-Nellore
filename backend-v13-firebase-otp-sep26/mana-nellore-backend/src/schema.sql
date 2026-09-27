@@ -85,8 +85,8 @@ CREATE TABLE IF NOT EXISTS menu_items (
   available boolean NOT NULL DEFAULT true,
   prep_minutes int NOT NULL DEFAULT 20,
   sort_order int NOT NULL DEFAULT 0,
-  meal_slot text NOT NULL DEFAULT 'all'
-    CHECK (meal_slot IN ('all','breakfast','lunch','dinner')),
+  meal_slot text[] NOT NULL DEFAULT '{all}'
+    CHECK (meal_slot <@ ARRAY['all','breakfast','lunch','dinner']),
   is_combo boolean NOT NULL DEFAULT false,
   allergens jsonb NOT NULL DEFAULT '[]'
 );

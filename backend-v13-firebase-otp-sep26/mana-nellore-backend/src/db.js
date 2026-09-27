@@ -69,7 +69,19 @@ async function migrate() {
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS birthday_dessert boolean NOT NULL DEFAULT false');
 
   // Menu items: meal slots, combos, allergens
-  await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS meal_slot text NOT NULL DEFAULT 'all'");
+  await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS meal_slot text[] NOT NULL DEFAULT '{all}'");
+  // meal_slot was single text before multi-select — convert legacy values to text[]
+  await q(`DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'menu_items' AND column_name = 'meal_slot' AND data_type = 'text') THEN
+      ALTER TABLE menu_items ALTER COLUMN meal_slot DROP DEFAULT;
+      ALTER TABLE menu_items DROP CONSTRAINT IF EXISTS menu_items_meal_slot_check;
+      ALTER TABLE menu_items ALTER COLUMN meal_slot TYPE text[] USING ARRAY[meal_slot]::text[];
+      ALTER TABLE menu_items ALTER COLUMN meal_slot SET DEFAULT '{all}';
+      ALTER TABLE menu_items ADD CONSTRAINT menu_items_meal_slot_check
+        CHECK (meal_slot <@ ARRAY['all','breakfast','lunch','dinner']);
+    END IF;
+  END $$`);
   await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS is_combo boolean NOT NULL DEFAULT false');
   await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS allergens jsonb NOT NULL DEFAULT '[]'");
 

@@ -207,7 +207,7 @@ router.get(
     let mealCond = '';
     if (['breakfast', 'lunch', 'dinner'].includes(meal)) {
       itemParams.push(meal);
-      mealCond = ` AND (meal_slot = 'all' OR meal_slot = $${itemParams.length})`;
+      mealCond = ` AND ('all' = ANY(meal_slot) OR $${itemParams.length} = ANY(meal_slot))`;
     }
     const items = await db.query(
       `SELECT * FROM menu_items WHERE restaurant_id = $1 AND available = true${mealCond}

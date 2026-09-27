@@ -21,6 +21,18 @@ async function requireRestaurant(req, res) {
   return id;
 }
 
+/* Meal slots are multi-select: accepts a string or an array, returns a deduped array.
+   Empty selection, ['all'], or anything invalid -> ['all'] (visible in every meal tab). */
+function normSlots(v) {
+  const arr = Array.isArray(v) ? v : (v == null ? [] : [v]);
+  const ok = [];
+  for (const s of arr) {
+    const t = String(s || '').toLowerCase().trim();
+    if (['breakfast', 'lunch', 'dinner'].includes(t) && !ok.includes(t)) ok.push(t);
+  }
+  return ok.length ? ok : ['all'];
+}
+
 async function notify(dbConn, userId, title, body) {
   await dbConn.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [
     userId, title, body
@@ -249,7 +261,7 @@ router.post(
       [id, category_id || null, name, description || null, image_url || null,
        Math.round(Number(price_paise)), !!veg, available !== false,
        prep_minutes || 20, sort_order || 0,
-       ['breakfast','lunch','dinner'].includes(meal_slot) ? meal_slot : 'all',
+       normSlots(meal_slot),
        !!is_combo, JSON.stringify(Array.isArray(allergens) ? allergens : [])]
     );
     res.status(201).json({ item: rows[0] });
@@ -269,6 +281,7 @@ router.put(
       if (req.body[f] !== undefined) {
         let v = req.body[f];
         if (f === 'price_paise') v = Math.round(Number(v));
+        if (f === 'meal_slot') v = normSlots(v);
         params.push(v);
         sets.push(`${f} = $${params.length}`);
       }
