@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS users (
 );
 ALTER TABLE users ADD COLUMN IF NOT EXISTS lat double precision;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS lng double precision;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS veg_only boolean NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS healthy_default boolean NOT NULL DEFAULT false;
 
 -- OTP login codes (hashed, single-use, expiring)
 CREATE TABLE IF NOT EXISTS otp_codes (
@@ -33,6 +35,7 @@ CREATE TABLE IF NOT EXISTS otp_codes (
   used boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
 CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_codes(phone);
 
 CREATE TABLE IF NOT EXISTS restaurants (
@@ -46,6 +49,7 @@ CREATE TABLE IF NOT EXISTS restaurants (
   phone text,
   image_url text,
   fssai text,
+  aadhar text,
   status text NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','approved','suspended','rejected')),
   is_open boolean NOT NULL DEFAULT true,
@@ -214,6 +218,27 @@ CREATE TABLE IF NOT EXISTS coupons (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- Customer memory: favorites + coupon issuances survive phone changes/reinstalls.
+CREATE TABLE IF NOT EXISTS favorites (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  customer_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  entity_type text NOT NULL CHECK (entity_type IN ('restaurant','dish')),
+  entity_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (customer_id, entity_type, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_favorites_customer ON favorites(customer_id);
+
+CREATE TABLE IF NOT EXISTS coupon_issuances (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  coupon_code text NOT NULL,
+  source text,
+  issued_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (user_id, coupon_code)
+);
+CREATE INDEX IF NOT EXISTS idx_coupon_issuances_user ON coupon_issuances(user_id);
+
 CREATE TABLE IF NOT EXISTS support_tickets (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -286,6 +311,7 @@ CREATE TABLE IF NOT EXISTS restaurant_applications (
   lng double precision,
   fssai text,
   photo_url text NOT NULL,
+  aadhar text,
   status text NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','approved','rejected')),
   admin_note text,

@@ -867,9 +867,9 @@ router.put(
         owner = c.rows[0];
       }
       const rRes = await db.query(
-        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, verified, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,true,'approved') RETURNING *`,
-        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai]
+        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, verified, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,'approved') RETURNING *`,
+        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai, app.aadhar || null]
       );
       await notify(owner.id, '🎉 Your restaurant is live!',
         `"${app.restaurant_name}" is verified and open for business on Mana Nellore!`);
@@ -878,6 +878,58 @@ router.put(
       await audit(req, 'application_rejected', 'restaurant_application', app.id, { admin_note });
     }
     res.json({ ok: true, status });
+  })
+);
+
+// POST /api/admin/restaurants/onboard — admin onboards a restaurant directly
+// (for busy owners who can't fill the application themselves).
+// Creates the owner profile + a live, verified restaurant in one step.
+router.post(
+  '/restaurants/onboard',
+  ah(async (req, res) => {
+    const { restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url } = req.body || {};
+    if (!restaurant_name || !String(restaurant_name).trim() ||
+        !owner_name || !String(owner_name).trim()) {
+      return res.status(400).json({ error: 'Restaurant name and owner name are required' });
+    }
+    const cleanPhone = String(phone || '').replace(/\D/g, '').slice(-10);
+    if (!/^[6-9]\d{9}$/.test(cleanPhone)) {
+      return res.status(400).json({ error: 'A valid 10-digit mobile number is required' });
+    }
+    if (!address || !String(address).trim()) {
+      return res.status(400).json({ error: 'Restaurant address is required' });
+    }
+    if (!fssai || !String(fssai).trim()) {
+      return res.status(400).json({ error: 'FSSAI license number is required' });
+    }
+    const cleanAadhar = String(aadhar || '').replace(/\D/g, '');
+    if (cleanAadhar && !/^\d{12}$/.test(cleanAadhar)) {
+      return res.status(400).json({ error: 'Aadhar must be 12 digits' });
+    }
+    // Find or create the owner's restaurant_owner profile (same phone, own profile)
+    let uRes = await db.query(
+      "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner'", [cleanPhone]
+    );
+    let owner = uRes.rows[0];
+    if (!owner) {
+      const c = await db.query(
+        "INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner') RETURNING *",
+        [cleanPhone, String(owner_name).trim()]
+      );
+      owner = c.rows[0];
+    }
+    const rRes = await db.query(
+      `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, verified, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true,'approved') RETURNING *`,
+      [owner.id, String(restaurant_name).trim(), String(address).trim(),
+       lat || null, lng || null, cleanPhone,
+       photo_url || null, String(fssai).trim(), cleanAadhar || null]
+    );
+    await notify(owner.id, '🎉 Your restaurant is live!',
+      `"${String(restaurant_name).trim()}" is verified and open for business on Mana Nellore!`);
+    await audit(req, 'restaurant_onboarded_by_admin', 'restaurant', rRes.rows[0].id,
+      { restaurant_name: String(restaurant_name).trim(), phone: cleanPhone });
+    res.status(201).json({ restaurant: rRes.rows[0] });
   })
 );
 

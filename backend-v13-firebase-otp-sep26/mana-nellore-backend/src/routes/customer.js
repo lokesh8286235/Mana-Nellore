@@ -287,6 +287,17 @@ router.post(
     const myCoupon = await mkCoupon('ME');
     const friendCoupon = await mkCoupon('FR');
     await db.query('UPDATE users SET referred_by = $1 WHERE id = $2', [friend.rows[0].id, req.user.id]);
+    // Record issuance so GET /api/customer/coupons can list them (survives reinstalls)
+    await db.query(
+      `INSERT INTO coupon_issuances (user_id, coupon_code, source) VALUES ($1, $2, 'referral')
+       ON CONFLICT (user_id, coupon_code) DO NOTHING`,
+      [req.user.id, myCoupon]
+    );
+    await db.query(
+      `INSERT INTO coupon_issuances (user_id, coupon_code, source) VALUES ($1, $2, 'referral')
+       ON CONFLICT (user_id, coupon_code) DO NOTHING`,
+      [friend.rows[0].id, friendCoupon]
+    );
     await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
       [friend.rows[0].id, '🎉 Your friend joined Mana Nellore!',
        `Thanks for spreading the word! Here's Rs 50 off your next order: ${friendCoupon}`]);
@@ -309,5 +320,121 @@ router.post(
   })
 );
 
-module.exports = router;
+// ---- Favorites: server-side memory so hearts survive phone changes/reinstalls ----
+router.get(
+  '/favorites',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      'SELECT entity_type, entity_id FROM favorites WHERE customer_id = $1 ORDER BY created_at',
+      [req.user.id]
+    );
+    res.json({ favorites: rows });
+  })
+);
+
+router.post(
+  '/favorites',
+  ah(async (req, res) => {
+    const { entity_type, entity_id } = req.body || {};
+    if (!['restaurant', 'dish'].includes(entity_type)) {
+      return res.status(400).json({ error: 'entity_type must be restaurant or dish' });
+    }
+    if (!entity_id) return res.status(400).json({ error: 'entity_id is required' });
+    await db.query(
+      `INSERT INTO favorites (customer_id, entity_type, entity_id)
+       VALUES ($1, $2, $3) ON CONFLICT (customer_id, entity_type, entity_id) DO NOTHING`,
+      [req.user.id, entity_type, String(entity_id)]
+    );
+    res.status(201).json({ ok: true });
+  })
+);
+
+router.delete(
+  '/favorites',
+  ah(async (req, res) => {
+    const { entity_type, entity_id } = req.body || {};
+    if (!entity_type || !entity_id) {
+      return res.status(400).json({ error: 'entity_type and entity_id are required' });
+    }
+    await db.query(
+      'DELETE FROM favorites WHERE customer_id = $1 AND entity_type = $2 AND entity_id = $3',
+      [req.user.id, entity_type, String(entity_id)]
+    );
+    res.json({ ok: true });
+  })
+);
+
+// ---- Preferences: veg-only + healthy defaults follow the customer ----
+router.get(
+  '/preferences',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      'SELECT veg_only, healthy_default FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    res.json({ preferences: { veg_only: !!rows[0].veg_only, healthy_default: !!rows[0].healthy_default } });
+  })
+);
+
+router.put(
+  '/preferences',
+  ah(async (req, res) => {
+    const sets = [];
+    const params = [];
+    if (req.body.veg_only !== undefined) {
+      params.push(!!req.body.veg_only);
+      sets.push(`veg_only = $${params.length}`);
+    }
+    if (req.body.healthy_default !== undefined) {
+      params.push(!!req.body.healthy_default);
+      sets.push(`healthy_default = $${params.length}`);
+    }
+    if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+    params.push(req.user.id);
+    const { rows } = await db.query(
+      `UPDATE users SET ${sets.join(', ')} WHERE id = $${params.length}
+       RETURNING veg_only, healthy_default`,
+      params
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    res.json({ preferences: { veg_only: !!rows[0].veg_only, healthy_default: !!rows[0].healthy_default } });
+  })
+);
+
+// ---- My coupons: only codes actually issued to this customer, with live status ----
+router.get(
+  '/coupons',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT ci.coupon_code AS code, ci.source, ci.issued_at,
+              c.discount_type, c.value, c.min_order_paise, c.max_discount_paise,
+              c.active, c.valid_from, c.valid_to
+       FROM coupon_issuances ci
+       LEFT JOIN coupons c ON c.code = ci.coupon_code
+       WHERE ci.user_id = $1
+       ORDER BY ci.issued_at DESC`,
+      [req.user.id]
+    );
+    const now = new Date();
+    const coupons = rows.map((r) => {
+      let status = 'usable';
+      if (!r.active) status = 'inactive';
+      else if (r.valid_from && new Date(r.valid_from) > now) status = 'upcoming';
+      else if (r.valid_to && new Date(r.valid_to) < now) status = 'expired';
+      return {
+        code: r.code,
+        source: r.source,
+        issued_at: r.issued_at,
+        discount_type: r.discount_type,
+        value: r.value,
+        min_order_paise: r.min_order_paise,
+        max_discount_paise: r.max_discount_paise,
+        status
+      };
+    });
+    res.json({ coupons });
+  })
+);
+
 module.exports = router;

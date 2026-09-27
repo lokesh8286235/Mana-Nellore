@@ -24,22 +24,32 @@ router.get(
 
 // POST /api/applications — restaurant onboarding application.
 // A photo is MANDATORY: the application cannot be submitted without one.
+// Address, FSSAI license and owner Aadhar are also mandatory.
 router.post(
   '/applications',
   ah(async (req, res) => {
-    const { restaurant_name, owner_name, phone, address, lat, lng, fssai, photo_url } = req.body || {};
+    const { restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url } = req.body || {};
     if (!restaurant_name || !owner_name || !phone) {
       return res.status(400).json({ error: 'Restaurant name, owner name and phone are required' });
+    }
+    if (!address || !String(address).trim()) {
+      return res.status(400).json({ error: 'Restaurant address is required' });
+    }
+    if (!fssai || !String(fssai).trim()) {
+      return res.status(400).json({ error: 'FSSAI license number is required' });
+    }
+    if (!aadhar || !/^\d{12}$/.test(String(aadhar).replace(/\D/g, ''))) {
+      return res.status(400).json({ error: 'A valid 12-digit owner Aadhar number is required' });
     }
     if (!photo_url) {
       return res.status(400).json({ error: 'A restaurant photo is required to apply' });
     }
     const { rows } = await db.query(
       `INSERT INTO restaurant_applications
-         (restaurant_name, owner_name, phone, address, lat, lng, fssai, photo_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+         (restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
       [restaurant_name, owner_name, phone, address || null, lat || null, lng || null,
-       fssai || null, photo_url]
+       fssai || null, String(aadhar).replace(/\D/g, ''), photo_url]
     );
     res.status(201).json({ application: rows[0] });
   })

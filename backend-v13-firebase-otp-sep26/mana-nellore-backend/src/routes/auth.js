@@ -2,7 +2,6 @@
 // fingerprint (WebAuthn) login for riders.
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const https = require('https');
 const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { signToken, authenticate, ah } = require('../middleware/auth');
@@ -22,7 +21,7 @@ function normalizePhone(input) {
   return /^\d{10}$/.test(ten) ? ten : null;
 }
 
-// Shared find-or-create used by both OTP verification and Firebase login.
+// Shared find-or-create used by OTP verification.
 async function makeReferralCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -56,54 +55,12 @@ async function findOrCreateUserByPhone(phone, role, name) {
   return user;
 }
 
-// ---------- Firebase Phone Auth verification ----------
-// Verifies a Firebase ID token WITHOUT firebase-admin: the token is a standard
-// RS256 JWT signed by Google; we fetch Google's public certs and check
-// signature, audience, issuer and expiry ourselves.
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'mana-nellore';
-let fbCerts = null;
-let fbCertsExp = 0;
-function getFirebaseCerts() {
-  return new Promise((resolve, reject) => {
-    if (fbCerts && Date.now() < fbCertsExp) return resolve(fbCerts);
-    https
-      .get(
-        'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com',
-        (res) => {
-          let raw = '';
-          res.on('data', (c) => (raw += c));
-          res.on('end', () => {
-            try {
-              const certs = JSON.parse(raw);
-              const m = /max-age=(\d+)/.exec(res.headers['cache-control'] || '');
-              fbCerts = certs;
-              fbCertsExp = Date.now() + (m ? parseInt(m[1], 10) : 3600) * 1000;
-              resolve(certs);
-            } catch (e) {
-              reject(e);
-            }
-          });
-        }
-      )
-      .on('error', reject);
-  });
-}
-async function verifyFirebaseIdToken(idToken) {
-  const certs = await getFirebaseCerts();
-  const decoded = jwt.decode(idToken, { complete: true });
-  const kid = decoded && decoded.header && decoded.header.kid;
-  const cert = kid && certs[kid];
-  if (!cert) throw new Error('Unknown signing key');
-  return jwt.verify(idToken, cert, {
-    algorithms: ['RS256'],
-    audience: FIREBASE_PROJECT_ID,
-    issuer: 'https://securetoken.google.com/' + FIREBASE_PROJECT_ID,
-  });
-}
-
 // POST /api/auth/send-otp { phone }
-// With DEV_OTP=true the code is returned in the response for testing;
-// otherwise it is only logged server-side (wire an SMS provider here).
+// THE OTP API. With DEV_OTP=true the code is returned in the response for testing.
+// Otherwise a real SMS provider must send the code — WIRE IT HERE (see OTP_SPEC.md):
+// call the provider with `+91${phone}` and the 6-digit `code` right after the
+// otp_codes INSERT below. If the provider call fails, delete the row / return 500
+// so the user is never stuck with a code they did not receive.
 router.post(
   '/send-otp',
   ah(async (req, res) => {
@@ -155,44 +112,6 @@ router.post(
       return res.status(401).json({ error: 'Invalid or expired OTP' });
     }
     await db.query('UPDATE otp_codes SET used = true WHERE id = $1', [otp.id]);
-
-    const user = await findOrCreateUserByPhone(phone, role, name);
-    const token = signToken(user);
-    res.json({
-      token,
-      user: { id: user.id, phone: user.phone, name: user.name, role: user.role }
-    });
-  })
-);
-
-// POST /api/auth/firebase { idToken, name?, role? }
-// Real-SMS login via Firebase Phone Auth. The frontend signs the user in with
-// Firebase, sends the Firebase ID token here, we verify it with Google's
-// public certs and issue our own app JWT. role: customer | restaurant_owner | rider.
-router.post(
-  '/firebase',
-  ah(async (req, res) => {
-    const { idToken, name } = req.body || {};
-    const role = (req.body && req.body.role) || 'customer';
-    if (!['customer', 'restaurant_owner', 'rider'].includes(role)) {
-      return res.status(400).json({ error: 'Invalid role' });
-    }
-    if (!idToken) {
-      return res.status(400).json({ error: 'Missing login token' });
-    }
-    let claims;
-    try {
-      claims = await verifyFirebaseIdToken(idToken);
-    } catch (e) {
-      return res.status(401).json({ error: 'Login verification failed. Please try again.' });
-    }
-    if (!claims.phone_number) {
-      return res.status(401).json({ error: 'Phone number not verified. Please try again.' });
-    }
-    const phone = normalizePhone(claims.phone_number);
-    if (!phone) {
-      return res.status(401).json({ error: 'Invalid phone number' });
-    }
 
     const user = await findOrCreateUserByPhone(phone, role, name);
     const token = signToken(user);

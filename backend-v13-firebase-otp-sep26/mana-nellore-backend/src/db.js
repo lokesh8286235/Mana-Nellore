@@ -136,6 +136,30 @@ async function migrate() {
   await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS cancelled_deliveries int NOT NULL DEFAULT 0');
   await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now()');
   await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS requires_student boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS aadhar text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar text');
+
+  // Customer memory: preferences, favorites, coupon issuances (survive reinstalls)
+  await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS veg_only boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS healthy_default boolean NOT NULL DEFAULT false');
+  await q(`CREATE TABLE IF NOT EXISTS favorites (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    entity_type text NOT NULL CHECK (entity_type IN ('restaurant','dish')),
+    entity_id text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (customer_id, entity_type, entity_id)
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_favorites_customer ON favorites(customer_id)');
+  await q(`CREATE TABLE IF NOT EXISTS coupon_issuances (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    coupon_code text NOT NULL,
+    source text,
+    issued_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, coupon_code)
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_coupon_issuances_user ON coupon_issuances(user_id)');
 
   // Backfill share tokens for old orders
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
