@@ -63,7 +63,9 @@ router.get(
               (SELECT ROUND(AVG(EXTRACT(EPOCH FROM (o.packed_at - o.placed_at)) / 60))
                FROM orders o
                WHERE o.restaurant_id = r.id AND o.packed_at IS NOT NULL
-                 AND o.placed_at > now() - interval '30 days') AS avg_pack_minutes
+                 AND o.placed_at > now() - interval '30 days') AS avg_pack_minutes,
+              (SELECT EXISTS (SELECT 1 FROM menu_items mi
+               WHERE mi.restaurant_id = r.id AND mi.veg = true AND mi.available = true)) AS has_veg
        FROM restaurants r WHERE ${conditions.join(' AND ')} ORDER BY r.rating_avg DESC, r.name ASC`,
       params
     );
@@ -99,6 +101,7 @@ router.get(
         chef_photo: r.chef_photo,
         distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
         delivery_fee_paise: fee,
+        has_veg: !!r.has_veg,
         eta_minutes: distanceKm == null ? 30 : Math.round(20 + distanceKm * 3)
       };
     });
