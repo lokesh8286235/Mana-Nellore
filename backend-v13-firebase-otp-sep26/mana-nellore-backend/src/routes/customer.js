@@ -122,21 +122,23 @@ router.delete(
 );
 
 // ---- Support tickets (any authenticated role; users see only their own) ----
+// Photo-aware version (kept); the older no-photo duplicate was removed so
+// ticket photos actually reach the server.
 router.post(
   '/support/tickets',
   ah(async (req, res) => {
-    const { order_id, category, subject, message } = req.body;
+    const { order_id, category, subject, message, photo_url } = req.body;
     if (!subject || !message) {
       return res.status(400).json({ error: 'Subject and message are required' });
     }
     if (order_id) {
-      const o = await db.query('SELECT id FROM orders WHERE id = $1', [order_id]);
+      const o = await db.query('SELECT id FROM orders WHERE id = $1 AND customer_id = $2', [order_id, req.user.id]);
       if (!o.rows[0]) return res.status(400).json({ error: 'Order not found' });
     }
     const { rows } = await db.query(
-      `INSERT INTO support_tickets (user_id, order_id, category, subject, message)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [req.user.id, order_id || null, category || null, subject, message]
+      `INSERT INTO support_tickets (user_id, order_id, category, subject, message, photo_url)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.user.id, order_id || null, category || null, subject, message, photo_url || null]
     );
     res.status(201).json({ ticket: rows[0] });
   })
@@ -184,40 +186,6 @@ router.put(
       [name || null, dob || null, req.user.id]
     );
     res.json({ profile: rows[0] });
-  })
-);
-
-// ---- Support tickets: photo attachments, resolution notes visible ----
-// ---- Support tickets (any authenticated role; users see only their own) ----
-router.post(
-  '/support/tickets',
-  ah(async (req, res) => {
-    const { order_id, category, subject, message, photo_url } = req.body;
-    if (!subject || !message) {
-      return res.status(400).json({ error: 'Subject and message are required' });
-    }
-    if (order_id) {
-      const o = await db.query('SELECT id FROM orders WHERE id = $1 AND customer_id = $2', [order_id, req.user.id]);
-      if (!o.rows[0]) return res.status(400).json({ error: 'Order not found' });
-    }
-    const { rows } = await db.query(
-      `INSERT INTO support_tickets (user_id, order_id, category, subject, message, photo_url)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [req.user.id, order_id || null, category || null, subject, message, photo_url || null]
-    );
-    res.status(201).json({ ticket: rows[0] });
-  })
-);
-
-router.get(
-  '/support/tickets',
-  ah(async (req, res) => {
-    // Includes the admin's resolution note so the customer always sees WHY.
-    const { rows } = await db.query(
-      'SELECT * FROM support_tickets WHERE user_id = $1 ORDER BY created_at DESC',
-      [req.user.id]
-    );
-    res.json({ tickets: rows });
   })
 );
 

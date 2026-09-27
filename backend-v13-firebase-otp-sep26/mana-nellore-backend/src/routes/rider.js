@@ -459,31 +459,36 @@ router.post(
       payout = riderPayoutPaise(config.riderPayout, distanceKm);
     }
 
-    await db.query(
-      `INSERT INTO rider_payouts (rider_id, order_id, amount_paise, distance_km)
-       VALUES ($1, $2, $3, $4) ON CONFLICT (order_id) DO NOTHING`,
-      [rider.id, order.id, payout, distanceKm]
-    );
-    await transition(order.id, 'delivered', 'rider');
-
-    // COD: rider must explicitly confirm the exact cash amount collected.
+    // COD: validate cash collection BEFORE any mutation — a failed confirmation
+    // must not leave the order marked delivered with money uncollected.
     const cod = order.payment_method === 'cod' && order.payment_status === 'pending';
     let paymentStatus = order.payment_status;
+    let cashPaise = 0;
     if (cod) {
       const cashConfirmed = req.body.cash_confirmed === true;
-      const cashPaise = Math.round(Number(req.body.cash_amount_paise) || 0);
+      cashPaise = Math.round(Number(req.body.cash_amount_paise) || 0);
       if (!cashConfirmed || cashPaise !== Number(order.total_paise)) {
         return res.status(400).json({
           error: `Please confirm you collected exactly Rs ${(order.total_paise / 100).toFixed(2)} in cash`
         });
       }
       paymentStatus = 'collected';
+    }
+
+    await db.query(
+      `INSERT INTO rider_payouts (rider_id, order_id, amount_paise, distance_km)
+       VALUES ($1, $2, $3, $4) ON CONFLICT (order_id) DO NOTHING`,
+      [rider.id, order.id, payout, distanceKm]
+    );
+    if (cod) {
       await db.query(
         `INSERT INTO rider_cod_ledger (rider_id, order_id, amount_paise)
          VALUES ($1, $2, $3) ON CONFLICT (order_id) DO NOTHING`,
         [rider.id, order.id, cashPaise]
       );
     }
+    await transition(order.id, 'delivered', 'rider');
+
     const deliveryPhoto = req.body.delivery_photo || null;
     await db.query(
       'UPDATE orders SET delivered_at = now(), payment_status = $1, delivery_photo = COALESCE($2, delivery_photo) WHERE id = $3',

@@ -239,11 +239,15 @@ router.get(
   '/orders/:id',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      `SELECT o.*, r.name AS restaurant_name,
-              a.line1, a.line2, a.city, ru.name AS rider_name, ru.phone AS rider_phone
+      // No customer address: admin sees order + restaurant + rider context only.
+      `SELECT o.id, o.status, o.subtotal_paise, o.discount_paise, o.delivery_fee_paise,
+              o.platform_fee_paise, o.tax_paise, o.total_paise, o.payment_method,
+              o.payment_status, o.order_type, o.tip_paise, o.no_cutlery, o.delivery_note,
+              o.packed_at, o.placed_at, o.delivered_at, o.eta_at, o.timeline,
+              r.name AS restaurant_name,
+              ru.name AS rider_name, ru.phone AS rider_phone
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
-       LEFT JOIN addresses a ON a.id = o.address_id
        LEFT JOIN riders rd ON rd.id = o.rider_id
        LEFT JOIN users ru ON ru.id = rd.user_id
        WHERE o.id = $1`,
@@ -509,8 +513,9 @@ router.get(
     }
     const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
     const { rows } = await db.query(
-      `SELECT t.*, u.name AS user_name, u.phone AS user_phone, u.role AS user_role
-       FROM support_tickets t JOIN users u ON u.id = t.user_id
+      // No customer PII in admin: ticket list shows no names or phone numbers.
+      // (Ticket detail shows the customer's orders as transaction context.)
+      `SELECT t.* FROM support_tickets t
        ${where} ORDER BY t.created_at DESC LIMIT 100`,
       params
     );
@@ -542,6 +547,72 @@ router.put(
         `Resolution: ${rows[0].resolution_note}`);
     }
     res.json({ ticket: rows[0] });
+  })
+);
+
+// POST /api/admin/tickets/:id/resolve-action { action: 'refund'|'reorder', resolution_note }
+// "Food never arrived" unhappy path: admin picks refund or fresh reorder.
+// Resolution note is required (same rule as closing a ticket).
+router.post(
+  '/tickets/:id/resolve-action',
+  ah(async (req, res) => {
+    const { action, resolution_note } = req.body;
+    if (!['refund', 'reorder'].includes(action)) {
+      return res.status(400).json({ error: 'Action must be refund or reorder' });
+    }
+    if (!(resolution_note || '').trim()) {
+      return res.status(400).json({ error: 'A resolution note is required' });
+    }
+    const t = await db.query('SELECT * FROM support_tickets WHERE id = $1', [req.params.id]);
+    const ticket = t.rows[0];
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+    if (!ticket.order_id) return res.status(400).json({ error: 'Ticket has no order attached' });
+    const o = await db.query('SELECT * FROM orders WHERE id = $1', [ticket.order_id]);
+    const order = o.rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    let note = (resolution_note || '').trim();
+    if (action === 'refund') {
+      if (!['paid', 'collected'].includes(order.payment_status)) {
+        return res.status(409).json({ error: `Order payment is '${order.payment_status}' — nothing to refund` });
+      }
+      await db.query("UPDATE orders SET payment_status = 'refunded' WHERE id = $1", [order.id]);
+      note = `Refunded Rs ${(order.total_paise / 100).toFixed(2)}. ${note}`;
+      await notify(order.customer_id, 'Refund issued 💸',
+        `Rs ${(order.total_paise / 100).toFixed(2)} has been refunded for your order. ${note}`);
+    } else {
+      // Reorder: clone the order fresh (no discount carried over) and let the
+      // restaurant + rider flow pick it up as a new 'placed' order.
+      const { rows } = await db.query(
+        `INSERT INTO orders (customer_id, restaurant_id, address_id, order_type, table_id,
+            subtotal_paise, delivery_fee_paise, platform_fee_paise, tax_paise, tip_paise,
+            total_paise, payment_method, delivery_note, no_cutlery,
+            recipient_name, recipient_phone)
+         SELECT customer_id, restaurant_id, address_id, order_type, table_id,
+            subtotal_paise, delivery_fee_paise, platform_fee_paise, tax_paise, tip_paise,
+            (subtotal_paise + delivery_fee_paise + platform_fee_paise + tax_paise + tip_paise),
+            payment_method, delivery_note, no_cutlery,
+            recipient_name, recipient_phone
+         FROM orders WHERE id = $1 RETURNING id`,
+        [order.id]
+      );
+      const newId = rows[0].id;
+      await db.query(
+        `INSERT INTO order_items (order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions)
+         SELECT $1, menu_item_id, name_snapshot, unit_price_paise, qty, instructions
+         FROM order_items WHERE order_id = $2`,
+        [newId, order.id]
+      );
+      note = `Fresh reorder placed for you. ${note}`;
+      await notify(order.customer_id, 'Your reorder is on its way 🍱',
+        `We've placed a fresh order for you at no extra charge. ${note}`);
+    }
+    await db.query(
+      `UPDATE support_tickets SET status = 'resolved', resolution_note = $1 WHERE id = $2`,
+      [note, ticket.id]
+    );
+    await audit(req, 'ticket_resolve_action', 'support_ticket', ticket.id, { action });
+    res.json({ ok: true, action });
   })
 );
 
@@ -828,8 +899,10 @@ router.get(
   '/callbacks',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      `SELECT c.*, u.name AS user_name FROM callback_requests c
-       JOIN users u ON u.id = c.user_id
+      // Phone only: the customer explicitly asked for a call back.
+      // No name join — admin does not need customer identities here.
+      `SELECT c.id, c.phone, c.order_id, c.reason, c.status, c.created_at
+       FROM callback_requests c
        WHERE c.status = 'open' ORDER BY c.created_at ASC`
     );
     res.json({ callbacks: rows });
@@ -899,8 +972,9 @@ router.get(
   '/student-applications',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      `SELECT s.*, u.name, u.phone FROM student_applications s
-       JOIN users u ON u.id = s.user_id
+      // No name/phone join: admin verifies the college ID photo only.
+      `SELECT s.id, s.id_photo, s.college, s.status, s.created_at
+       FROM student_applications s
        WHERE s.status = 'pending' ORDER BY s.created_at ASC`
     );
     res.json({ applications: rows });

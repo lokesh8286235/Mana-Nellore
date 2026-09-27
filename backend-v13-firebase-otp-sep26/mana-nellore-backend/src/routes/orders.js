@@ -376,6 +376,36 @@ router.post(
   })
 );
 
+// POST /api/orders/:id/report-missing — "my food never arrived".
+// Creates a missing_food ticket; admin resolves it with a refund or a reorder.
+router.post(
+  '/:id/report-missing',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
+      [req.params.id, req.user.id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (['delivered', 'cancelled', 'rejected'].includes(order.status)) {
+      return res.status(409).json({ error: `This order is already ${order.status}` });
+    }
+    const dup = await db.query(
+      `SELECT id FROM support_tickets WHERE order_id = $1 AND category = 'missing_food'
+       AND status IN ('open','in_progress') LIMIT 1`, [order.id]
+    );
+    if (dup.rows[0]) return res.status(409).json({ error: 'You already reported this order', ticket_id: dup.rows[0].id });
+    const t = await db.query(
+      `INSERT INTO support_tickets (user_id, order_id, category, subject, message)
+       VALUES ($1, $2, 'missing_food', 'Food never arrived',
+               'Customer reports the food never arrived. Please resolve with a refund or a reorder.')
+       RETURNING *`,
+      [req.user.id, order.id]
+    );
+    res.status(201).json({ ticket: t.rows[0] });
+  })
+);
+
 // GET /api/orders?status=
 router.get(
   '/',
