@@ -151,6 +151,35 @@ router.get(
   })
 );
 
+// GET /api/restaurants/:id/rating-summary -> public rating distribution
+router.get(
+  '/:id/rating-summary',
+  ah(async (req, res) => {
+    // Validate UUID format to avoid leaking raw DB errors
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    const { rows } = await db.query(
+      `SELECT COUNT(*)::int AS count,
+              ROUND(AVG(food_rating)::numeric, 1)::float AS avg,
+              COUNT(*) FILTER (WHERE food_rating = 5)::int AS s5,
+              COUNT(*) FILTER (WHERE food_rating = 4)::int AS s4,
+              COUNT(*) FILTER (WHERE food_rating = 3)::int AS s3,
+              COUNT(*) FILTER (WHERE food_rating = 2)::int AS s2,
+              COUNT(*) FILTER (WHERE food_rating = 1)::int AS s1
+       FROM ratings
+       WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL`,
+      [req.params.id]
+    );
+    const r = rows[0];
+    res.json({
+      avg: r.avg == null ? null : Number(r.avg),
+      count: r.count,
+      dist: { 5: r.s5, 4: r.s4, 3: r.s3, 2: r.s2, 1: r.s1 }
+    });
+  })
+);
+
 // GET /api/restaurants/:id -> restaurant + categories + available menu items
 router.get(
   '/:id',
