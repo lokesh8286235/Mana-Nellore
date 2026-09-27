@@ -30,7 +30,7 @@ app.use('/api/', apiLimiter);
 app.use('/api/auth/', authLimiter);
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, service: 'mana-nellore-backend', time: new Date().toISOString() });
+  res.json({ ok: !dbStatus.error, service: 'mana-nellore-backend', db: dbStatus, time: new Date().toISOString() });
 });
 
 app.use('/api/auth', require('./routes/auth'));
@@ -57,6 +57,11 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 8080;
 
+// Tracks DB init state for /api/health. The server always starts so a bad
+// migration shows up as a diagnosable degraded state instead of a silent
+// crash loop.
+const dbStatus = { ready: false, phase: null, error: null };
+
 if (!process.env.JWT_SECRET) {
   console.error('FATAL: JWT_SECRET is not set');
   process.exit(1);
@@ -64,9 +69,13 @@ if (!process.env.JWT_SECRET) {
 
 initDb()
   .then(() => {
-    app.listen(PORT, () => console.log(`mana-nellore-backend listening on ${PORT}`));
+    dbStatus.ready = true;
   })
   .catch((e) => {
-    console.error('Database init failed:', e.message);
-    process.exit(1);
+    dbStatus.phase = e.phase || 'unknown';
+    dbStatus.error = e.message;
+    console.error(`Database init failed in phase [${dbStatus.phase}]:`, e.message);
+  })
+  .finally(() => {
+    app.listen(PORT, () => console.log(`mana-nellore-backend listening on ${PORT} (db ready: ${dbStatus.ready})`));
   });

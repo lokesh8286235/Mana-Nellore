@@ -17,9 +17,15 @@ function query(text, params) {
 
 async function initDb() {
   const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
-  await pool.query(schema);
-  await migrate();
-  await seed();
+  try {
+    await pool.query(schema);
+  } catch (e) { e.phase = 'schema'; throw e; }
+  try {
+    await migrate();
+  } catch (e) { e.phase = 'migrate'; throw e; }
+  try {
+    await seed();
+  } catch (e) { e.phase = 'seed'; throw e; }
   console.log('Database ready');
 }
 
