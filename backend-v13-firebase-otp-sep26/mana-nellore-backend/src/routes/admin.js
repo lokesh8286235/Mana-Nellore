@@ -47,29 +47,34 @@ router.get(
 
     const q = async (text, params = []) => (await db.query(text, params)).rows[0];
 
-    const ordersToday = await q(
-      "SELECT COUNT(*) AS c FROM orders WHERE placed_at >= $1", [iso]);
-    const salesToday = await q(
-      "SELECT COALESCE(SUM(total_paise),0) AS s FROM orders WHERE placed_at >= $1 AND status != 'cancelled'", [iso]);
-    const activeOrders = await q(
-      `SELECT COUNT(*) AS c FROM orders WHERE status = ANY($1)`, [ACTIVE_STATUSES]);
-    const onlineRiders = await q(
-      "SELECT COUNT(*) AS c FROM riders WHERE online = true AND status = 'approved'");
-    const cancellationsToday = await q(
-      "SELECT COUNT(*) AS c FROM orders WHERE placed_at >= $1 AND status = 'cancelled'", [iso]);
-    const refundsToday = await q(
-      "SELECT COUNT(*) AS c, COALESCE(SUM(total_paise),0) AS s FROM orders WHERE placed_at >= $1 AND payment_status = 'refunded'", [iso]);
-    const openTickets = await q(
-      "SELECT COUNT(*) AS c FROM support_tickets WHERE status IN ('open','in_progress')");
-    const contribution = await q(
-      `SELECT COALESCE(SUM(o.platform_fee_paise + o.commission_paise - COALESCE(rp.amount_paise, 0)), 0) AS s
-       FROM orders o LEFT JOIN rider_payouts rp ON rp.order_id = o.id
-       WHERE o.status = 'delivered' AND o.placed_at >= $1`, [iso]);
-    const counts = await q(
-      `SELECT
-         (SELECT COUNT(*) FROM restaurants WHERE status = 'approved') AS restaurants,
-         (SELECT COUNT(*) FROM riders WHERE status = 'approved') AS riders,
-         (SELECT COUNT(DISTINCT customer_id) FROM orders) AS customers`);
+    // All independent counts run in parallel — sequential awaits made this
+    // endpoint ~9x slower than the database actually needs.
+    const [
+      ordersToday,
+      salesToday,
+      activeOrders,
+      onlineRiders,
+      cancellationsToday,
+      refundsToday,
+      openTickets,
+      contribution,
+      counts
+    ] = await Promise.all([
+      q("SELECT COUNT(*) AS c FROM orders WHERE placed_at >= $1", [iso]),
+      q("SELECT COALESCE(SUM(total_paise),0) AS s FROM orders WHERE placed_at >= $1 AND status != 'cancelled'", [iso]),
+      q(`SELECT COUNT(*) AS c FROM orders WHERE status = ANY($1)`, [ACTIVE_STATUSES]),
+      q("SELECT COUNT(*) AS c FROM riders WHERE online = true AND status = 'approved'"),
+      q("SELECT COUNT(*) AS c FROM orders WHERE placed_at >= $1 AND status = 'cancelled'", [iso]),
+      q("SELECT COUNT(*) AS c, COALESCE(SUM(total_paise),0) AS s FROM orders WHERE placed_at >= $1 AND payment_status = 'refunded'", [iso]),
+      q("SELECT COUNT(*) AS c FROM support_tickets WHERE status IN ('open','in_progress')"),
+      q(`SELECT COALESCE(SUM(o.platform_fee_paise + o.commission_paise - COALESCE(rp.amount_paise, 0)), 0) AS s
+         FROM orders o LEFT JOIN rider_payouts rp ON rp.order_id = o.id
+         WHERE o.status = 'delivered' AND o.placed_at >= $1`, [iso]),
+      q(`SELECT
+           (SELECT COUNT(*) FROM restaurants WHERE status = 'approved') AS restaurants,
+           (SELECT COUNT(*) FROM riders WHERE status = 'approved') AS riders,
+           (SELECT COUNT(DISTINCT customer_id) FROM orders) AS customers`)
+    ]);
 
     res.json({
       orders_today: Number(ordersToday.c),
@@ -188,6 +193,24 @@ router.get(
       params
     );
     res.json({ riders: rows.map((r) => ({ ...r, rating_avg: Number(r.rating_avg) })) });
+  })
+);
+
+// Single rider detail — used by the rider drawer (avoids downloading the full list).
+router.get(
+  '/riders/:id',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT rd.*, u.name, u.phone,
+              (SELECT COUNT(*) FROM orders o WHERE o.rider_id = rd.id) AS total_deliveries
+       FROM riders rd JOIN users u ON u.id = rd.user_id
+       WHERE rd.id = $1`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Rider not found' });
+    const r = rows[0];
+    r.rating_avg = Number(r.rating_avg);
+    res.json({ rider: r });
   })
 );
 
