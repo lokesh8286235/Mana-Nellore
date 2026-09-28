@@ -22,6 +22,29 @@ router.get(
   })
 );
 
+// GET /api/applications/check?phone= — does this number already have a
+// restaurant account, a restaurant, or a pending application? Lets the
+// "new restaurant" form warn before the user fills everything in.
+router.get(
+  '/applications/check',
+  ah(async (req, res) => {
+    let digits = String(req.query.phone || '').replace(/\D/g, '');
+    if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+    if (!/^\d{10}$/.test(digits)) return res.json({ registered: false, applied: false });
+    const { rows } = await db.query(
+      `SELECT 'registered' AS kind FROM users WHERE RIGHT(phone, 10) = $1 AND role = 'restaurant_owner'
+       UNION ALL
+       SELECT 'registered' FROM restaurants WHERE RIGHT(phone, 10) = $1
+       UNION ALL
+       SELECT 'applied' FROM restaurant_applications WHERE RIGHT(phone, 10) = $1 AND status = 'pending'
+       LIMIT 1`,
+      [digits]
+    );
+    const kind = rows[0] && rows[0].kind;
+    res.json({ registered: kind === 'registered', applied: kind === 'applied' });
+  })
+);
+
 // POST /api/applications — restaurant onboarding application.
 // A photo is MANDATORY: the application cannot be submitted without one.
 // Address, FSSAI license and owner Aadhar are also mandatory.
