@@ -32,6 +32,32 @@ router.post(
     if (!restaurant_name || !owner_name || !phone) {
       return res.status(400).json({ error: 'Restaurant name, owner name and phone are required' });
     }
+    // Normalize to 10 digits so duplicates are caught regardless of formatting.
+    let digits = String(phone).replace(/\D/g, '');
+    if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+    if (!/^\d{10}$/.test(digits)) {
+      return res.status(400).json({ error: 'Enter a valid 10-digit mobile number' });
+    }
+    // Duplicate guard: a number that already has a restaurant account, an
+    // approved restaurant, or a pending application cannot apply again as "new".
+    const dupe = await db.query(
+      `SELECT 'registered' AS kind FROM users WHERE RIGHT(phone, 10) = $1 AND role = 'restaurant_owner'
+       UNION ALL
+       SELECT 'registered' FROM restaurants WHERE RIGHT(phone, 10) = $1
+       UNION ALL
+       SELECT 'applied' FROM restaurant_applications WHERE RIGHT(phone, 10) = $1 AND status = 'pending'
+       LIMIT 1`,
+      [digits]
+    );
+    if (dupe.rows[0]) {
+      const already = dupe.rows[0].kind === 'registered';
+      return res.status(409).json({
+        code: already ? 'already_registered' : 'already_applied',
+        error: already
+          ? 'There is already an account with this mobile number. Please go back and log in.'
+          : 'You have already applied with this mobile number. Your application is under review.'
+      });
+    }
     if (!address || !String(address).trim()) {
       return res.status(400).json({ error: 'Restaurant address is required' });
     }
@@ -48,7 +74,7 @@ router.post(
       `INSERT INTO restaurant_applications
          (restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [restaurant_name, owner_name, phone, address || null, lat || null, lng || null,
+      [restaurant_name, owner_name, digits, address || null, lat || null, lng || null,
        fssai || null, String(aadhar).replace(/\D/g, ''), photo_url]
     );
     res.status(201).json({ application: rows[0] });
