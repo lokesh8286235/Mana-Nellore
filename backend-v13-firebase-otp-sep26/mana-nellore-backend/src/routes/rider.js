@@ -215,7 +215,7 @@ router.get(
     if (!rider) return;
     const { rows } = await db.query(
       `SELECT o.id, o.total_paise, o.placed_at, o.payment_method,
-              r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
+              r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng, r.address AS rest_address,
               a.line1, a.city, a.lat AS addr_lat, a.lng AS addr_lng
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
@@ -243,6 +243,7 @@ router.get(
         placed_at: o.placed_at,
         payment_method: o.payment_method,
         restaurant_name: o.restaurant_name,
+        rest_address: o.rest_address || null,
         address: [o.line1, o.city].filter(Boolean).join(', '),
         distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
         pickup_km: pickupKm == null ? null : Math.round(pickupKm * 10) / 10,
