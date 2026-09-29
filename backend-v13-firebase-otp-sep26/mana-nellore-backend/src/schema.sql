@@ -392,3 +392,73 @@ CREATE TABLE IF NOT EXISTS student_applications (
     CHECK (status IN ('pending','approved','rejected')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- In-app notifications (order updates, SOS, promos). Written by notify() after
+-- order/rider/owner mutations; read via GET /api/customer/notifications.
+CREATE TABLE IF NOT EXISTS notifications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title text NOT NULL,
+  body text NOT NULL,
+  read boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
+
+-- Admin audit trail: every mutating admin action logs who + what + when.
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  admin_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  staff_name text,
+  action text NOT NULL,
+  entity text,
+  entity_id text,
+  meta jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_admin ON audit_logs(admin_id);
+
+-- Rider SOS alerts (one-tap emergency share -> admin bell + sound).
+CREATE TABLE IF NOT EXISTS sos_alerts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  rider_id uuid NOT NULL REFERENCES riders(id) ON DELETE CASCADE,
+  lat double precision,
+  lng double precision,
+  status text NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open','acknowledged','resolved')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sos_alerts_status ON sos_alerts(status, created_at DESC);
+
+-- Dish customization groups, e.g. "Extra toppings" on a pizza (max 3).
+CREATE TABLE IF NOT EXISTS customization_groups (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  menu_item_id uuid NOT NULL REFERENCES menu_items(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  required boolean NOT NULL DEFAULT false,
+  max_select int NOT NULL DEFAULT 1,
+  sort int NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cust_groups_item ON customization_groups(menu_item_id);
+
+-- Options inside a customization group, e.g. "Extra cheese +₹30".
+CREATE TABLE IF NOT EXISTS customization_options (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  group_id uuid NOT NULL REFERENCES customization_groups(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  price_paise int NOT NULL DEFAULT 0,
+  sort int NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cust_options_group ON customization_options(group_id);
+
+-- Hot-path indexes (polls, aggregates, dashboards)
+CREATE INDEX IF NOT EXISTS idx_orders_placed_at ON orders(placed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ratings_ratee ON ratings(ratee_type, ratee_id);
+CREATE INDEX IF NOT EXISTS idx_ratings_order ON ratings(order_id);
+CREATE INDEX IF NOT EXISTS idx_orders_rider_status_delivered
+  ON orders(rider_id, delivered_at) WHERE status = 'delivered';
+CREATE INDEX IF NOT EXISTS idx_orders_restaurant_status ON orders(restaurant_id, status);
+CREATE INDEX IF NOT EXISTS idx_orders_rider_status ON orders(rider_id, status);

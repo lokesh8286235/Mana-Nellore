@@ -31,7 +31,11 @@ router.get(
   '/',
   ah(async (req, res) => {
     const { q, veg, open, lat, lng, meal } = req.query;
-    const cacheKey = JSON.stringify({ q, veg, open, lat, lng, meal });
+    // Round GPS to 2 decimals in the cache key: raw floats would give every
+    // customer a unique key and the shared-query cache would never hit.
+    const rLat = lat == null || lat === '' ? lat : String(Math.round(Number(lat) * 100) / 100);
+    const rLng = lng == null || lng === '' ? lng : String(Math.round(Number(lng) * 100) / 100);
+    const cacheKey = JSON.stringify({ q, veg, open, lat: rLat, lng: rLng, meal });
     const cached = cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
@@ -192,9 +196,15 @@ router.get(
       return res.status(404).json({ error: 'Restaurant not found' });
     }
     const { rows } = await db.query(
-      "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'",
+      `SELECT id, name, description, address, lat, lng, phone, image_url,
+              is_open, opens_at, closes_at, rating_avg, verified,
+              chef_name, chef_photo, chef_story, birthday_dessert, created_at
+       FROM restaurants WHERE id = $1 AND status = 'approved'`,
       [req.params.id]
     );
+    // NOTE: explicit column allowlist — never SELECT * here. Owner-sensitive
+    // columns (aadhar, commission_pct, fssai, gstin, owner_id) must not leak
+    // into the unauthenticated public response.
     const restaurant = rows[0];
     if (!restaurant) return res.status(404).json({ error: 'Restaurant not found' });
 

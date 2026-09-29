@@ -486,11 +486,11 @@ router.get(
   '/refunds/history',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      `SELECT o.id, o.total_paise, o.payment_status, o.placed_at, o.customer_id,
-              u.phone AS customer_phone, u.name AS customer_name,
+      // NOTE: no customer PII in admin responses — customer_id/phone/name
+      // excluded by rule (order + restaurant + amount + status only).
+      `SELECT o.id, o.total_paise, o.payment_status, o.placed_at,
               r.name AS restaurant_name
        FROM orders o
-       LEFT JOIN users u ON u.id = o.customer_id
        LEFT JOIN restaurants r ON r.id = o.restaurant_id
        WHERE o.payment_status = 'refunded'
        ORDER BY o.placed_at DESC LIMIT 100`

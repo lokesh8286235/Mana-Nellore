@@ -382,7 +382,16 @@ router.delete(
 // ---- Orders ----
 function orderDetailQuery(where, params) {
   return db.query(
-    `SELECT o.*, r.name AS restaurant_name,
+    // NOTE: explicit column list — never SELECT o.* here. pickup_photo /
+    // delivery_photo are base64 blobs (up to ~1.5MB) that never change; they
+    // are fetched once via a dedicated endpoint, never on the 2.5s poll.
+    `SELECT o.id, o.customer_id, o.restaurant_id, o.rider_id, o.address_id, o.status,
+            o.subtotal_paise, o.discount_paise, o.delivery_fee_paise, o.platform_fee_paise,
+            o.tax_paise, o.commission_paise, o.total_paise, o.payment_method, o.payment_status,
+            o.delivery_otp_hash, o.cancel_reason, o.timeline, o.placed_at, o.delivered_at,
+            o.eta_at, o.packed_at, o.share_token, o.order_type, o.table_id,
+            o.delivery_note, o.no_cutlery, o.tip_paise, o.recipient_name, o.recipient_phone,
+            r.name AS restaurant_name,
             u.name AS customer_name, u.phone AS customer_phone,
             a.line1, a.line2, a.city, a.lat AS addr_lat, a.lng AS addr_lng,
             ru.name AS rider_name, ru.phone AS rider_phone
@@ -393,7 +402,8 @@ function orderDetailQuery(where, params) {
      LEFT JOIN riders rd ON rd.id = o.rider_id
      LEFT JOIN users ru ON ru.id = rd.user_id
      WHERE ${where}
-     ORDER BY o.placed_at DESC`,
+     ORDER BY o.placed_at DESC
+     LIMIT 100`,
     params
   );
 }
@@ -411,10 +421,21 @@ router.get(
       where += ` AND o.status = $${params.length}`;
     }
     const { rows } = await orderDetailQuery(where, params);
-    for (const o of rows) {
-      const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [o.id]);
-      o.items = items.rows;
+    // Single batched items query — the old per-order loop was an N+1
+    // (1 + N queries every 2.5s poll against an unbounded order history).
+    const ids = rows.map((o) => o.id);
+    let itemsByOrder = {};
+    if (ids.length) {
+      const itemsRes = await db.query(
+        `SELECT id, order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions
+         FROM order_items WHERE order_id = ANY($1)`,
+        [ids]
+      );
+      for (const it of itemsRes.rows) {
+        (itemsByOrder[it.order_id] = itemsByOrder[it.order_id] || []).push(it);
+      }
     }
+    for (const o of rows) o.items = itemsByOrder[o.id] || [];
     res.json({ orders: rows });
   })
 );
