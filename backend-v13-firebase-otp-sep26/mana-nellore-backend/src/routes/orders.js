@@ -179,6 +179,7 @@ router.post(
       );
       const restaurant = rRes.rows[0];
       if (!restaurant) throw { status: 404, message: 'Restaurant not available' };
+      if (restaurant.is_coming_soon) throw { status: 400, message: 'Restaurant is opening soon — not accepting orders yet' };
       if (!restaurant.is_open) throw { status: 400, message: 'Restaurant is currently closed' };
 
       let address = null;
