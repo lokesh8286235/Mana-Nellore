@@ -1218,4 +1218,65 @@ router.put(
   })
 );
 
+// ---- Bulk menu import (audited) ----
+// POST /api/admin/restaurants/:id/menu/import
+// { categories: ["IDLI", ...], items: [{ category, name, price_paise, veg, is_combo }] }
+// For owners who can't add items themselves. Creates missing categories by name,
+// skips exact duplicates, preserves input order. Every import is audit-logged.
+router.post(
+  '/restaurants/:id/menu/import',
+  ah(async (req, res) => {
+    const { rows: rRows } = await db.query('SELECT id FROM restaurants WHERE id = $1', [req.params.id]);
+    if (!rRows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    const rid = rRows[0].id;
+    const body = req.body || {};
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!items.length) return res.status(400).json({ error: 'No items to import' });
+    if (items.length > 500) return res.status(400).json({ error: 'Too many items (max 500)' });
+
+    const catIdByName = {};
+    const maxSort = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM categories WHERE restaurant_id = $1', [rid]);
+    let catSort = Number(maxSort.rows[0].s) || 0;
+    async function catIdFor(rawName) {
+      const name = String(rawName || '').trim();
+      if (!name) return null;
+      if (catIdByName[name]) return catIdByName[name];
+      const ex = await db.query('SELECT id FROM categories WHERE restaurant_id = $1 AND name = $2', [rid, name]);
+      if (ex.rows[0]) { catIdByName[name] = ex.rows[0].id; return ex.rows[0].id; }
+      const c = await db.query(
+        'INSERT INTO categories (restaurant_id, name, sort_order) VALUES ($1, $2, $3) RETURNING id',
+        [rid, name, catSort++]
+      );
+      catIdByName[name] = c.rows[0].id;
+      return c.rows[0].id;
+    }
+    // Pre-create in the given order so tabs sort correctly
+    for (const n of (Array.isArray(body.categories) ? body.categories : [])) await catIdFor(n);
+
+    const maxItemSort = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM menu_items WHERE restaurant_id = $1', [rid]);
+    let itemSort = Number(maxItemSort.rows[0].s) || 0;
+    let created = 0, skipped = 0;
+    for (const it of items) {
+      const name = String(it.name || '').trim();
+      const price = Math.round(Number(it.price_paise));
+      if (!name || !Number.isFinite(price) || price < 0) { skipped++; continue; }
+      const catId = await catIdFor(it.category);
+      const dup = await db.query(
+        `SELECT id FROM menu_items WHERE restaurant_id = $1 AND name = $2
+         AND COALESCE(category_id::text, '') = COALESCE($3::text, '')`,
+        [rid, name, catId]
+      );
+      if (dup.rows[0]) { skipped++; continue; }
+      await db.query(
+        `INSERT INTO menu_items (restaurant_id, category_id, name, price_paise, veg, available, is_combo, sort_order)
+         VALUES ($1, $2, $3, $4, $5, true, $6, $7)`,
+        [rid, catId, name, price, it.veg !== false, !!it.is_combo, itemSort++]
+      );
+      created++;
+    }
+    await audit(req, 'menu_bulk_import', 'restaurant', rid, { created, skipped });
+    res.json({ ok: true, created, skipped });
+  })
+);
+
 module.exports = router;module.exports = router;
