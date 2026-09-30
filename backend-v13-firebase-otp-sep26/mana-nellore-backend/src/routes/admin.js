@@ -1168,4 +1168,18 @@ router.put(
   })
 );
 
+// ---- Mark a restaurant as coming soon ----
+router.put(
+  '/restaurants/:id/coming-soon',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      'UPDATE restaurants SET is_coming_soon = $1 WHERE id = $2 RETURNING id, is_coming_soon',
+      [req.body.is_coming_soon !== false, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    await audit(req, 'restaurant_coming_soon', 'restaurant', req.params.id, { is_coming_soon: rows[0].is_coming_soon });
+    res.json({ ok: true, is_coming_soon: rows[0].is_coming_soon });
+  })
+);
+
 module.exports = router;module.exports = router;
