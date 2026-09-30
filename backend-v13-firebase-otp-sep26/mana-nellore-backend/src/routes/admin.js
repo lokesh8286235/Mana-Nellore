@@ -1182,4 +1182,40 @@ router.put(
   })
 );
 
+// ---- Correct a restaurant's owner login number ----
+// PUT /api/admin/restaurants/:id/owner-phone { phone }
+// Reuses the existing restaurant_owner profile for that phone (same find-or-create
+// semantics as the onboard endpoint), then points the restaurant at it and updates
+// the public contact number. Audited.
+router.put(
+  '/restaurants/:id/owner-phone',
+  ah(async (req, res) => {
+    const cleanPhone = String(req.body.phone || '').replace(/\D/g, '').slice(-10);
+    if (!/^[6-9]\d{9}$/.test(cleanPhone)) {
+      return res.status(400).json({ error: 'A valid 10-digit mobile number is required' });
+    }
+    const { rows: rRows } = await db.query('SELECT * FROM restaurants WHERE id = $1', [req.params.id]);
+    const rest = rRows[0];
+    if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
+    const uRes = await db.query(
+      "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner' ORDER BY created_at DESC",
+      [cleanPhone]
+    );
+    let owner = uRes.rows[0];
+    if (!owner) {
+      const c = await db.query(
+        "INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner') RETURNING *",
+        [cleanPhone, rest.name]
+      );
+      owner = c.rows[0];
+    }
+    const prevOwnerId = rest.owner_id;
+    const prevPhone = rest.phone;
+    await db.query('UPDATE restaurants SET owner_id = $1, phone = $2 WHERE id = $3', [owner.id, cleanPhone, rest.id]);
+    await audit(req, 'restaurant_owner_phone', 'restaurant', rest.id,
+      { from_phone: prevPhone, to_phone: cleanPhone, from_owner: prevOwnerId, to_owner: owner.id });
+    res.json({ ok: true, phone: cleanPhone, owner_id: owner.id });
+  })
+);
+
 module.exports = router;module.exports = router;

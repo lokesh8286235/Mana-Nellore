@@ -8,7 +8,8 @@ const router = express.Router();
 router.use(authenticate, requireRole('restaurant_owner'));
 
 async function ownRestaurantId(userId) {
-  const { rows } = await db.query('SELECT id FROM restaurants WHERE owner_id = $1', [userId]);
+  // Newest first: an owner test account can hold placeholder restaurants; the live one wins.
+  const { rows } = await db.query('SELECT id FROM restaurants WHERE owner_id = $1 ORDER BY created_at DESC', [userId]);
   return rows[0] ? rows[0].id : null;
 }
 
