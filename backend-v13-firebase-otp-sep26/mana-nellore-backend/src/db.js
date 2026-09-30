@@ -69,6 +69,10 @@ async function migrate() {
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS birthday_dessert boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS opens_at_we time');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS is_coming_soon boolean NOT NULL DEFAULT false');
+  // Coming soon means NOT approved yet: any coming-soon restaurant that is still
+  // marked approved+verified gets moved back to pending+unverified (idempotent).
+  await q(`UPDATE restaurants SET verified = false, status = 'pending'
+           WHERE is_coming_soon = true AND status = 'approved'`);
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS closes_at_we time');
 
   // Menu items: meal slots, combos, allergens

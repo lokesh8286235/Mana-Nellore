@@ -35,7 +35,10 @@ router.get(
     const cached = cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
-    const conditions = ["r.status = 'approved'"];
+    // Live (approved) restaurants plus Coming-soon ones (pending, not approved yet).
+    // Coming soon is a visibility state, not an approval: customers see the full
+    // menu but the apps + order guard block ordering until finalized.
+    const conditions = ["(r.status = 'approved' OR r.is_coming_soon = true)"];
     const params = [];
 
     if (q) {
@@ -200,7 +203,7 @@ router.get(
       return res.status(404).json({ error: 'Restaurant not found' });
     }
     const { rows } = await db.query(
-      "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'",
+      "SELECT * FROM restaurants WHERE id = $1 AND (status = 'approved' OR is_coming_soon = true)",
       [req.params.id]
     );
     const restaurant = rows[0];

@@ -859,13 +859,15 @@ router.get(
   })
 );
 
-// PUT /api/admin/applications/:id { status: approved|rejected, admin_note? }
+// PUT /api/admin/applications/:id { status: approved|rejected, admin_note?, coming_soon? }
 // Approving creates the owner profile (separate role profile), the restaurant
-// (verified=true), and notifies the applicant.
+// (verified=true, live) and notifies the applicant — unless coming_soon is true,
+// in which case the restaurant is created pending+unverified under Coming soon.
 router.put(
   '/applications/:id',
   ah(async (req, res) => {
     const { status, admin_note } = req.body;
+    const launchComingSoon = req.body && req.body.coming_soon === true;
     if (!['approved', 'rejected'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
@@ -877,6 +879,7 @@ router.put(
     await db.query('UPDATE restaurant_applications SET status = $1, admin_note = $2 WHERE id = $3',
       [status, admin_note || null, app.id]);
 
+    let restaurantId = null;
     if (status === 'approved') {
       // Find or create the owner's restaurant_owner profile (same phone, own profile)
       let uRes = await db.query(
@@ -891,28 +894,38 @@ router.put(
         owner = c.rows[0];
       }
       const rRes = await db.query(
-        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, verified, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,'approved') RETURNING *`,
-        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai, app.aadhar || null]
+        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, verified, status, is_coming_soon)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai, app.aadhar || null,
+         !launchComingSoon, launchComingSoon ? 'pending' : 'approved', launchComingSoon]
       );
       await seedSuggestedCats(db, rRes.rows[0].id);
-      await notify(owner.id, '🎉 Your restaurant is live!',
-        `"${app.restaurant_name}" is verified and open for business on Mana Nellore!`);
-      await audit(req, 'application_approved', 'restaurant', rRes.rows[0].id, { application_id: app.id });
+      if (launchComingSoon) {
+        await notify(owner.id, '🏗️ Your restaurant is coming soon!',
+          `"${app.restaurant_name}" is listed under Coming soon on Mana Nellore. We will approve and launch it when it is ready!`);
+      } else {
+        await notify(owner.id, '🎉 Your restaurant is live!',
+          `"${app.restaurant_name}" is verified and open for business on Mana Nellore!`);
+      }
+      await audit(req, 'application_approved', 'restaurant', rRes.rows[0].id,
+        { application_id: app.id, coming_soon: launchComingSoon });
+      restaurantId = rRes.rows[0].id;
     } else {
       await audit(req, 'application_rejected', 'restaurant_application', app.id, { admin_note });
     }
-    res.json({ ok: true, status });
+    res.json({ ok: true, status, restaurant_id: restaurantId });
   })
 );
 
 // POST /api/admin/restaurants/onboard — admin onboards a restaurant directly
 // (for busy owners who can't fill the application themselves).
-// Creates the owner profile + a live, verified restaurant in one step.
+// Creates the owner profile + restaurant in one step: live & verified by default,
+// or listed as Coming soon (pending, unverified) when body.coming_soon is true.
 router.post(
   '/restaurants/onboard',
   ah(async (req, res) => {
     const { restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url } = req.body || {};
+    const launchComingSoon = req.body && req.body.coming_soon === true;
     if (!restaurant_name || !String(restaurant_name).trim() ||
         !owner_name || !String(owner_name).trim()) {
       return res.status(400).json({ error: 'Restaurant name and owner name are required' });
@@ -944,17 +957,23 @@ router.post(
       owner = c.rows[0];
     }
     const rRes = await db.query(
-      `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, verified, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true,'approved') RETURNING *`,
+      `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, verified, status, is_coming_soon)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [owner.id, String(restaurant_name).trim(), String(address).trim(),
        lat || null, lng || null, cleanPhone,
-       photo_url || null, String(fssai).trim(), cleanAadhar || null]
+       photo_url || null, String(fssai).trim(), cleanAadhar || null,
+       !launchComingSoon, launchComingSoon ? 'pending' : 'approved', launchComingSoon]
     );
     await seedSuggestedCats(db, rRes.rows[0].id);
-    await notify(owner.id, '🎉 Your restaurant is live!',
-      `"${String(restaurant_name).trim()}" is verified and open for business on Mana Nellore!`);
+    if (launchComingSoon) {
+      await notify(owner.id, '🏗️ Your restaurant is coming soon!',
+        `"${String(restaurant_name).trim()}" is listed under Coming soon on Mana Nellore. We will approve and launch it when it is ready!`);
+    } else {
+      await notify(owner.id, '🎉 Your restaurant is live!',
+        `"${String(restaurant_name).trim()}" is verified and open for business on Mana Nellore!`);
+    }
     await audit(req, 'restaurant_onboarded_by_admin', 'restaurant', rRes.rows[0].id,
-      { restaurant_name: String(restaurant_name).trim(), phone: cleanPhone });
+      { restaurant_name: String(restaurant_name).trim(), phone: cleanPhone, coming_soon: launchComingSoon });
     res.status(201).json({ restaurant: rRes.rows[0] });
   })
 );
@@ -1168,17 +1187,31 @@ router.put(
   })
 );
 
-// ---- Mark a restaurant as coming soon ----
+// ---- Coming soon / Finalize onboarding ----
+// Coming soon means NOT approved yet: marking coming soon un-approves
+// (pending + unverified, suspended stays suspended); finalizing approves
+// (approved + verified) and opens ordering.
 router.put(
   '/restaurants/:id/coming-soon',
   ah(async (req, res) => {
+    const toComingSoon = req.body.is_coming_soon !== false;
     const { rows } = await db.query(
-      'UPDATE restaurants SET is_coming_soon = $1 WHERE id = $2 RETURNING id, is_coming_soon',
-      [req.body.is_coming_soon !== false, req.params.id]
+      `UPDATE restaurants
+       SET is_coming_soon = $1,
+           verified = CASE WHEN $1 THEN false ELSE true END,
+           status = CASE
+             WHEN $1 AND status = 'approved' THEN 'pending'
+             WHEN NOT $1 AND status = 'pending' THEN 'approved'
+             ELSE status END
+       WHERE id = $2
+       RETURNING id, is_coming_soon, verified, status`,
+      [toComingSoon, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    await audit(req, 'restaurant_coming_soon', 'restaurant', req.params.id, { is_coming_soon: rows[0].is_coming_soon });
-    res.json({ ok: true, is_coming_soon: rows[0].is_coming_soon });
+    await audit(req, toComingSoon ? 'restaurant_coming_soon' : 'restaurant_finalized',
+      'restaurant', req.params.id,
+      { is_coming_soon: rows[0].is_coming_soon, verified: rows[0].verified, status: rows[0].status });
+    res.json({ ok: true, is_coming_soon: rows[0].is_coming_soon, verified: rows[0].verified, status: rows[0].status });
   })
 );
 
