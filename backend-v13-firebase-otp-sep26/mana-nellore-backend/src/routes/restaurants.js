@@ -109,6 +109,7 @@ router.get(
         distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
         delivery_fee_paise: fee,
         has_veg: !!r.has_veg,
+        is_coming_soon: !!r.is_coming_soon,
         eta_minutes: distanceKm == null ? 30 : Math.round(20 + distanceKm * 3)
       };
     });
