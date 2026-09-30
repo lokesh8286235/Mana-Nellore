@@ -58,14 +58,15 @@ router.post(
   ah(async (req, res) => {
     const existing = await ownRestaurantId(req.user.id);
     if (existing) return res.status(409).json({ error: 'Restaurant already registered' });
-    const { name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at } = req.body;
+    const { name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at, opens_at_we, closes_at_we } = req.body;
     if (!name) return res.status(400).json({ error: 'Restaurant name is required' });
     const { rows } = await db.query(
       `INSERT INTO restaurants
-         (owner_id, name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+         (owner_id, name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at, opens_at_we, closes_at_we)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [req.user.id, name, description || null, address || null, lat || null, lng || null,
-       phone || null, image_url || null, fssai || null, opens_at || null, closes_at || null]
+       phone || null, image_url || null, fssai || null, opens_at || null, closes_at || null,
+       opens_at_we || null, closes_at_we || null]
     );
     res.status(201).json({ restaurant: rows[0] });
   })
@@ -89,7 +90,8 @@ router.put(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const fields = ['name', 'description', 'address', 'lat', 'lng', 'phone', 'image_url', 'fssai',
-      'chef_name', 'chef_photo', 'chef_story', 'gstin', 'birthday_dessert'];
+      'chef_name', 'chef_photo', 'chef_story', 'gstin', 'birthday_dessert',
+      'opens_at', 'closes_at', 'opens_at_we', 'closes_at_we'];
     const sets = [];
     const params = [];
     for (const f of fields) {
@@ -108,16 +110,16 @@ router.put(
   })
 );
 
-// PUT /api/owner/hours { opens_at, closes_at }
+// PUT /api/owner/hours { opens_at, closes_at, opens_at_we, closes_at_we }
 router.put(
   '/hours',
   ah(async (req, res) => {
     const id = await requireRestaurant(req, res);
     if (!id) return;
-    const { opens_at, closes_at } = req.body;
+    const { opens_at, closes_at, opens_at_we, closes_at_we } = req.body;
     const { rows } = await db.query(
-      'UPDATE restaurants SET opens_at = $1, closes_at = $2 WHERE id = $3 RETURNING *',
-      [opens_at || null, closes_at || null, id]
+      'UPDATE restaurants SET opens_at = $1, closes_at = $2, opens_at_we = $3, closes_at_we = $4 WHERE id = $5 RETURNING *',
+      [opens_at || null, closes_at || null, opens_at_we || null, closes_at_we || null, id]
     );
     res.json({ restaurant: rows[0] });
   })

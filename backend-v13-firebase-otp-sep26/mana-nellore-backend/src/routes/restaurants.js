@@ -94,6 +94,8 @@ router.get(
         is_open: isOpenNow(r),
         opens_at: r.opens_at,
         closes_at: r.closes_at,
+        opens_at_we: r.opens_at_we,
+        closes_at_we: r.closes_at_we,
         load: active >= 7 ? 'slammed' : active >= 3 ? 'busy' : 'quiet',
         avg_pack_minutes: r.avg_pack_minutes != null ? Number(r.avg_pack_minutes) : null,
         birthday_dessert: !!r.birthday_dessert,

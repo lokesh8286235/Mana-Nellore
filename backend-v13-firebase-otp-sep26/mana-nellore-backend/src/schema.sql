@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS restaurants (
   is_open boolean NOT NULL DEFAULT true,
   opens_at time,
   closes_at time,
+  opens_at_we time,
+  closes_at_we time,
   commission_pct numeric NOT NULL DEFAULT 12,
   rating_avg numeric NOT NULL DEFAULT 0,
   verified boolean NOT NULL DEFAULT false,

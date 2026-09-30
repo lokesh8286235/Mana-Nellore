@@ -67,6 +67,8 @@ async function migrate() {
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS chef_story text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS gstin text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS birthday_dessert boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS opens_at_we time');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS closes_at_we time');
 
   // Menu items: meal slots, combos, allergens
   await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS meal_slot text[] NOT NULL DEFAULT '{all}'");
