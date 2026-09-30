@@ -273,8 +273,9 @@ router.post(
     const me = await db.query('SELECT referred_by FROM users WHERE id = $1', [req.user.id]);
     if (me.rows[0].referred_by) return res.status(409).json({ error: 'You already used a referral code' });
     const friend = await db.query('SELECT id FROM users WHERE referral_code = $1', [code]);
-    if (!friend.rows[0] || friend.rows[0].id === req.user.id) {
-      return res.status(400).json({ error: 'Invalid referral code' });
+    if (!friend.rows[0]) return res.status(400).json({ error: 'Invalid referral code' });
+    if (friend.rows[0].id === req.user.id) {
+      return res.status(400).json({ error: 'You are entering your own referral code 🙂' });
     }
     const mkCoupon = async (suffix) => {
       const c = 'REF' + suffix + Math.random().toString(36).slice(2, 7).toUpperCase();

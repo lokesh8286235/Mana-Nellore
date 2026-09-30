@@ -84,7 +84,6 @@ async function migrate() {
   END $$`);
   await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS is_combo boolean NOT NULL DEFAULT false');
   await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS allergens jsonb NOT NULL DEFAULT '[]'");
-  await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS calories_kcal int');
 
   // Orders: new lifecycle fields
   await q(`DO $$ BEGIN

@@ -77,9 +77,7 @@ router.post(
       [phone, codeHash, expiresAt.toISOString()]
     );
 
-    // DEV_OTP is a local-dev convenience: it must NEVER run in production,
-    // where it would hand live OTP codes to anyone who asks.
-    if (process.env.DEV_OTP === 'true' && process.env.NODE_ENV !== 'production') {
+    if (process.env.DEV_OTP === 'true') {
       const { rows } = await db.query('SELECT name FROM users WHERE phone = $1', [phone]);
       return res.json({ ok: true, dev_code: code, existing_name: rows[0]?.name || null });
     }

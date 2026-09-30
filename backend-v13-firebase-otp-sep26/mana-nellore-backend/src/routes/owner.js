@@ -243,14 +243,10 @@ router.post(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const { category_id, name, description, image_url, price_paise, veg, available, prep_minutes, sort_order,
-      meal_slot, is_combo, allergens, calories_kcal } = req.body;
+      meal_slot, is_combo, allergens } = req.body;
     if (!name || price_paise == null) {
       return res.status(400).json({ error: 'Name and price_paise are required' });
     }
-    const kcalRaw = calories_kcal;
-    const kcal = (kcalRaw === undefined || kcalRaw === null || kcalRaw === '')
-      ? null
-      : (Number.isFinite(Number(kcalRaw)) ? Math.max(0, Math.round(Number(kcalRaw))) : null);
     if (category_id) {
       const c = await db.query('SELECT id FROM categories WHERE id = $1 AND restaurant_id = $2', [
         category_id, id
@@ -260,13 +256,13 @@ router.post(
     const { rows } = await db.query(
       `INSERT INTO menu_items
          (restaurant_id, category_id, name, description, image_url, price_paise, veg, available, prep_minutes, sort_order,
-          meal_slot, is_combo, allergens, calories_kcal)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14) RETURNING *`,
+          meal_slot, is_combo, allergens)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) RETURNING *`,
       [id, category_id || null, name, description || null, image_url || null,
        Math.round(Number(price_paise)), !!veg, available !== false,
        prep_minutes || 20, sort_order || 0,
        normSlots(meal_slot),
-       !!is_combo, JSON.stringify(Array.isArray(allergens) ? allergens : []), kcal]
+       !!is_combo, JSON.stringify(Array.isArray(allergens) ? allergens : [])]
     );
     res.status(201).json({ item: rows[0] });
   })
@@ -278,7 +274,7 @@ router.put(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const fields = ['category_id', 'name', 'description', 'image_url', 'price_paise', 'veg', 'available', 'prep_minutes', 'sort_order',
-      'meal_slot', 'is_combo', 'allergens', 'calories_kcal'];
+      'meal_slot', 'is_combo', 'allergens'];
     const sets = [];
     const params = [];
     for (const f of fields) {
@@ -286,7 +282,6 @@ router.put(
         let v = req.body[f];
         if (f === 'price_paise') v = Math.round(Number(v));
         if (f === 'meal_slot') v = normSlots(v);
-        if (f === 'calories_kcal') v = (v === null || v === '' ? null : (Number.isFinite(Number(v)) ? Math.max(0, Math.round(Number(v))) : null));
         params.push(v);
         sets.push(`${f} = $${params.length}`);
       }
@@ -387,16 +382,7 @@ router.delete(
 // ---- Orders ----
 function orderDetailQuery(where, params) {
   return db.query(
-    // NOTE: explicit column list — never SELECT o.* here. pickup_photo /
-    // delivery_photo are base64 blobs (up to ~1.5MB) that never change; they
-    // are fetched once via a dedicated endpoint, never on the 2.5s poll.
-    `SELECT o.id, o.customer_id, o.restaurant_id, o.rider_id, o.address_id, o.status,
-            o.subtotal_paise, o.discount_paise, o.delivery_fee_paise, o.platform_fee_paise,
-            o.tax_paise, o.commission_paise, o.total_paise, o.payment_method, o.payment_status,
-            o.delivery_otp_hash, o.cancel_reason, o.timeline, o.placed_at, o.delivered_at,
-            o.eta_at, o.packed_at, o.share_token, o.order_type, o.table_id,
-            o.delivery_note, o.no_cutlery, o.tip_paise, o.recipient_name, o.recipient_phone,
-            r.name AS restaurant_name,
+    `SELECT o.*, r.name AS restaurant_name,
             u.name AS customer_name, u.phone AS customer_phone,
             a.line1, a.line2, a.city, a.lat AS addr_lat, a.lng AS addr_lng,
             ru.name AS rider_name, ru.phone AS rider_phone
@@ -407,8 +393,7 @@ function orderDetailQuery(where, params) {
      LEFT JOIN riders rd ON rd.id = o.rider_id
      LEFT JOIN users ru ON ru.id = rd.user_id
      WHERE ${where}
-     ORDER BY o.placed_at DESC
-     LIMIT 100`,
+     ORDER BY o.placed_at DESC`,
     params
   );
 }
@@ -426,21 +411,10 @@ router.get(
       where += ` AND o.status = $${params.length}`;
     }
     const { rows } = await orderDetailQuery(where, params);
-    // Single batched items query — the old per-order loop was an N+1
-    // (1 + N queries every 2.5s poll against an unbounded order history).
-    const ids = rows.map((o) => o.id);
-    let itemsByOrder = {};
-    if (ids.length) {
-      const itemsRes = await db.query(
-        `SELECT id, order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions
-         FROM order_items WHERE order_id = ANY($1)`,
-        [ids]
-      );
-      for (const it of itemsRes.rows) {
-        (itemsByOrder[it.order_id] = itemsByOrder[it.order_id] || []).push(it);
-      }
+    for (const o of rows) {
+      const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [o.id]);
+      o.items = items.rows;
     }
-    for (const o of rows) o.items = itemsByOrder[o.id] || [];
     res.json({ orders: rows });
   })
 );

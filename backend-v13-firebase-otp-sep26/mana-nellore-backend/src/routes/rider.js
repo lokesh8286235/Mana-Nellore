@@ -34,19 +34,17 @@ async function notify(userId, title, body) {
 }
 
 // Award quest bonuses a rider has just earned. Idempotent: one bonus per rider per quest.
-// Single grouped query — the old per-quest COUNT(*) loop was an N+1.
 async function checkQuests(riderId) {
-  const { rows } = await db.query(
-    `SELECT q.id, q.bonus_paise, q.target_deliveries, COUNT(o.id) AS n
-     FROM quests q
-     LEFT JOIN orders o ON o.rider_id = $1 AND o.status = 'delivered'
-                        AND o.delivered_at BETWEEN q.starts_at AND q.ends_at
-     WHERE q.active = true AND now() BETWEEN q.starts_at AND q.ends_at
-     GROUP BY q.id, q.bonus_paise, q.target_deliveries`,
-    [riderId]
+  const quests = await db.query(
+    `SELECT * FROM quests WHERE active = true AND now() BETWEEN starts_at AND ends_at`
   );
-  for (const q of rows) {
-    if (Number(q.n) >= q.target_deliveries) {
+  for (const q of quests.rows) {
+    const done = await db.query(
+      `SELECT COUNT(*) AS n FROM orders
+       WHERE rider_id = $1 AND status = 'delivered' AND delivered_at BETWEEN $2 AND $3`,
+      [riderId, q.starts_at, q.ends_at]
+    );
+    if (Number(done.rows[0].n) >= q.target_deliveries) {
       await db.query(
         `INSERT INTO rider_bonuses (rider_id, quest_id, amount_paise)
          VALUES ($1, $2, $3) ON CONFLICT (rider_id, quest_id) DO NOTHING`,
@@ -215,7 +213,7 @@ router.get(
     if (!rider) return;
     const { rows } = await db.query(
       `SELECT o.id, o.total_paise, o.placed_at, o.payment_method,
-              r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng, r.address AS rest_address,
+              r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
               a.line1, a.city, a.lat AS addr_lat, a.lng AS addr_lng
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
@@ -243,7 +241,6 @@ router.get(
         placed_at: o.placed_at,
         payment_method: o.payment_method,
         restaurant_name: o.restaurant_name,
-        rest_address: o.rest_address || null,
         address: [o.line1, o.city].filter(Boolean).join(', '),
         distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
         pickup_km: pickupKm == null ? null : Math.round(pickupKm * 10) / 10,
@@ -564,29 +561,32 @@ router.get(
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
-    // Single grouped query: progress counts come from one LEFT JOIN instead of
-    // a per-quest COUNT(*) loop (N+1 on the 60s poll).
     const quests = await db.query(
-      `SELECT q.*, b.id AS bonus_id, COUNT(o.id) AS done_n
+      `SELECT q.*, b.id AS bonus_id
        FROM quests q
        LEFT JOIN rider_bonuses b ON b.quest_id = q.id AND b.rider_id = $1
-       LEFT JOIN orders o ON o.rider_id = $1 AND o.status = 'delivered'
-                          AND o.delivered_at BETWEEN q.starts_at AND q.ends_at
        WHERE q.active = true AND now() BETWEEN q.starts_at AND q.ends_at
-       GROUP BY q.id, b.id
        ORDER BY q.ends_at ASC`,
       [rider.id]
     );
-    const out = quests.rows.map((q) => ({
-      id: q.id,
-      name: q.name,
-      target_deliveries: q.target_deliveries,
-      bonus_paise: q.bonus_paise,
-      starts_at: q.starts_at,
-      ends_at: q.ends_at,
-      completed: Number(q.done_n),
-      bonus_earned: !!q.bonus_id
-    }));
+    const out = [];
+    for (const q of quests.rows) {
+      const done = await db.query(
+        `SELECT COUNT(*) AS n FROM orders
+         WHERE rider_id = $1 AND status = 'delivered' AND delivered_at BETWEEN $2 AND $3`,
+        [rider.id, q.starts_at, q.ends_at]
+      );
+      out.push({
+        id: q.id,
+        name: q.name,
+        target_deliveries: q.target_deliveries,
+        bonus_paise: q.bonus_paise,
+        starts_at: q.starts_at,
+        ends_at: q.ends_at,
+        completed: Number(done.rows[0].n),
+        bonus_earned: !!q.bonus_id
+      });
+    }
     res.json({ quests: out });
   })
 );

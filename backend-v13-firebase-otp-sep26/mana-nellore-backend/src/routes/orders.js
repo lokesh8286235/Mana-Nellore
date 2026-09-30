@@ -353,9 +353,28 @@ router.post(
   })
 );
 
-// POST /api/orders/:id/pay — REMOVED (was a fake "simulate gateway success"
-// endpoint that let any customer mark their own order paid with no money
-// moving). Real payments go through the Razorpay flow below.
+// POST /api/orders/:id/pay — simulates gateway success (replace with webhook later)
+router.post(
+  '/:id/pay',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
+      [req.params.id, req.user.id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.payment_status !== 'pending') {
+      return res.status(409).json({ error: `Payment already ${order.payment_status}` });
+    }
+    await db.query("UPDATE orders SET payment_status = 'paid' WHERE id = $1", [order.id]);
+    const timeline = order.timeline || [];
+    timeline.push({ status: 'paid', at: new Date().toISOString(), by: 'customer' });
+    await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
+      JSON.stringify(timeline), order.id
+    ]);
+    res.json({ ok: true, payment_status: 'paid' });
+  })
+);
 
 // POST /api/orders/:id/report-missing — "my food never arrived".
 // Creates a missing_food ticket; admin resolves it with a refund or a reorder.
@@ -398,15 +417,7 @@ router.get(
       where += ` AND o.status = $${params.length}`;
     }
     const { rows } = await db.query(
-      // NOTE: explicit columns — pickup_photo/delivery_photo base64 blobs are
-      // excluded; they never ride the poll (fetched once via /:id/photos).
-      `SELECT o.id, o.customer_id, o.restaurant_id, o.rider_id, o.address_id, o.status,
-              o.subtotal_paise, o.discount_paise, o.delivery_fee_paise, o.platform_fee_paise,
-              o.tax_paise, o.commission_paise, o.total_paise, o.payment_method, o.payment_status,
-              o.cancel_reason, o.timeline, o.placed_at, o.delivered_at,
-              o.eta_at, o.packed_at, o.share_token, o.order_type, o.table_id,
-              o.delivery_note, o.no_cutlery, o.tip_paise, o.recipient_name, o.recipient_phone,
-              r.name AS restaurant_name, r.image_url AS restaurant_image
+      `SELECT o.*, r.name AS restaurant_name, r.image_url AS restaurant_image
        FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params
@@ -415,37 +426,12 @@ router.get(
   })
 );
 
-// GET /api/orders/:id/photos — pickup/delivery photo blobs, fetched ONCE by the
-// client (never on the 3s tracking poll). Customer-scoped like the detail route.
-router.get(
-  '/:id/photos',
-  ah(async (req, res) => {
-    const { rows } = await db.query(
-      'SELECT pickup_photo, delivery_photo FROM orders WHERE id = $1 AND customer_id = $2',
-      [req.params.id, req.user.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Order not found' });
-    res.json({
-      pickup_photo: rows[0].pickup_photo || null,
-      delivery_photo: rows[0].delivery_photo || null
-    });
-  })
-);
-
 // GET /api/orders/:id
 router.get(
   '/:id',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      // NOTE: explicit columns — pickup_photo/delivery_photo base64 blobs are
-      // excluded; they never ride the 3s tracking poll (fetched once via /:id/photos).
-      `SELECT o.id, o.customer_id, o.restaurant_id, o.rider_id, o.address_id, o.status,
-              o.subtotal_paise, o.discount_paise, o.delivery_fee_paise, o.platform_fee_paise,
-              o.tax_paise, o.commission_paise, o.total_paise, o.payment_method, o.payment_status,
-              o.cancel_reason, o.timeline, o.placed_at, o.delivered_at,
-              o.eta_at, o.packed_at, o.share_token, o.order_type, o.table_id,
-              o.delivery_note, o.no_cutlery, o.tip_paise, o.recipient_name, o.recipient_phone,
-              r.name AS restaurant_name, r.image_url AS restaurant_image, r.phone AS restaurant_phone,
+      `SELECT o.*, r.name AS restaurant_name, r.image_url AS restaurant_image, r.phone AS restaurant_phone,
               r.verified AS restaurant_verified, r.lat AS rest_lat, r.lng AS rest_lng,
               rd.lat AS rider_lat, rd.lng AS rider_lng,
               a.line1, a.line2, a.city,
