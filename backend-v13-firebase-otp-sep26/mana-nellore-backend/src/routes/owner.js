@@ -243,10 +243,14 @@ router.post(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const { category_id, name, description, image_url, price_paise, veg, available, prep_minutes, sort_order,
-      meal_slot, is_combo, allergens } = req.body;
+      meal_slot, is_combo, allergens, calories_kcal } = req.body;
     if (!name || price_paise == null) {
       return res.status(400).json({ error: 'Name and price_paise are required' });
     }
+    const kcalRaw = calories_kcal;
+    const kcal = (kcalRaw === undefined || kcalRaw === null || kcalRaw === '')
+      ? null
+      : (Number.isFinite(Number(kcalRaw)) ? Math.max(0, Math.round(Number(kcalRaw))) : null);
     if (category_id) {
       const c = await db.query('SELECT id FROM categories WHERE id = $1 AND restaurant_id = $2', [
         category_id, id
@@ -256,13 +260,13 @@ router.post(
     const { rows } = await db.query(
       `INSERT INTO menu_items
          (restaurant_id, category_id, name, description, image_url, price_paise, veg, available, prep_minutes, sort_order,
-          meal_slot, is_combo, allergens)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) RETURNING *`,
+          meal_slot, is_combo, allergens, calories_kcal)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14) RETURNING *`,
       [id, category_id || null, name, description || null, image_url || null,
        Math.round(Number(price_paise)), !!veg, available !== false,
        prep_minutes || 20, sort_order || 0,
        normSlots(meal_slot),
-       !!is_combo, JSON.stringify(Array.isArray(allergens) ? allergens : [])]
+       !!is_combo, JSON.stringify(Array.isArray(allergens) ? allergens : []), kcal]
     );
     res.status(201).json({ item: rows[0] });
   })
@@ -274,7 +278,7 @@ router.put(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const fields = ['category_id', 'name', 'description', 'image_url', 'price_paise', 'veg', 'available', 'prep_minutes', 'sort_order',
-      'meal_slot', 'is_combo', 'allergens'];
+      'meal_slot', 'is_combo', 'allergens', 'calories_kcal'];
     const sets = [];
     const params = [];
     for (const f of fields) {
@@ -282,6 +286,7 @@ router.put(
         let v = req.body[f];
         if (f === 'price_paise') v = Math.round(Number(v));
         if (f === 'meal_slot') v = normSlots(v);
+        if (f === 'calories_kcal') v = (v === null || v === '' ? null : (Number.isFinite(Number(v)) ? Math.max(0, Math.round(Number(v))) : null));
         params.push(v);
         sets.push(`${f} = $${params.length}`);
       }

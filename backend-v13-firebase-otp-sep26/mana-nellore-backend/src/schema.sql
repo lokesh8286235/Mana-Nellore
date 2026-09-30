@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS menu_items (
   meal_slot text[] NOT NULL DEFAULT '{all}'
     CHECK (meal_slot <@ ARRAY['all','breakfast','lunch','dinner']),
   is_combo boolean NOT NULL DEFAULT false,
-  allergens jsonb NOT NULL DEFAULT '[]'
+  allergens jsonb NOT NULL DEFAULT '[]',
+  calories_kcal int
 );
 CREATE INDEX IF NOT EXISTS idx_menu_restaurant ON menu_items(restaurant_id);
 
