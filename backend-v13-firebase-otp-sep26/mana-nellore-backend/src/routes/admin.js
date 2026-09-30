@@ -1251,6 +1251,32 @@ router.put(
   })
 );
 
+// ---- Change a restaurant's photo ----
+// PUT /api/admin/restaurants/:id/photo { image_url }
+// Accepts a data-URL (same as the onboard flow) or an https URL. Audited.
+router.put(
+  '/restaurants/:id/photo',
+  ah(async (req, res) => {
+    const imageUrl = String(req.body.image_url || '').trim();
+    if (!imageUrl) return res.status(400).json({ error: 'image_url is required' });
+    if (imageUrl.length > 1500000) {
+      return res.status(400).json({ error: 'Image is too large (max ~1.5MB)' });
+    }
+    const isDataUrl = /^data:image\/(jpeg|png|webp);base64,/.test(imageUrl);
+    const isHttps = /^https:\/\/[^ "']+$/.test(imageUrl);
+    if (!isDataUrl && !isHttps) {
+      return res.status(400).json({ error: 'image_url must be an image data-URL or an https URL' });
+    }
+    const { rows } = await db.query(
+      'UPDATE restaurants SET image_url = $1 WHERE id = $2 RETURNING id, name',
+      [imageUrl, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    await audit(req, 'restaurant_photo_changed', 'restaurant', rows[0].id, { name: rows[0].name });
+    res.json({ ok: true });
+  })
+);
+
 // ---- Bulk menu import (audited) ----
 // POST /api/admin/restaurants/:id/menu/import
 // { categories: ["IDLI", ...], items: [{ category, name, price_paise, veg, is_combo }] }
