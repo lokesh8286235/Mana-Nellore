@@ -1,6 +1,7 @@
 // Admin / operations portal. Full platform visibility; every mutating
 // action writes an audit log entry.
 const express = require('express');
+const { seedSuggestedCats } = require('../lib/suggested-cats');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 
@@ -894,6 +895,7 @@ router.put(
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,'approved') RETURNING *`,
         [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai, app.aadhar || null]
       );
+      await seedSuggestedCats(db, rRes.rows[0].id);
       await notify(owner.id, '🎉 Your restaurant is live!',
         `"${app.restaurant_name}" is verified and open for business on Mana Nellore!`);
       await audit(req, 'application_approved', 'restaurant', rRes.rows[0].id, { application_id: app.id });
@@ -948,6 +950,7 @@ router.post(
        lat || null, lng || null, cleanPhone,
        photo_url || null, String(fssai).trim(), cleanAadhar || null]
     );
+    await seedSuggestedCats(db, rRes.rows[0].id);
     await notify(owner.id, '🎉 Your restaurant is live!',
       `"${String(restaurant_name).trim()}" is verified and open for business on Mana Nellore!`);
     await audit(req, 'restaurant_onboarded_by_admin', 'restaurant', rRes.rows[0].id,

@@ -44,6 +44,11 @@ router.get(
       conditions.push(`(r.name ILIKE ${qp} OR r.description ILIKE ${qp} OR EXISTS (
         SELECT 1 FROM menu_items mi
         WHERE mi.restaurant_id = r.id AND mi.available = true AND mi.name ILIKE ${qp}
+      ) OR EXISTS (
+        SELECT 1 FROM categories c
+        WHERE c.restaurant_id = r.id AND c.name ILIKE ${qp}
+          AND EXISTS (SELECT 1 FROM menu_items mi2
+                      WHERE mi2.category_id = c.id AND mi2.available = true)
       ))`);
     }
     if (veg === 'true') {

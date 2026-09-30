@@ -52,6 +52,8 @@ async function transition(orderId, status, by) {
 
 // ---- Restaurant profile ----
 
+const { seedSuggestedCats } = require('../lib/suggested-cats');
+
 // POST /api/owner/restaurant — register (one restaurant per owner)
 router.post(
   '/restaurant',
@@ -68,6 +70,7 @@ router.post(
        phone || null, image_url || null, fssai || null, opens_at || null, closes_at || null,
        opens_at_we || null, closes_at_we || null]
     );
+    await seedSuggestedCats(db, rows[0].id);
     res.status(201).json({ restaurant: rows[0] });
   })
 );
