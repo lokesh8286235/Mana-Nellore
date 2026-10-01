@@ -9,6 +9,16 @@ const DATA_URL_RE = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/;
 const HTTPS_RE = /^https:\/\/[^ "'<>]+$/;
 const MAX_BYTES = 1500000; // ~1.5MB, matches the admin photo endpoint cap
 
+// Absolute base for served images. Apps render image_url straight into <img
+// src>, so a relative /img/... path would resolve against the wrong domain.
+// Overridable via env; the fallback is the live Railway backend.
+const PUBLIC_BASE = (process.env.PUBLIC_BACKEND_URL ||
+  'https://mana-nellore-mana-nellore.up.railway.app').replace(/\/$/, '');
+
+function imgUrl(hash) {
+  return PUBLIC_BASE + '/img/' + hash;
+}
+
 function parseDataUrl(value) {
   const m = DATA_URL_RE.exec(String(value || '').trim());
   if (!m) return null;
@@ -33,7 +43,7 @@ async function storeImageUrl(db, value) {
     'INSERT INTO images (hash, data, mime) VALUES ($1, $2, $3) ON CONFLICT (hash) DO NOTHING',
     [hash, parsed.buffer, parsed.mime]
   );
-  return '/img/' + hash;
+  return imgUrl(hash);
 }
 
-module.exports = { storeImageUrl, parseDataUrl };
+module.exports = { storeImageUrl, parseDataUrl, imgUrl };

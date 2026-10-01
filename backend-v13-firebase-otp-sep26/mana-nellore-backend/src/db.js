@@ -199,7 +199,7 @@ async function migrate() {
 // still holding a data:image/... value are touched.
 async function migrateDataUrlPhotos() {
   const crypto = require('crypto');
-  const { parseDataUrl } = require('./lib/images');
+  const { parseDataUrl, imgUrl } = require('./lib/images');
   const targets = [
     ['restaurants', 'image_url'],
     ['restaurants', 'chef_photo'],
@@ -217,9 +217,16 @@ async function migrateDataUrlPhotos() {
         'INSERT INTO images (hash, data, mime) VALUES ($1, $2, $3) ON CONFLICT (hash) DO NOTHING',
         [hash, p.buffer, p.mime]
       );
-      await pool.query(`UPDATE ${table} SET ${col} = $1 WHERE id = $2`, ['/img/' + hash, r.id]);
-      console.log(`migrated photo ${table}.${col} ${r.id} -> /img/${hash.slice(0, 12)}...`);
+      await pool.query(`UPDATE ${table} SET ${col} = $1 WHERE id = $2`, [imgUrl(hash), r.id]);
+      console.log(`migrated photo ${table}.${col} ${r.id} -> ${imgUrl(hash).slice(0, 60)}...`);
     }
+    // Fix up rows migrated while the URL was still relative: /img/<hash> ->
+    // absolute. Idempotent.
+    await pool.query(
+      `UPDATE ${table} SET ${col} = $1 || substring(${col} from 5)
+       WHERE ${col} LIKE '/img/%'`,
+      [imgUrl('').slice(0, -1)]
+    );
   }
 }
 
