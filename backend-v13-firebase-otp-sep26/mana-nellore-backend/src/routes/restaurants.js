@@ -208,6 +208,52 @@ router.get(
 );
 
 // GET /api/restaurants/:id -> restaurant + categories + available menu items
+// GET /api/restaurants/dishes/search?q=biryani&max_price_paise=50000&veg=true
+// Cross-restaurant dish search for the "Ask Mana" conversational ordering.
+// Must sit BEFORE /:id so Express doesn't treat "dishes" as an id.
+router.get(
+  '/dishes/search',
+  ah(async (req, res) => {
+    const q = (req.query.q || '').trim();
+    if (!q) return res.status(400).json({ error: 'q is required' });
+    const maxPrice = req.query.max_price_paise != null ? Number(req.query.max_price_paise) : null;
+    const vegOnly = req.query.veg === 'true';
+    const params = ['%' + q + '%'];
+    let priceClause = '';
+    if (Number.isFinite(maxPrice) && maxPrice >= 0) {
+      params.push(Math.floor(maxPrice));
+      priceClause = 'AND m.price_paise <= $' + params.length;
+    }
+    let vegClause = '';
+    if (vegOnly) vegClause = 'AND m.veg = true';
+    const { rows } = await db.query(
+      `SELECT m.id, m.name, m.price_paise, m.veg, m.image_url,
+              r.id AS restaurant_id, r.name AS restaurant_name,
+              r.rating_avg, r.is_coming_soon
+       FROM menu_items m
+       JOIN restaurants r ON r.id = m.restaurant_id
+       WHERE m.name ILIKE $1 AND m.available = true
+         AND r.status = 'approved' AND r.is_coming_soon = false
+         ${priceClause} ${vegClause}
+       ORDER BY m.price_paise ASC
+       LIMIT 30`,
+      params
+    );
+    res.json({
+      dishes: rows.map((d) => ({
+        id: d.id,
+        name: d.name,
+        price_paise: d.price_paise,
+        veg: !!d.veg,
+        image_url: d.image_url,
+        restaurant_id: d.restaurant_id,
+        restaurant_name: d.restaurant_name,
+        rating_avg: Number(d.rating_avg) || 0,
+      })),
+    });
+  })
+);
+
 router.get(
   '/:id',
   ah(async (req, res) => {
