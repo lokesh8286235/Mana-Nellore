@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS menu_items (
   allergens jsonb NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_menu_restaurant ON menu_items(restaurant_id);
+CREATE INDEX IF NOT EXISTS idx_menu_rest_veg_avail ON menu_items(restaurant_id, available, veg);
 
 CREATE TABLE IF NOT EXISTS addresses (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -167,6 +168,8 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_restaurant ON orders(restaurant_id);
+CREATE INDEX IF NOT EXISTS idx_orders_rest_status ON orders(restaurant_id, status);
+CREATE INDEX IF NOT EXISTS idx_orders_rest_packed ON orders(restaurant_id, placed_at) WHERE packed_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_rider ON orders(rider_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 

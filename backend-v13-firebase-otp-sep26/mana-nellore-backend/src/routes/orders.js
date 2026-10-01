@@ -460,13 +460,16 @@ router.get(
               a.line1, a.line2, a.city,
               ru.name AS rider_name, ru.phone AS rider_phone,
               rd.profile_photo AS rider_photo, rd.rating_avg AS rider_rating,
-              (SELECT COUNT(*) FROM orders od
-               WHERE od.rider_id = rd.id AND od.status = 'delivered') AS rider_deliveries
+              COALESCE(rdc.cnt, 0) AS rider_deliveries
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
        LEFT JOIN addresses a ON a.id = o.address_id
        LEFT JOIN riders rd ON rd.id = o.rider_id
        LEFT JOIN users ru ON ru.id = rd.user_id
+       LEFT JOIN (
+         SELECT rider_id, COUNT(*) AS cnt FROM orders
+         WHERE status = 'delivered' GROUP BY rider_id
+       ) rdc ON rdc.rider_id = rd.id
        WHERE o.id = $1 AND o.customer_id = $2`,
       [req.params.id, req.user.id]
     );

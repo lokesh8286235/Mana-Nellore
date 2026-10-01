@@ -55,26 +55,39 @@ router.get(
       ))`);
     }
     if (veg === 'true') {
-      conditions.push(
-        `EXISTS (SELECT 1 FROM menu_items mi WHERE mi.restaurant_id = r.id AND mi.veg = true AND mi.available = true)`
-      );
+      // Perf: reuse the hv JOIN (already computed for has_veg) instead of a
+      // correlated EXISTS per restaurant.
+      conditions.push(`hv.rid IS NOT NULL`);
     }
     if (open === 'true') {
       conditions.push('r.is_open = true');
     }
 
+    // Perf: the three per-restaurant aggregates are pre-computed once via LEFT
+    // JOINs instead of correlated subqueries (was ~300ms per cache miss).
     const { rows } = await db.query(
       `SELECT r.*,
-              (SELECT COUNT(*) FROM orders o
-               WHERE o.restaurant_id = r.id
-                 AND o.status IN ('placed','accepted','preparing','ready')) AS active_orders,
-              (SELECT ROUND(AVG(EXTRACT(EPOCH FROM (o.packed_at - o.placed_at)) / 60))
-               FROM orders o
-               WHERE o.restaurant_id = r.id AND o.packed_at IS NOT NULL
-                 AND o.placed_at > now() - interval '30 days') AS avg_pack_minutes,
-              (SELECT EXISTS (SELECT 1 FROM menu_items mi
-               WHERE mi.restaurant_id = r.id AND mi.veg = true AND mi.available = true)) AS has_veg
-       FROM restaurants r WHERE ${conditions.join(' AND ')} ORDER BY r.rating_avg DESC, r.name ASC`,
+              COALESCE(ao.cnt, 0) AS active_orders,
+              ap.avg_mins AS avg_pack_minutes,
+              (hv.rid IS NOT NULL) AS has_veg
+       FROM restaurants r
+       LEFT JOIN (
+         SELECT restaurant_id, COUNT(*) AS cnt FROM orders
+         WHERE status IN ('placed','accepted','preparing','ready')
+         GROUP BY restaurant_id
+       ) ao ON ao.restaurant_id = r.id
+       LEFT JOIN (
+         SELECT restaurant_id,
+                ROUND(AVG(EXTRACT(EPOCH FROM (packed_at - placed_at)) / 60)) AS avg_mins
+         FROM orders
+         WHERE packed_at IS NOT NULL AND placed_at > now() - interval '30 days'
+         GROUP BY restaurant_id
+       ) ap ON ap.restaurant_id = r.id
+       LEFT JOIN (
+         SELECT DISTINCT restaurant_id AS rid FROM menu_items
+         WHERE veg = true AND available = true
+       ) hv ON hv.rid = r.id
+       WHERE ${conditions.join(' AND ')} ORDER BY r.rating_avg DESC, r.name ASC`,
       params
     );
 
