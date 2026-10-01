@@ -42,14 +42,17 @@ async function notify(dbConn, userId, title, body) {
 }
 
 async function transition(orderId, status, by) {
-  const { rows } = await db.query('SELECT timeline FROM orders WHERE id = $1', [orderId]);
-  const timeline = rows[0].timeline || [];
-  timeline.push({ status, at: new Date().toISOString(), by });
+  // Single UPDATE with a jsonb append: concurrent transitions can no longer
+  // silently drop each other's timeline entries (read-modify-write race).
   // "Packed fresh" stamp: the moment the kitchen taps Ready for pickup
   const packed = status === 'ready' ? ', packed_at = now()' : '';
-  await db.query(`UPDATE orders SET status = $1, timeline = $2::jsonb${packed} WHERE id = $3`, [
-    status, JSON.stringify(timeline), orderId
-  ]);
+  await db.query(
+    `UPDATE orders SET status = $1,
+       timeline = COALESCE(timeline, '[]'::jsonb)
+                || jsonb_build_object('status', $1, 'at', $2, 'by', $3)${packed}
+     WHERE id = $4`,
+    [status, new Date().toISOString(), by, orderId]
+  );
 }
 
 // ---- Restaurant profile ----
@@ -256,6 +259,12 @@ router.post(
     if (!name || price_paise == null) {
       return res.status(400).json({ error: 'Name and price_paise are required' });
     }
+    // Guard against NaN ("abc" -> 22P02 -> misleading 404) and negative prices
+    // (a negative-priced item would shrink the customer's bill at checkout).
+    const pricePaise = Math.round(Number(price_paise));
+    if (!Number.isFinite(pricePaise) || pricePaise < 0) {
+      return res.status(400).json({ error: 'price_paise must be a non-negative number' });
+    }
     if (category_id) {
       const c = await db.query('SELECT id FROM categories WHERE id = $1 AND restaurant_id = $2', [
         category_id, id
@@ -268,7 +277,7 @@ router.post(
           meal_slot, is_combo, allergens)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) RETURNING *`,
       [id, category_id || null, name, description || null, await storeImageUrl(db, image_url),
-       Math.round(Number(price_paise)), !!veg, available !== false,
+       pricePaise, !!veg, available !== false,
        prep_minutes || 20, sort_order || 0,
        normSlots(meal_slot),
        !!is_combo, JSON.stringify(Array.isArray(allergens) ? allergens : [])]
@@ -289,7 +298,14 @@ router.put(
     for (const f of fields) {
       if (req.body[f] !== undefined) {
         let v = req.body[f];
-        if (f === 'price_paise') v = Math.round(Number(v));
+        if (f === 'price_paise') {
+          v = Math.round(Number(v));
+          if (!Number.isFinite(v) || v < 0) {
+            const err = new Error('price_paise must be a non-negative number');
+            err.status = 400;
+            throw err;
+          }
+        }
         if (f === 'meal_slot') v = normSlots(v);
         if (f === 'image_url') v = await storeImageUrl(db, v);
         params.push(v);

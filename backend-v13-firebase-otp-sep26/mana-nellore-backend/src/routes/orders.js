@@ -16,12 +16,15 @@ async function notify(userId, title, body) {
 }
 
 async function transition(orderId, status, by) {
-  const { rows } = await db.query('SELECT timeline FROM orders WHERE id = $1', [orderId]);
-  const timeline = rows[0].timeline || [];
-  timeline.push({ status, at: new Date().toISOString(), by });
-  await db.query('UPDATE orders SET status = $1, timeline = $2::jsonb WHERE id = $3', [
-    status, JSON.stringify(timeline), orderId
-  ]);
+  // Single UPDATE with a jsonb append: concurrent transitions can no longer
+  // silently drop each other's timeline entries (read-modify-write race).
+  await db.query(
+    `UPDATE orders SET status = $1,
+       timeline = COALESCE(timeline, '[]'::jsonb)
+                || jsonb_build_object('status', $1, 'at', $2, 'by', $3)
+     WHERE id = $4`,
+    [status, new Date().toISOString(), by, orderId]
+  );
 }
 
 function newDeliveryOtp() {
@@ -74,6 +77,10 @@ router.post(
     for (const it of items) {
       const m = menuById[it.menu_item_id];
       if (!m || !m.available) continue;
+      const qty = Number(it.qty);
+      if (!Number.isInteger(qty) || qty <= 0) {
+        return res.status(400).json({ error: 'Quantity must be a positive integer' });
+      }
       let custExtra = 0;
       if (Array.isArray(it.customizations) && it.customizations.length) {
         const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
@@ -87,10 +94,10 @@ router.post(
           for (const o of oRes.rows) custExtra += Number(o.price_paise) || 0;
         }
       }
-      subtotal += (m.price_paise + custExtra) * (Number(it.qty) || 1);
+      subtotal += (m.price_paise + custExtra) * qty;
     }
 
-    // Coupon
+    // Coupon (quote only — placement re-validates everything inside its transaction)
     let discount = 0;
     let couponError = null;
     if (coupon_code) {
@@ -312,6 +319,20 @@ router.post(
       );
       const order = oRes.rows[0];
 
+      // Single-use referral coupons: burn after applying so "Rs 50 off your
+      // next order" can't be replayed on every order. Generic admin coupons
+      // (no issuance record) stay multi-use as before.
+      if (couponId) {
+        const iss = await client.query(
+          `SELECT 1 FROM coupon_issuances
+           WHERE user_id = $1 AND coupon_code = $2 AND source = 'referral'`,
+          [req.user.id, String(coupon_code).toUpperCase()]
+        );
+        if (iss.rows[0]) {
+          await client.query('UPDATE coupons SET active = false WHERE id = $1', [couponId]);
+        }
+      }
+
       for (const s of snapshots) {
         await client.query(
           `INSERT INTO order_items (order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions)
@@ -368,11 +389,12 @@ router.post(
       return res.status(409).json({ error: `Payment already ${order.payment_status}` });
     }
     await db.query("UPDATE orders SET payment_status = 'paid' WHERE id = $1", [order.id]);
-    const timeline = order.timeline || [];
-    timeline.push({ status: 'paid', at: new Date().toISOString(), by: 'customer' });
-    await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
-      JSON.stringify(timeline), order.id
-    ]);
+    await db.query(
+      `UPDATE orders SET timeline = COALESCE(timeline, '[]'::jsonb)
+         || jsonb_build_object('status', 'paid', 'at', $1, 'by', 'customer')
+       WHERE id = $2`,
+      [new Date().toISOString(), order.id]
+    );
     res.json({ ok: true, payment_status: 'paid' });
   })
 );
@@ -479,8 +501,11 @@ router.get(
         }
         const timeline = order.timeline || [];
         timeline.push({ status: 'no_response_nudge', at: new Date().toISOString(), by: 'system' });
-        await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2',
-          [JSON.stringify(timeline), order.id]);
+        await db.query(
+          `UPDATE orders SET timeline = COALESCE(timeline, '[]'::jsonb)
+             || jsonb_build_object('status', 'no_response_nudge', 'at', $1, 'by', 'system')
+           WHERE id = $2 AND NOT (COALESCE(timeline, '[]'::jsonb) @> '[{"status":"no_response_nudge"}]')`,
+          [new Date().toISOString(), order.id]);
       }
     }
     res.json({ order: { ...order, items: items.rows, queue_ahead: queueAhead, no_response: noResponse } });
@@ -536,6 +561,19 @@ router.post(
   '/:id/rate',
   ah(async (req, res) => {
     const { food_rating, delivery_rating, comment, photo_url } = req.body;
+    // Ratings must be whole stars 1-5. Without this, out-of-range values hit
+    // the DB CHECK constraint and surface as raw 500s (or a misleading 404
+    // for non-numeric input via the 22P02 handler) instead of a clean 400.
+    const normRating = (v) => {
+      if (v == null || v === '') return null;
+      const n = Number(v);
+      return Number.isInteger(n) && n >= 1 && n <= 5 ? n : undefined;
+    };
+    const foodRating = normRating(food_rating);
+    const deliveryRating = normRating(delivery_rating);
+    if (foodRating === undefined || deliveryRating === undefined) {
+      return res.status(400).json({ error: 'Ratings must be whole numbers from 1 to 5' });
+    }
     // Food photos: client-resized data URLs only, capped to protect the DB.
     let photo = null;
     if (photo_url) {
@@ -562,14 +600,14 @@ router.post(
     await db.query(
       `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment, photo_url)
        VALUES ($1,$2,'restaurant',$3,$4,$5,$6,$7)`,
-      [order.id, req.user.id, order.restaurant_id, food_rating || null, null, comment || null, photo]
+      [order.id, req.user.id, order.restaurant_id, foodRating, null, comment || null, photo]
     );
-    if (order.rider_id && delivery_rating) {
+    if (order.rider_id && deliveryRating != null) {
       const rp = await db.query('SELECT user_id FROM riders WHERE id = $1', [order.rider_id]);
       await db.query(
         `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment)
          VALUES ($1,$2,'rider',$3,$4,$5,$6)`,
-        [order.id, req.user.id, rp.rows[0].user_id, null, delivery_rating, comment || null]
+        [order.id, req.user.id, rp.rows[0].user_id, null, deliveryRating, comment || null]
       );
       await db.query(
         `UPDATE riders SET rating_avg = (
@@ -579,7 +617,7 @@ router.post(
         [order.rider_id]
       );
     }
-    if (food_rating) {
+    if (foodRating != null) {
       await db.query(
         `UPDATE restaurants SET rating_avg = (
            SELECT COALESCE(AVG(food_rating), 0) FROM ratings
@@ -724,8 +762,10 @@ router.post(
     const expected = crypto
       .createHmac('sha256', keySecret)
       .update(razorpay_order_id + '|' + razorpay_payment_id)
-      .digest('hex');
-    if (expected !== razorpay_signature) {
+      .digest();
+    // Timing-safe compare: never short-circuit on the attacker-controlled value.
+    const sigBuf = Buffer.from(String(razorpay_signature), 'hex');
+    if (expected.length !== sigBuf.length || !crypto.timingSafeEqual(expected, sigBuf)) {
       return res.status(400).json({ error: 'Payment verification failed' });
     }
     const { rows } = await db.query(
@@ -735,9 +775,12 @@ router.post(
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found or already paid' });
     await db.query("UPDATE orders SET payment_status = 'paid', payment_method = 'razorpay' WHERE id = $1", [order.id]);
-    const timeline = order.timeline || [];
-    timeline.push({ status: 'paid', at: new Date().toISOString(), by: 'razorpay' });
-    await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [JSON.stringify(timeline), order.id]);
+    await db.query(
+      `UPDATE orders SET timeline = COALESCE(timeline, '[]'::jsonb)
+         || jsonb_build_object('status', 'paid', 'at', $1, 'by', 'razorpay')
+       WHERE id = $2`,
+      [new Date().toISOString(), order.id]
+    );
     await notify(order.customer_id, 'Payment successful ✅',
       `Rs ${(order.total_paise / 100).toFixed(2)} paid. The kitchen is firing up! 🔥`);
     res.json({ ok: true, payment_status: 'paid' });

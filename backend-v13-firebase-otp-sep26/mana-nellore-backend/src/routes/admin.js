@@ -376,11 +376,26 @@ router.post(
     if (!['flat', 'percent'].includes(discount_type)) {
       return res.status(400).json({ error: 'discount_type must be flat or percent' });
     }
+    // Validate numerics up front: NaN would hit the int columns and surface
+    // as a raw 500 (or a misleading 404 via the 22P02 handler).
+    const valueInt = Math.round(Number(value));
+    const minOrder = min_order_paise == null || min_order_paise === '' ? 0 : Math.round(Number(min_order_paise));
+    const maxDisc = max_discount_paise == null || max_discount_paise === '' ? null : Math.round(Number(max_discount_paise));
+    if (!Number.isFinite(valueInt) || valueInt < 0) {
+      return res.status(400).json({ error: 'value must be a non-negative number' });
+    }
+    if (!Number.isFinite(minOrder) || minOrder < 0 ||
+        (maxDisc != null && (!Number.isFinite(maxDisc) || maxDisc < 0))) {
+      return res.status(400).json({ error: 'min_order_paise and max_discount_paise must be non-negative numbers' });
+    }
+    const codeUp = String(code).toUpperCase();
+    const dupe = await db.query('SELECT id FROM coupons WHERE code = $1', [codeUp]);
+    if (dupe.rows[0]) return res.status(409).json({ error: 'A coupon with this code already exists' });
     const { rows } = await db.query(
       `INSERT INTO coupons (code, discount_type, value, min_order_paise, max_discount_paise, valid_from, valid_to, active, requires_student)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [String(code).toUpperCase(), discount_type, Math.round(Number(value)),
-       min_order_paise || 0, max_discount_paise != null ? Math.round(Number(max_discount_paise)) : null,
+      [codeUp, discount_type, valueInt,
+       minOrder, maxDisc,
        valid_from || null, valid_to || null, active !== false, !!requires_student]
     );
     await audit(req, 'coupon_create', 'coupon', rows[0].id, { code });
@@ -396,7 +411,19 @@ router.put(
     const params = [];
     for (const f of fields) {
       if (req.body[f] !== undefined) {
-        params.push(req.body[f]);
+        let v = req.body[f];
+        // Validate up front: bad values would otherwise surface as raw DB
+        // 500s (or a misleading 404 via the 22P02 handler).
+        if (f === 'discount_type' && !['flat', 'percent'].includes(v)) {
+          return res.status(400).json({ error: 'discount_type must be flat or percent' });
+        }
+        if (['value', 'min_order_paise', 'max_discount_paise'].includes(f) && v !== null && v !== '') {
+          v = Math.round(Number(v));
+          if (!Number.isFinite(v) || v < 0) {
+            return res.status(400).json({ error: `${f} must be a non-negative number` });
+          }
+        }
+        params.push(v);
         sets.push(`${f} = $${params.length}`);
       }
     }
@@ -872,28 +899,35 @@ router.put(
     if (!['approved', 'rejected'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
-    const aRes = await db.query('SELECT * FROM restaurant_applications WHERE id = $1', [req.params.id]);
-    const app = aRes.rows[0];
-    if (!app) return res.status(404).json({ error: 'Application not found' });
-    if (app.status !== 'pending') return res.status(409).json({ error: `Application already ${app.status}` });
-
-    await db.query('UPDATE restaurant_applications SET status = $1, admin_note = $2 WHERE id = $3',
-      [status, admin_note || null, app.id]);
+    // Atomically claim the application: two admins acting on the same pending
+    // application can no longer both approve it and create duplicate restaurants.
+    const { rows } = await db.query(
+      `UPDATE restaurant_applications SET status = $1, admin_note = $2
+       WHERE id = $3 AND status = 'pending' RETURNING *`,
+      [status, admin_note || null, req.params.id]
+    );
+    const app = rows[0];
+    if (!app) {
+      const exists = await db.query(
+        'SELECT status FROM restaurant_applications WHERE id = $1', [req.params.id]
+      );
+      if (!exists.rows[0]) return res.status(404).json({ error: 'Application not found' });
+      return res.status(409).json({ error: `Application already ${exists.rows[0].status}` });
+    }
 
     let restaurantId = null;
     if (status === 'approved') {
-      // Find or create the owner's restaurant_owner profile (same phone, own profile)
-      let uRes = await db.query(
+      // Find or create the owner's restaurant_owner profile (same phone, own profile).
+      // INSERT-first with ON CONFLICT: concurrent approvals collapse onto one row.
+      await db.query(
+        `INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner')
+         ON CONFLICT (phone, role) DO NOTHING`,
+        [app.phone, app.owner_name]
+      );
+      const uRes = await db.query(
         "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner'", [app.phone]
       );
-      let owner = uRes.rows[0];
-      if (!owner) {
-        const c = await db.query(
-          "INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner') RETURNING *",
-          [app.phone, app.owner_name]
-        );
-        owner = c.rows[0];
-      }
+      const owner = uRes.rows[0];
       const rRes = await db.query(
         `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, verified, status, is_coming_soon)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
@@ -942,18 +976,18 @@ router.post(
     if (cleanAadhar && !/^\d{12}$/.test(cleanAadhar)) {
       return res.status(400).json({ error: 'Aadhar must be 12 digits' });
     }
-    // Find or create the owner's restaurant_owner profile (same phone, own profile)
-    let uRes = await db.query(
+    // Find or create the owner's restaurant_owner profile (same phone, own profile).
+    // INSERT-first with ON CONFLICT: a double-submit collapses onto one row
+    // instead of 500ing on UNIQUE(phone, role).
+    await db.query(
+      `INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner')
+       ON CONFLICT (phone, role) DO NOTHING`,
+      [cleanPhone, String(owner_name || '').trim() || null]
+    );
+    const uRes = await db.query(
       "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner'", [cleanPhone]
     );
-    let owner = uRes.rows[0];
-    if (!owner) {
-      const c = await db.query(
-        "INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner') RETURNING *",
-        [cleanPhone, String(owner_name || '').trim() || null]
-      );
-      owner = c.rows[0];
-    }
+    const owner = uRes.rows[0];
     const rRes = await db.query(
       `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, verified, status, is_coming_soon)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
@@ -1228,18 +1262,17 @@ router.put(
     const { rows: rRows } = await db.query('SELECT * FROM restaurants WHERE id = $1', [req.params.id]);
     const rest = rRows[0];
     if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
+    // INSERT-first with ON CONFLICT: concurrent updates collapse onto one row.
+    await db.query(
+      `INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner')
+       ON CONFLICT (phone, role) DO NOTHING`,
+      [cleanPhone, rest.name]
+    );
     const uRes = await db.query(
       "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner' ORDER BY created_at DESC",
       [cleanPhone]
     );
-    let owner = uRes.rows[0];
-    if (!owner) {
-      const c = await db.query(
-        "INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner') RETURNING *",
-        [cleanPhone, rest.name]
-      );
-      owner = c.rows[0];
-    }
+    const owner = uRes.rows[0];
     const prevOwnerId = rest.owner_id;
     const prevPhone = rest.phone;
     await db.query('UPDATE restaurants SET owner_id = $1, phone = $2 WHERE id = $3', [owner.id, cleanPhone, rest.id]);
@@ -1383,4 +1416,4 @@ router.post(
   })
 );
 
-module.exports = router;module.exports = router;
+module.exports = router;

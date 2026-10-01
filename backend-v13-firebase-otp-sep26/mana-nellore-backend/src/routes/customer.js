@@ -14,8 +14,13 @@ router.put(
   ah(async (req, res) => {
     const { lat, lng } = req.body;
     if (lat == null || lng == null) return res.status(400).json({ error: 'lat and lng are required' });
-    await db.query('UPDATE users SET lat = $1, lng = $2 WHERE id = $3', [lat, lng, req.user.id]);
-    res.json({ ok: true, lat, lng });
+    const la = Number(lat);
+    const ln = Number(lng);
+    if (!Number.isFinite(la) || !Number.isFinite(ln) || Math.abs(la) > 90 || Math.abs(ln) > 180) {
+      return res.status(400).json({ error: 'Invalid lat/lng' });
+    }
+    await db.query('UPDATE users SET lat = $1, lng = $2 WHERE id = $3', [la, ln, req.user.id]);
+    res.json({ ok: true, lat: la, lng: ln });
   })
 );
 
@@ -255,8 +260,17 @@ router.get(
     let { rows } = await db.query('SELECT referral_code FROM users WHERE id = $1', [req.user.id]);
     let code = rows[0].referral_code;
     if (!code) {
-      code = makeReferralCode();
-      await db.query('UPDATE users SET referral_code = $1 WHERE id = $2', [code, req.user.id]);
+      // Retry on the astronomically rare referral_code collision (UNIQUE key).
+      for (let attempt = 0; attempt < 3; attempt++) {
+        code = makeReferralCode();
+        try {
+          await db.query('UPDATE users SET referral_code = $1 WHERE id = $2', [code, req.user.id]);
+          break;
+        } catch (e) {
+          if (e.code !== '23505' || attempt === 2) throw e;
+          code = null;
+        }
+      }
     }
     const count = await db.query('SELECT COUNT(*) AS n FROM users WHERE referred_by = $1', [req.user.id]);
     res.json({ code, referrals: Number(count.rows[0].n) });
@@ -277,6 +291,15 @@ router.post(
     if (friend.rows[0].id === req.user.id) {
       return res.status(400).json({ error: 'You are entering your own referral code 🙂' });
     }
+    // Atomically claim the referral: concurrent double-taps (or replays) of
+    // "apply" can no longer mint the Rs 50 coupon pair twice.
+    const claimed = await db.query(
+      'UPDATE users SET referred_by = $1 WHERE id = $2 AND referred_by IS NULL RETURNING id',
+      [friend.rows[0].id, req.user.id]
+    );
+    if (!claimed.rows[0]) {
+      return res.status(409).json({ error: 'You already used a referral code' });
+    }
     const mkCoupon = async (suffix) => {
       const c = 'REF' + suffix + Math.random().toString(36).slice(2, 7).toUpperCase();
       await db.query(
@@ -287,7 +310,7 @@ router.post(
     };
     const myCoupon = await mkCoupon('ME');
     const friendCoupon = await mkCoupon('FR');
-    await db.query('UPDATE users SET referred_by = $1 WHERE id = $2', [friend.rows[0].id, req.user.id]);
+    // (referred_by was already claimed atomically above)
     // Record issuance so GET /api/customer/coupons can list them (survives reinstalls)
     await db.query(
       `INSERT INTO coupon_issuances (user_id, coupon_code, source) VALUES ($1, $2, 'referral')

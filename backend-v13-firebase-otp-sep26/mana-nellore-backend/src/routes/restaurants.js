@@ -268,8 +268,29 @@ router.get(
       detailDist = Math.round(haversineKm(dLat, dLng, Number(restaurant.lat), Number(restaurant.lng)) * 10) / 10;
     }
     res.json({
-      restaurant: { ...restaurant, rating_avg: Number(restaurant.rating_avg), is_open: isOpenNow(restaurant),
-        verified: !!restaurant.verified, distance_km: detailDist },
+      // Whitelisted public fields only: the raw row carries owner PII
+      // (aadhar, fssai, owner_id, gstin) that must never reach clients.
+      restaurant: {
+        id: restaurant.id,
+        name: restaurant.name,
+        description: restaurant.description,
+        address: restaurant.address,
+        phone: restaurant.phone,
+        image_url: restaurant.image_url,
+        rating_avg: Number(restaurant.rating_avg),
+        is_open: isOpenNow(restaurant),
+        verified: !!restaurant.verified,
+        opens_at: restaurant.opens_at,
+        closes_at: restaurant.closes_at,
+        opens_at_we: restaurant.opens_at_we,
+        closes_at_we: restaurant.closes_at_we,
+        birthday_dessert: !!restaurant.birthday_dessert,
+        chef_name: restaurant.chef_name,
+        chef_photo: restaurant.chef_photo,
+        chef_story: restaurant.chef_story,
+        is_coming_soon: !!restaurant.is_coming_soon,
+        distance_km: detailDist
+      },
       categories: cats.rows.map((c) => ({ ...c, items: byCat[c.id] || [] })),
       uncategorized: byCat.uncategorized || [],
       review_photos: photos.rows

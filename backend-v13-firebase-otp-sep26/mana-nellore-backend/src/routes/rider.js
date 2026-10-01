@@ -55,12 +55,15 @@ async function checkQuests(riderId) {
 }
 
 async function transition(orderId, status, by) {
-  const { rows } = await db.query('SELECT timeline FROM orders WHERE id = $1', [orderId]);
-  const timeline = rows[0].timeline || [];
-  timeline.push({ status, at: new Date().toISOString(), by });
-  await db.query('UPDATE orders SET status = $1, timeline = $2::jsonb WHERE id = $3', [
-    status, JSON.stringify(timeline), orderId
-  ]);
+  // Single UPDATE with a jsonb append: concurrent transitions can no longer
+  // silently drop each other's timeline entries (read-modify-write race).
+  await db.query(
+    `UPDATE orders SET status = $1,
+       timeline = COALESCE(timeline, '[]'::jsonb)
+                || jsonb_build_object('status', $1, 'at', $2, 'by', $3)
+     WHERE id = $4`,
+    [status, new Date().toISOString(), by, orderId]
+  );
 }
 
 function newDeliveryOtp() {
@@ -154,7 +157,12 @@ router.put(
     if (!rider) return;
     const { lat, lng } = req.body;
     if (lat == null || lng == null) return res.status(400).json({ error: 'lat and lng are required' });
-    await db.query('UPDATE riders SET lat = $1, lng = $2 WHERE id = $3', [lat, lng, rider.id]);
+    const la = Number(lat);
+    const ln = Number(lng);
+    if (!Number.isFinite(la) || !Number.isFinite(ln) || Math.abs(la) > 90 || Math.abs(ln) > 180) {
+      return res.status(400).json({ error: 'Invalid lat/lng' });
+    }
+    await db.query('UPDATE riders SET lat = $1, lng = $2 WHERE id = $3', [la, ln, rider.id]);
     res.json({ ok: true });
   })
 );
@@ -307,17 +315,17 @@ router.post(
       return res.status(409).json({ error: 'You already have 3 active deliveries — complete one first' });
     }
     const { rows } = await db.query(
-      "SELECT * FROM orders WHERE id = $1 AND status = 'ready' AND rider_id IS NULL",
-      [req.params.id]
+      `UPDATE orders SET rider_id = $1,
+         timeline = COALESCE(timeline, '[]'::jsonb)
+           || jsonb_build_object('status', 'rider_assigned', 'at', $3, 'by', 'rider')
+       WHERE id = $2 AND status = 'ready' AND rider_id IS NULL
+         AND (SELECT COUNT(*) FROM orders o
+              WHERE o.rider_id = $1 AND o.status NOT IN ('delivered', 'cancelled')) < 3
+       RETURNING *`,
+      [rider.id, req.params.id, new Date().toISOString()]
     );
     const order = rows[0];
     if (!order) return res.status(409).json({ error: 'Delivery no longer available' });
-    await db.query('UPDATE orders SET rider_id = $1 WHERE id = $2', [rider.id, order.id]);
-    const timeline = order.timeline || [];
-    timeline.push({ status: 'rider_assigned', at: new Date().toISOString(), by: 'rider' });
-    await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
-      JSON.stringify(timeline), order.id
-    ]);
     await notify(order.customer_id, 'Rider assigned', 'Your rider is on the way to the restaurant.');
     res.json({ ok: true });
   })
@@ -489,7 +497,14 @@ router.post(
     }
     await transition(order.id, 'delivered', 'rider');
 
-    const deliveryPhoto = req.body.delivery_photo || null;
+    let deliveryPhoto = null;
+    if (req.body.delivery_photo) {
+      deliveryPhoto = String(req.body.delivery_photo);
+      const okPrefix = deliveryPhoto.startsWith('data:image/') || deliveryPhoto.startsWith('http');
+      if (!okPrefix || deliveryPhoto.length > 1500000) {
+        return res.status(400).json({ error: 'Photo must be an image under ~1.5MB' });
+      }
+    }
     await db.query(
       'UPDATE orders SET delivered_at = now(), payment_status = $1, delivery_photo = COALESCE($2, delivery_photo) WHERE id = $3',
       [paymentStatus, deliveryPhoto, order.id]

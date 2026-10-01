@@ -36,21 +36,29 @@ async function makeReferralCode() {
 // One phone number gets a SEPARATE user profile per role (portal).
 // Logging into a different portal creates (or reuses) that portal's profile
 // and never changes an existing profile's role.
+// INSERT-first with ON CONFLICT: two concurrent first-logins for the same
+// phone+role collapse onto one row instead of 500ing on UNIQUE(phone, role).
 async function findOrCreateUserByPhone(phone, role, name) {
-  let userRes = await db.query(
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await db.query(
+        `INSERT INTO users (phone, name, role, referral_code) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (phone, role) DO NOTHING`,
+        [phone, name || null, role, await makeReferralCode()]
+      );
+      break;
+    } catch (e) {
+      // Astronomically rare referral_code collision: retry with a fresh code.
+      if (e.code !== '23505' || attempt === 2) throw e;
+    }
+  }
+  const { rows } = await db.query(
     'SELECT * FROM users WHERE phone = $1 AND role = $2',
     [phone, role]
   );
-  let user = userRes.rows[0];
-  if (!user) {
-    const created = await db.query(
-      'INSERT INTO users (phone, name, role, referral_code) VALUES ($1, $2, $3, $4) RETURNING *',
-      [phone, name || null, role, await makeReferralCode()]
-    );
-    user = created.rows[0];
-    if (role === 'rider') {
-      await db.query('INSERT INTO riders (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [user.id]);
-    }
+  const user = rows[0];
+  if (role === 'rider') {
+    await db.query('INSERT INTO riders (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [user.id]);
   }
   return user;
 }
@@ -111,7 +119,16 @@ router.post(
     if (!otp || !(await bcrypt.compare(String(code), otp.code_hash))) {
       return res.status(401).json({ error: 'Invalid or expired OTP' });
     }
-    await db.query('UPDATE otp_codes SET used = true WHERE id = $1', [otp.id]);
+    // Atomically consume the code: a concurrent replay of the same OTP loses
+    // the race here and gets a 401 instead of minting a second session (and
+    // the find-or-create below 500ing on the UNIQUE(phone, role) key).
+    const consumed = await db.query(
+      'UPDATE otp_codes SET used = true WHERE id = $1 AND used = false RETURNING id',
+      [otp.id]
+    );
+    if (!consumed.rows[0]) {
+      return res.status(401).json({ error: 'Invalid or expired OTP' });
+    }
 
     const user = await findOrCreateUserByPhone(phone, role, name);
     const token = signToken(user);
