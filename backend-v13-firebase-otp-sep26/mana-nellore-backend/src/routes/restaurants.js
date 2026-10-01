@@ -226,13 +226,16 @@ router.get(
     }
     let vegClause = '';
     if (vegOnly) vegClause = 'AND m.veg = true';
+    /* spelling-tolerant: menu spellings vary (Idly vs Idli, Biriyani vs Biryani).
+       Normalising y->i on both sides merges that whole class of typos. */
     const { rows } = await db.query(
       `SELECT m.id, m.name, m.price_paise, m.veg, m.image_url,
               r.id AS restaurant_id, r.name AS restaurant_name,
               r.rating_avg, r.is_coming_soon
        FROM menu_items m
        JOIN restaurants r ON r.id = m.restaurant_id
-       WHERE m.name ILIKE $1 AND m.available = true
+       WHERE REPLACE(LOWER(m.name), 'y', 'i') LIKE REPLACE(LOWER($1), 'y', 'i')
+         AND m.available = true
          AND r.status = 'approved' AND r.is_coming_soon = false
          ${priceClause} ${vegClause}
        ORDER BY m.price_paise ASC
