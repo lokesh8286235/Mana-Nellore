@@ -183,6 +183,44 @@ async function migrate() {
   // Backfill share tokens for old orders
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
            WHERE share_token IS NULL`);
+
+  // Image store (v16): photo bytes as immutable files, not data-URLs in JSON.
+  await q(`CREATE TABLE IF NOT EXISTS images (
+    hash text PRIMARY KEY,
+    data bytea NOT NULL,
+    mime text NOT NULL DEFAULT 'image/jpeg',
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await migrateDataUrlPhotos();
+}
+
+// One-time: move data-URL photos already stored in text columns into the
+// image store and rewrite the columns to /img/<hash>. Idempotent — only rows
+// still holding a data:image/... value are touched.
+async function migrateDataUrlPhotos() {
+  const crypto = require('crypto');
+  const { parseDataUrl } = require('./lib/images');
+  const targets = [
+    ['restaurants', 'image_url'],
+    ['restaurants', 'chef_photo'],
+    ['menu_items', 'image_url'],
+  ];
+  for (const [table, col] of targets) {
+    const { rows } = await pool.query(
+      `SELECT id, ${col} AS v FROM ${table} WHERE ${col} LIKE 'data:image/%'`
+    );
+    for (const r of rows) {
+      const p = parseDataUrl(r.v);
+      if (!p || !p.buffer.length) continue;
+      const hash = crypto.createHash('sha256').update(p.buffer).digest('hex');
+      await pool.query(
+        'INSERT INTO images (hash, data, mime) VALUES ($1, $2, $3) ON CONFLICT (hash) DO NOTHING',
+        [hash, p.buffer, p.mime]
+      );
+      await pool.query(`UPDATE ${table} SET ${col} = $1 WHERE id = $2`, ['/img/' + hash, r.id]);
+      console.log(`migrated photo ${table}.${col} ${r.id} -> /img/${hash.slice(0, 12)}...`);
+    }
+  }
 }
 
 // Default pricing rules (paise). Admin can edit these live via /api/admin/pricing.

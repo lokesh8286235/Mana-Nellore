@@ -2,6 +2,7 @@
 // restaurant — an owner can never see or touch another restaurant's data.
 const express = require('express');
 const db = require('../db');
+const { storeImageUrl } = require('../lib/images');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 
 const router = express.Router();
@@ -68,7 +69,7 @@ router.post(
          (owner_id, name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at, opens_at_we, closes_at_we)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [req.user.id, name, description || null, address || null, lat || null, lng || null,
-       phone || null, image_url || null, fssai || null, opens_at || null, closes_at || null,
+       phone || null, await storeImageUrl(db, image_url), fssai || null, opens_at || null, closes_at || null,
        opens_at_we || null, closes_at_we || null]
     );
     await seedSuggestedCats(db, rows[0].id);
@@ -100,7 +101,9 @@ router.put(
     const params = [];
     for (const f of fields) {
       if (req.body[f] !== undefined) {
-        params.push(req.body[f]);
+        let v = req.body[f];
+        if (f === 'image_url' || f === 'chef_photo') v = await storeImageUrl(db, v);
+        params.push(v);
         sets.push(`${f} = $${params.length}`);
       }
     }
@@ -264,7 +267,7 @@ router.post(
          (restaurant_id, category_id, name, description, image_url, price_paise, veg, available, prep_minutes, sort_order,
           meal_slot, is_combo, allergens)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) RETURNING *`,
-      [id, category_id || null, name, description || null, image_url || null,
+      [id, category_id || null, name, description || null, await storeImageUrl(db, image_url),
        Math.round(Number(price_paise)), !!veg, available !== false,
        prep_minutes || 20, sort_order || 0,
        normSlots(meal_slot),
@@ -288,6 +291,7 @@ router.put(
         let v = req.body[f];
         if (f === 'price_paise') v = Math.round(Number(v));
         if (f === 'meal_slot') v = normSlots(v);
+        if (f === 'image_url') v = await storeImageUrl(db, v);
         params.push(v);
         sets.push(`${f} = $${params.length}`);
       }

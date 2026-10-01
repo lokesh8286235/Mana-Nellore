@@ -395,3 +395,12 @@ CREATE TABLE IF NOT EXISTS student_applications (
     CHECK (status IN ('pending','approved','rejected')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Image store: photo bytes live here ONCE; API JSON only carries /img/<hash>.
+-- Keeps restaurant-list and menu payloads tiny at 1000+ restaurants.
+CREATE TABLE IF NOT EXISTS images (
+  hash text PRIMARY KEY,
+  data bytea NOT NULL,
+  mime text NOT NULL DEFAULT 'image/jpeg',
+  created_at timestamptz NOT NULL DEFAULT now()
+);

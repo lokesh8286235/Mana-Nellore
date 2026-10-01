@@ -2,6 +2,7 @@
 // action writes an audit log entry.
 const express = require('express');
 const { seedSuggestedCats } = require('../lib/suggested-cats');
+const { storeImageUrl } = require('../lib/images');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 
@@ -896,7 +897,7 @@ router.put(
       const rRes = await db.query(
         `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, verified, status, is_coming_soon)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai, app.aadhar || null,
+        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, await storeImageUrl(db, app.photo_url), app.fssai, app.aadhar || null,
          !launchComingSoon, launchComingSoon ? 'pending' : 'approved', launchComingSoon]
       );
       await seedSuggestedCats(db, rRes.rows[0].id);
@@ -961,7 +962,7 @@ router.post(
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [owner.id, String(restaurant_name).trim(), String(address).trim(),
        lat || null, lng || null, cleanPhone,
-       photo_url || null, String(fssai).trim(), cleanAadhar || null,
+       await storeImageUrl(db, photo_url), String(fssai).trim(), cleanAadhar || null,
        !launchComingSoon, launchComingSoon ? 'pending' : 'approved', launchComingSoon]
     );
     await seedSuggestedCats(db, rRes.rows[0].id);
@@ -1253,27 +1254,26 @@ router.put(
 
 // ---- Change a restaurant's photo ----
 // PUT /api/admin/restaurants/:id/photo { image_url }
-// Accepts a data-URL (same as the onboard flow) or an https URL. Audited.
+// Accepts a data-URL (stored once as a file, served at /img/<hash>) or an
+// https URL. Audited.
 router.put(
   '/restaurants/:id/photo',
   ah(async (req, res) => {
     const imageUrl = String(req.body.image_url || '').trim();
     if (!imageUrl) return res.status(400).json({ error: 'image_url is required' });
-    if (imageUrl.length > 1500000) {
-      return res.status(400).json({ error: 'Image is too large (max ~1.5MB)' });
-    }
-    const isDataUrl = /^data:image\/(jpeg|png|webp);base64,/.test(imageUrl);
-    const isHttps = /^https:\/\/[^ "']+$/.test(imageUrl);
-    if (!isDataUrl && !isHttps) {
-      return res.status(400).json({ error: 'image_url must be an image data-URL or an https URL' });
+    let stored;
+    try {
+      stored = await storeImageUrl(db, imageUrl);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
     }
     const { rows } = await db.query(
       'UPDATE restaurants SET image_url = $1 WHERE id = $2 RETURNING id, name',
-      [imageUrl, req.params.id]
+      [stored, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, 'restaurant_photo_changed', 'restaurant', rows[0].id, { name: rows[0].name });
-    res.json({ ok: true });
+    res.json({ ok: true, image_url: stored });
   })
 );
 

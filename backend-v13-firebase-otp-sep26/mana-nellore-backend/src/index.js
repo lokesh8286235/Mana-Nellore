@@ -42,6 +42,10 @@ app.use('/api/rider', require('./routes/rider'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api', require('./routes/public'));
 
+// Static image assets — deliberately outside /api/ so menu/gallery bursts
+// don't consume the API rate-limit budget.
+app.use('/img', require('./routes/img'));
+
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
 // Central error handler
