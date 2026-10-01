@@ -927,19 +927,16 @@ router.post(
   ah(async (req, res) => {
     const { restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url } = req.body || {};
     const launchComingSoon = req.body && req.body.coming_soon === true;
-    if (!restaurant_name || !String(restaurant_name).trim() ||
-        !owner_name || !String(owner_name).trim()) {
-      return res.status(400).json({ error: 'Restaurant name and owner name are required' });
+    if (!restaurant_name || !String(restaurant_name).trim()) {
+      return res.status(400).json({ error: 'Restaurant name is required' });
     }
+    // owner_name + fssai are optional at onboard time — admin fills them later via Edit details
     const cleanPhone = String(phone || '').replace(/\D/g, '').slice(-10);
     if (!/^[6-9]\d{9}$/.test(cleanPhone)) {
       return res.status(400).json({ error: 'A valid 10-digit mobile number is required' });
     }
     if (!address || !String(address).trim()) {
       return res.status(400).json({ error: 'Restaurant address is required' });
-    }
-    if (!fssai || !String(fssai).trim()) {
-      return res.status(400).json({ error: 'FSSAI license number is required' });
     }
     const cleanAadhar = String(aadhar || '').replace(/\D/g, '');
     if (cleanAadhar && !/^\d{12}$/.test(cleanAadhar)) {
@@ -953,7 +950,7 @@ router.post(
     if (!owner) {
       const c = await db.query(
         "INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner') RETURNING *",
-        [cleanPhone, String(owner_name).trim()]
+        [cleanPhone, String(owner_name || '').trim() || null]
       );
       owner = c.rows[0];
     }
@@ -962,7 +959,7 @@ router.post(
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [owner.id, String(restaurant_name).trim(), String(address).trim(),
        lat || null, lng || null, cleanPhone,
-       await storeImageUrl(db, photo_url), String(fssai).trim(), cleanAadhar || null,
+       await storeImageUrl(db, photo_url), String(fssai || '').trim() || null, cleanAadhar || null,
        !launchComingSoon, launchComingSoon ? 'pending' : 'approved', launchComingSoon]
     );
     await seedSuggestedCats(db, rRes.rows[0].id);
@@ -1249,6 +1246,54 @@ router.put(
     await audit(req, 'restaurant_owner_phone', 'restaurant', rest.id,
       { from_phone: prevPhone, to_phone: cleanPhone, from_owner: prevOwnerId, to_owner: owner.id });
     res.json({ ok: true, phone: cleanPhone, owner_id: owner.id });
+  })
+);
+
+// ---- Edit a restaurant's details ----
+// PUT /api/admin/restaurants/:id/details { name, address, fssai, owner_name }
+// Updates the restaurant's editable details. All fields optional; only the
+// fields present in the body are changed. owner_name updates the linked
+// owner's user record. Empty strings clear the field (name cannot be emptied).
+// Audited.
+router.put(
+  '/restaurants/:id/details',
+  ah(async (req, res) => {
+    const { rows: rRows } = await db.query('SELECT * FROM restaurants WHERE id = $1', [req.params.id]);
+    const rest = rRows[0];
+    if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
+    const { name, address, fssai, owner_name } = req.body || {};
+    const updates = [];
+    const vals = [];
+    let i = 1;
+    const changes = {};
+    if (name !== undefined) {
+      const v = String(name).trim();
+      if (!v) return res.status(400).json({ error: 'Restaurant name cannot be empty' });
+      updates.push('name = $' + (i++)); vals.push(v); changes.name = { from: rest.name, to: v };
+    }
+    if (address !== undefined) {
+      const v = String(address).trim() || null;
+      updates.push('address = $' + (i++)); vals.push(v); changes.address = { from: rest.address, to: v };
+    }
+    if (fssai !== undefined) {
+      const v = String(fssai).trim() || null;
+      updates.push('fssai = $' + (i++)); vals.push(v); changes.fssai = { from: rest.fssai, to: v };
+    }
+    if (!updates.length && owner_name === undefined) {
+      return res.status(400).json({ error: 'Nothing to update' });
+    }
+    if (updates.length) {
+      vals.push(rest.id);
+      await db.query('UPDATE restaurants SET ' + updates.join(', ') + ' WHERE id = $' + i, vals);
+    }
+    if (owner_name !== undefined && rest.owner_id) {
+      const v = String(owner_name).trim() || null;
+      await db.query('UPDATE users SET name = $1 WHERE id = $2', [v, rest.owner_id]);
+      changes.owner_name = { to: v };
+    }
+    await audit(req, 'restaurant_details_updated', 'restaurant', rest.id, changes);
+    const { rows: out } = await db.query('SELECT * FROM restaurants WHERE id = $1', [rest.id]);
+    res.json({ ok: true, restaurant: out[0] });
   })
 );
 
