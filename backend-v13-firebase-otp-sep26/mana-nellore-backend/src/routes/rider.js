@@ -411,7 +411,7 @@ router.put(
 
     const code = newDeliveryOtp();
     const hash = await bcrypt.hash(code, 8);
-    await db.query('UPDATE orders SET delivery_otp_hash = $1, pickup_photo = COALESCE($2, pickup_photo) WHERE id = $3',
+    await db.query('UPDATE orders SET delivery_otp_hash = $1, pickup_photo = $2 WHERE id = $3',
       [hash, photo, detail.id]);
     await transition(detail.id, 'picked_up', 'rider');
     await notify(detail.customer_id, 'Your delivery OTP',
@@ -505,10 +505,17 @@ router.post(
         return res.status(400).json({ error: 'Photo must be an image under ~1.5MB' });
       }
     }
-    await db.query(
-      'UPDATE orders SET delivered_at = now(), payment_status = $1, delivery_photo = COALESCE($2, delivery_photo) WHERE id = $3',
-      [paymentStatus, deliveryPhoto, order.id]
-    );
+    if (deliveryPhoto) {
+      await db.query(
+        'UPDATE orders SET delivered_at = now(), payment_status = $1, delivery_photo = $2 WHERE id = $3',
+        [paymentStatus, deliveryPhoto, order.id]
+      );
+    } else {
+      await db.query(
+        'UPDATE orders SET delivered_at = now(), payment_status = $1 WHERE id = $3',
+        [paymentStatus, order.id]
+      );
+    }
 
     await notify(order.customer_id, 'Delivered! 🍽️',
       'Wash your hands — your food is here! Enjoy every bite. Loved it? Tap to rate ⭐');
