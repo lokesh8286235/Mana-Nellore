@@ -60,7 +60,7 @@ async function transition(orderId, status, by) {
   await db.query(
     `UPDATE orders SET status = $1,
        timeline = COALESCE(timeline, '[]'::jsonb)
-                || jsonb_build_object('status', $1, 'at', $2, 'by', $3)
+                || jsonb_build_object('status', $1::text, 'at', $2::text, 'by', $3::text)
      WHERE id = $4`,
     [status, new Date().toISOString(), by, orderId]
   );
@@ -317,7 +317,7 @@ router.post(
     const { rows } = await db.query(
       `UPDATE orders SET rider_id = $1,
          timeline = COALESCE(timeline, '[]'::jsonb)
-           || jsonb_build_object('status', 'rider_assigned', 'at', $3, 'by', 'rider')
+           || jsonb_build_object('status', 'rider_assigned', 'at', $3::text, 'by', 'rider')
        WHERE id = $2 AND status = 'ready' AND rider_id IS NULL
          AND (SELECT COUNT(*) FROM orders o
               WHERE o.rider_id = $1 AND o.status NOT IN ('delivered', 'cancelled')) < 3

@@ -21,7 +21,7 @@ async function transition(orderId, status, by) {
   await db.query(
     `UPDATE orders SET status = $1,
        timeline = COALESCE(timeline, '[]'::jsonb)
-                || jsonb_build_object('status', $1, 'at', $2, 'by', $3)
+                || jsonb_build_object('status', $1::text, 'at', $2::text, 'by', $3::text)
      WHERE id = $4`,
     [status, new Date().toISOString(), by, orderId]
   );
@@ -391,7 +391,7 @@ router.post(
     await db.query("UPDATE orders SET payment_status = 'paid' WHERE id = $1", [order.id]);
     await db.query(
       `UPDATE orders SET timeline = COALESCE(timeline, '[]'::jsonb)
-         || jsonb_build_object('status', 'paid', 'at', $1, 'by', 'customer')
+         || jsonb_build_object('status', 'paid', 'at', $1::text, 'by', 'customer')
        WHERE id = $2`,
       [new Date().toISOString(), order.id]
     );
@@ -506,7 +506,7 @@ router.get(
         timeline.push({ status: 'no_response_nudge', at: new Date().toISOString(), by: 'system' });
         await db.query(
           `UPDATE orders SET timeline = COALESCE(timeline, '[]'::jsonb)
-             || jsonb_build_object('status', 'no_response_nudge', 'at', $1, 'by', 'system')
+             || jsonb_build_object('status', 'no_response_nudge', 'at', $1::text, 'by', 'system')
            WHERE id = $2 AND NOT (COALESCE(timeline, '[]'::jsonb) @> '[{"status":"no_response_nudge"}]')`,
           [new Date().toISOString(), order.id]);
       }
@@ -780,7 +780,7 @@ router.post(
     await db.query("UPDATE orders SET payment_status = 'paid', payment_method = 'razorpay' WHERE id = $1", [order.id]);
     await db.query(
       `UPDATE orders SET timeline = COALESCE(timeline, '[]'::jsonb)
-         || jsonb_build_object('status', 'paid', 'at', $1, 'by', 'razorpay')
+         || jsonb_build_object('status', 'paid', 'at', $1::text, 'by', 'razorpay')
        WHERE id = $2`,
       [new Date().toISOString(), order.id]
     );
