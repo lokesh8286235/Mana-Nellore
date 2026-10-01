@@ -69,6 +69,19 @@ async function findOrCreateUserByPhone(phone, role, name) {
 // call the provider with `+91${phone}` and the 6-digit `code` right after the
 // otp_codes INSERT below. If the provider call fails, delete the row / return 500
 // so the user is never stuck with a code they did not receive.
+//
+// SECURITY: the dev code is returned ONLY for whitelisted test phones
+// (DEV_OTP_PHONES, comma-separated, 10-digit). Returning it for any phone
+// lets anyone mint a session for anyone else's number — full account
+// takeover. Default (unset/empty): no phone gets a code back.
+function devOtpAllowed(phone) {
+  if (process.env.DEV_OTP !== 'true') return false;
+  const list = String(process.env.DEV_OTP_PHONES || '')
+    .split(',')
+    .map((s) => s.replace(/\D/g, '').slice(-10))
+    .filter(Boolean);
+  return list.includes(phone);
+}
 router.post(
   '/send-otp',
   ah(async (req, res) => {
@@ -85,7 +98,7 @@ router.post(
       [phone, codeHash, expiresAt.toISOString()]
     );
 
-    if (process.env.DEV_OTP === 'true') {
+    if (devOtpAllowed(phone)) {
       const { rows } = await db.query('SELECT name FROM users WHERE phone = $1', [phone]);
       return res.json({ ok: true, dev_code: code, existing_name: rows[0]?.name || null });
     }

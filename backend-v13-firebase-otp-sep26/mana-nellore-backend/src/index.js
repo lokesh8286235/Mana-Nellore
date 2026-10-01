@@ -4,11 +4,26 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { initDb } = require('./db');
 
 const app = express();
-app.use(cors());
+// Behind Railway's proxy the client IP arrives in X-Forwarded-For. Without
+// this, rate limiting keys on the proxy IP and every user shares one bucket.
+app.set('trust proxy', 1);
+app.use(helmet());
+// Browsers may only call the API from our own web apps (*.vercel.app covers
+// the stable domains and deploy URLs). Non-browser clients (curl, native
+// apps) send no Origin and are unaffected.
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin || /\.vercel\.app$/.test(origin)) return cb(null, true);
+      return cb(new Error('CORS: origin not allowed'));
+    },
+  })
+);
 app.use(express.json({ limit: '2mb' }));
 
 // Rate limiting: general API + strict OTP/auth
@@ -30,7 +45,14 @@ app.use('/api/', apiLimiter);
 app.use('/api/auth/', authLimiter);
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: !dbStatus.error, service: 'mana-nellore-backend', db: dbStatus, time: new Date().toISOString() });
+  // Public: readiness only. Never expose dbStatus.error — init failure
+  // messages can contain connection details.
+  res.json({
+    ok: !dbStatus.error,
+    service: 'mana-nellore-backend',
+    db: { ready: dbStatus.ready },
+    time: new Date().toISOString(),
+  });
 });
 
 app.use('/api/auth', require('./routes/auth'));
