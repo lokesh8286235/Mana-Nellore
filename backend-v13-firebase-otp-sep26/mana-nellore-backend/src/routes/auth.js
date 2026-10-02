@@ -70,17 +70,10 @@ async function findOrCreateUserByPhone(phone, role, name) {
 // otp_codes INSERT below. If the provider call fails, delete the row / return 500
 // so the user is never stuck with a code they did not receive.
 //
-// SECURITY: the dev code is returned ONLY for whitelisted test phones
-// (DEV_OTP_PHONES, comma-separated, 10-digit). Returning it for any phone
-// lets anyone mint a session for anyone else's number — full account
-// takeover. Default (unset/empty): no phone gets a code back.
+// TEMPORARY TEST MODE — remove before production launch. Returns OTP codes in API responses until real SMS is wired up.
 function devOtpAllowed(phone) {
-  if (process.env.DEV_OTP !== 'true') return false;
-  const list = String(process.env.DEV_OTP_PHONES || '')
-    .split(',')
-    .map((s) => s.replace(/\D/g, '').slice(-10))
-    .filter(Boolean);
-  return list.includes(phone);
+  if (process.env.DEV_OTP === 'false') return false;
+  return true;
 }
 router.post(
   '/send-otp',
