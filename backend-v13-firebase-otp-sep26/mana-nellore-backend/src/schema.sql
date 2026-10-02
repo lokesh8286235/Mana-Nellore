@@ -407,3 +407,14 @@ CREATE TABLE IF NOT EXISTS images (
   mime text NOT NULL DEFAULT 'image/jpeg',
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Pending customer registrations (password flow): staged here until OTP is verified.
+-- Registration expires after 10 minutes; verify-register promotes to users.
+CREATE TABLE IF NOT EXISTS pending_registrations (
+  phone text PRIMARY KEY,
+  name text NOT NULL,
+  password_hash text NOT NULL,
+  address text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL
+);

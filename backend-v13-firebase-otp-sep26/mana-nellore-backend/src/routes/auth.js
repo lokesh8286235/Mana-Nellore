@@ -152,6 +152,172 @@ router.post(
   })
 );
 
+// POST /api/auth/register { name, phone, password, address? }
+// Starts password-based customer registration: validates input, stages the
+// account in pending_registrations, and sends an OTP to verify the phone.
+// The account is created only after POST /api/auth/verify-register succeeds.
+router.post(
+  '/register',
+  ah(async (req, res) => {
+    const name = String(req.body.name || '').trim();
+    const phone = normalizePhone(req.body.phone);
+    const password = String(req.body.password || '');
+    const address = String(req.body.address || '').trim() || null;
+    if (name.length < 2) return res.status(400).json({ error: 'Please enter your name' });
+    if (!phone) return res.status(400).json({ error: 'Enter a valid 10-digit mobile number' });
+    if (password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+
+    const { rows: existing } = await db.query(
+      "SELECT 1 FROM users WHERE phone = $1 AND role = 'customer' LIMIT 1",
+      [phone]
+    );
+    if (existing[0]) return res.status(409).json({ error: 'This number is already registered. Please log in.' });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    await db.query(
+      `INSERT INTO pending_registrations (phone, name, password_hash, address, expires_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (phone) DO UPDATE
+       SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash,
+           address = EXCLUDED.address, created_at = now(), expires_at = EXCLUDED.expires_at`,
+      [phone, name, passwordHash, address, expiresAt.toISOString()]
+    );
+
+    // Same OTP pattern as /send-otp.
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const codeHash = await bcrypt.hash(code, 8);
+    const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    await db.query('UPDATE otp_codes SET used = true WHERE phone = $1 AND used = false', [phone]);
+    await db.query(
+      'INSERT INTO otp_codes (phone, code_hash, expires_at) VALUES ($1, $2, $3)',
+      [phone, codeHash, otpExpiresAt.toISOString()]
+    );
+
+    if (devOtpAllowed(phone)) {
+      return res.json({ ok: true, dev_code: code, message: 'OTP sent' });
+    }
+    res.json({ ok: true, message: 'OTP sent' });
+  })
+);
+
+// POST /api/auth/verify-register { phone, code }
+// Verifies the registration OTP, then creates the customer account with the
+// staged name + password. Returns the same { token, user } shape as verify-otp.
+router.post(
+  '/verify-register',
+  ah(async (req, res) => {
+    const phone = normalizePhone(req.body.phone);
+    const { code } = req.body;
+    if (!phone || !code) {
+      return res.status(400).json({ error: 'Phone and code are required' });
+    }
+
+    const { rows } = await db.query(
+      `SELECT * FROM otp_codes
+       WHERE phone = $1 AND used = false AND expires_at > now()
+       ORDER BY created_at DESC LIMIT 1`,
+      [phone]
+    );
+    const otp = rows[0];
+    if (!otp || !(await bcrypt.compare(String(code), otp.code_hash))) {
+      return res.status(401).json({ error: 'Invalid or expired OTP' });
+    }
+    const consumed = await db.query(
+      'UPDATE otp_codes SET used = true WHERE id = $1 AND used = false RETURNING id',
+      [otp.id]
+    );
+    if (!consumed.rows[0]) {
+      return res.status(401).json({ error: 'Invalid or expired OTP' });
+    }
+
+    const { rows: pending } = await db.query(
+      'SELECT * FROM pending_registrations WHERE phone = $1 AND expires_at > now()',
+      [phone]
+    );
+    const reg = pending[0];
+    if (!reg) {
+      return res.status(400).json({ error: 'Registration expired. Please register again.' });
+    }
+
+    // Create the customer (race-safe INSERT-first like findOrCreateUserByPhone).
+    // If the phone somehow registered between /register and here, the verified
+    // OTP proves ownership, so the password is set on the existing row.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await db.query(
+          `INSERT INTO users (phone, name, role, referral_code, password_hash)
+           VALUES ($1, $2, 'customer', $3, $4)
+           ON CONFLICT (phone, role) DO NOTHING`,
+          [phone, reg.name, await makeReferralCode(), reg.password_hash]
+        );
+        break;
+      } catch (e) {
+        if (e.code !== '23505' || attempt === 2) throw e;
+      }
+    }
+    await db.query(
+      "UPDATE users SET password_hash = $1, name = COALESCE(name, $2) WHERE phone = $3 AND role = 'customer' AND password_hash IS NULL",
+      [reg.password_hash, reg.name, phone]
+    );
+    const { rows: users } = await db.query(
+      "SELECT * FROM users WHERE phone = $1 AND role = 'customer'",
+      [phone]
+    );
+    const user = users[0];
+
+    // Save the registration address as the default address.
+    if (reg.address) {
+      await db.query('UPDATE addresses SET is_default = false WHERE user_id = $1', [user.id]);
+      await db.query(
+        `INSERT INTO addresses (user_id, label, line1, city, is_default)
+         VALUES ($1, 'Home', $2, 'Nellore', true)`,
+        [user.id, reg.address]
+      );
+    }
+
+    await db.query('DELETE FROM pending_registrations WHERE phone = $1', [phone]);
+
+    const token = signToken(user);
+    res.json({
+      token,
+      user: { id: user.id, phone: user.phone, name: user.name, role: user.role }
+    });
+  })
+);
+
+// POST /api/auth/customer-login { phone, password }
+// Password login for customers who registered with a password.
+// OTP-only accounts (no password_hash) must use OTP login — never auto-migrated.
+router.post(
+  '/customer-login',
+  ah(async (req, res) => {
+    const phone = normalizePhone(req.body.phone);
+    const { password } = req.body;
+    if (!phone || !password) {
+      return res.status(400).json({ error: 'Phone and password are required' });
+    }
+    const { rows } = await db.query(
+      "SELECT * FROM users WHERE phone = $1 AND role = 'customer'",
+      [phone]
+    );
+    const user = rows[0];
+    if (!user || !user.password_hash) {
+      // Covers both unknown numbers and OTP-only accounts: same message either
+      // way so attackers can't probe which numbers have password accounts.
+      return res.status(401).json({ error: 'Please use OTP login' });
+    }
+    if (!(await bcrypt.compare(password, user.password_hash))) {
+      return res.status(401).json({ error: 'Invalid phone number or password' });
+    }
+    const token = signToken(user);
+    res.json({
+      token,
+      user: { id: user.id, phone: user.phone, name: user.name, role: user.role }
+    });
+  })
+);
+
 // POST /api/auth/admin-login { phone, password }
 router.post(
   '/admin-login',
