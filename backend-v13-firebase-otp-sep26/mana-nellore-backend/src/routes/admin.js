@@ -165,7 +165,11 @@ router.put(
       return res.status(400).json({ error: 'Invalid status' });
     }
     const { rows } = await db.query(
-      'UPDATE restaurants SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]
+      `UPDATE restaurants
+       SET status = $1,
+           verified = CASE WHEN $1 = 'approved' THEN true ELSE verified END,
+           is_coming_soon = CASE WHEN $1 = 'approved' THEN false ELSE is_coming_soon END
+       WHERE id = $2 RETURNING *`, [status, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, `restaurant_${status}`, 'restaurant', req.params.id, {});
@@ -1222,7 +1226,7 @@ router.put(
 // ---- Coming soon / Finalize onboarding ----
 // Coming soon means NOT approved yet: marking coming soon un-approves
 // (pending + unverified, suspended stays suspended); finalizing approves
-// (approved + verified) and opens ordering.
+// (approved + verified, from any non-rejected state) and opens ordering.
 router.put(
   '/restaurants/:id/coming-soon',
   ah(async (req, res) => {
@@ -1233,7 +1237,7 @@ router.put(
            verified = CASE WHEN $1 THEN false ELSE true END,
            status = CASE
              WHEN $1 AND status = 'approved' THEN 'pending'
-             WHEN NOT $1 AND status = 'pending' THEN 'approved'
+             WHEN NOT $1 AND status <> 'rejected' THEN 'approved'
              ELSE status END
        WHERE id = $2
        RETURNING id, is_coming_soon, verified, status`,
@@ -1283,18 +1287,22 @@ router.put(
 );
 
 // ---- Edit a restaurant's details ----
-// PUT /api/admin/restaurants/:id/details { name, address, fssai, owner_name }
+// PUT /api/admin/restaurants/:id/details { name, address, fssai, owner_name,
+//   opens_at, closes_at, opens_at_we, closes_at_we }
 // Updates the restaurant's editable details. All fields optional; only the
 // fields present in the body are changed. owner_name updates the linked
 // owner's user record. Empty strings clear the field (name cannot be emptied).
+// Timing fields accept 'HH:MM' or 'HH:MM:SS' (24h); empty string clears.
 // Audited.
+const TIME_RE = /^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
 router.put(
   '/restaurants/:id/details',
   ah(async (req, res) => {
     const { rows: rRows } = await db.query('SELECT * FROM restaurants WHERE id = $1', [req.params.id]);
     const rest = rRows[0];
     if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
-    const { name, address, fssai, owner_name } = req.body || {};
+    const { name, address, fssai, owner_name,
+      opens_at, closes_at, opens_at_we, closes_at_we } = req.body || {};
     const updates = [];
     const vals = [];
     let i = 1;
@@ -1311,6 +1319,17 @@ router.put(
     if (fssai !== undefined) {
       const v = String(fssai).trim() || null;
       updates.push('fssai = $' + (i++)); vals.push(v); changes.fssai = { from: rest.fssai, to: v };
+    }
+    for (const tf of ['opens_at', 'closes_at', 'opens_at_we', 'closes_at_we']) {
+      const raw = { opens_at, closes_at, opens_at_we, closes_at_we }[tf];
+      if (raw !== undefined) {
+        const t = String(raw).trim();
+        if (t && !TIME_RE.test(t)) {
+          return res.status(400).json({ error: tf + " must be 'HH:MM' (24h)" });
+        }
+        const v = t || null;
+        updates.push(tf + ' = $' + (i++)); vals.push(v); changes[tf] = { from: rest[tf], to: v };
+      }
     }
     if (!updates.length && owner_name === undefined) {
       return res.status(400).json({ error: 'Nothing to update' });
