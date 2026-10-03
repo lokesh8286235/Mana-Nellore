@@ -156,6 +156,29 @@ router.get(
   })
 );
 
+// DELETE /api/admin/restaurants/:id — permanently deletes a restaurant and all its
+// menu items, categories, etc. (via ON DELETE CASCADE). Refuses if the restaurant
+// has any orders, to protect real order history.
+router.delete(
+  '/restaurants/:id',
+  ah(async (req, res) => {
+    const id = req.params.id;
+    const { rows: existing } = await db.query(
+      'SELECT id, name FROM restaurants WHERE id = $1', [id]
+    );
+    if (!existing[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    const { rows: orderCheck } = await db.query(
+      'SELECT COUNT(*)::int AS c FROM orders WHERE restaurant_id = $1', [id]
+    );
+    if (orderCheck[0].c > 0) {
+      return res.status(400).json({ error: 'Cannot delete: restaurant has ' + orderCheck[0].c + ' order(s). Suspend it instead.' });
+    }
+    await db.query('DELETE FROM restaurants WHERE id = $1', [id]);
+    await audit(req, 'restaurant_delete', 'restaurant', id, { name: existing[0].name });
+    res.json({ deleted: id, name: existing[0].name });
+  })
+);
+
 // PUT /api/admin/restaurants/:id/status { status: approved|suspended|rejected|pending }
 router.put(
   '/restaurants/:id/status',
