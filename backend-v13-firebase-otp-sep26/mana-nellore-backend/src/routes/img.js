@@ -43,6 +43,10 @@ function sendImg(res, buf, mime) {
   res.set('Content-Type', mime);
   res.set('Content-Length', String(buf.length));
   res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  // Images are embedded on other origins (admin panel, customer app), so
+  // override helmet's default CORP: same-origin — otherwise browsers refuse
+  // to load them cross-origin and photos show broken.
+  res.set('Cross-Origin-Resource-Policy', 'cross-origin');
   res.send(buf);
 }
 
