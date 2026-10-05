@@ -1458,4 +1458,126 @@ router.post(
   })
 );
 
+
+// ---- Admin menu item management (audited) ----
+// POST /api/admin/restaurants/:id/menu/items
+// { category, name, description, price_paise, veg, available, image_url, is_combo }
+// image_url accepts a data-URL (stored via images lib) or https URL.
+router.post(
+  '/restaurants/:id/menu/items',
+  ah(async (req, res) => {
+    const { rows: rRows } = await db.query('SELECT id, name FROM restaurants WHERE id = $1', [req.params.id]);
+    if (!rRows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    const rid = rRows[0].id;
+    const b = req.body || {};
+    const name = String(b.name || '').trim();
+    const price = Math.round(Number(b.price_paise));
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    if (!Number.isFinite(price) || price < 0) return res.status(400).json({ error: 'valid price_paise is required' });
+    // Resolve or create category by name
+    let catId = null;
+    const catName = String(b.category || '').trim();
+    if (catName) {
+      const ex = await db.query('SELECT id FROM categories WHERE restaurant_id = $1 AND name = $2', [rid, catName]);
+      if (ex.rows[0]) catId = ex.rows[0].id;
+      else {
+        const ms = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM categories WHERE restaurant_id = $1', [rid]);
+        const c = await db.query('INSERT INTO categories (restaurant_id, name, sort_order) VALUES ($1, $2, $3) RETURNING id',
+          [rid, catName, Number(ms.rows[0].s) || 0]);
+        catId = c.rows[0].id;
+      }
+    }
+    let imageUrl = null;
+    if (b.image_url) {
+      try { imageUrl = await storeImageUrl(db, String(b.image_url)); }
+      catch (e) { return res.status(400).json({ error: e.message }); }
+    }
+    const ms2 = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM menu_items WHERE restaurant_id = $1', [rid]);
+    const { rows } = await db.query(
+      `INSERT INTO menu_items (restaurant_id, category_id, name, description, image_url, price_paise, veg, available, is_combo, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [rid, catId, name, String(b.description || '').trim() || null, imageUrl,
+       price, b.veg !== false, b.available !== false, !!b.is_combo, Number(ms2.rows[0].s) || 0]
+    );
+    await audit(req, 'menu_item_created', 'restaurant', rid, { item_id: rows[0].id, name });
+    res.status(201).json({ ok: true, item: rows[0] });
+  })
+);
+
+// PUT /api/admin/restaurants/:id/menu/items/:itemId
+// Partial update. image_url accepts data-URL or https URL. Audited.
+router.put(
+  '/restaurants/:id/menu/items/:itemId',
+  ah(async (req, res) => {
+    const { rows: rRows } = await db.query('SELECT id FROM restaurants WHERE id = $1', [req.params.id]);
+    if (!rRows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    const rid = rRows[0].id;
+    const { rows: iRows } = await db.query('SELECT * FROM menu_items WHERE id = $1 AND restaurant_id = $2', [req.params.itemId, rid]);
+    if (!iRows[0]) return res.status(404).json({ error: 'Menu item not found' });
+    const b = req.body || {};
+    const sets = [], vals = [];
+    let vi = 1;
+    function set(col, val) { sets.push(col + ' = $' + (vi++)); vals.push(val); }
+    if (b.name !== undefined) {
+      const n = String(b.name).trim();
+      if (!n) return res.status(400).json({ error: 'name cannot be empty' });
+      set('name', n);
+    }
+    if (b.price_paise !== undefined) {
+      const p = Math.round(Number(b.price_paise));
+      if (!Number.isFinite(p) || p < 0) return res.status(400).json({ error: 'valid price_paise is required' });
+      set('price_paise', p);
+    }
+    if (b.description !== undefined) set('description', String(b.description).trim() || null);
+    if (b.veg !== undefined) set('veg', !!b.veg);
+    if (b.available !== undefined) set('available', !!b.available);
+    if (b.is_combo !== undefined) set('is_combo', !!b.is_combo);
+    if (b.category !== undefined) {
+      const catName = String(b.category || '').trim();
+      let catId = null;
+      if (catName) {
+        const ex = await db.query('SELECT id FROM categories WHERE restaurant_id = $1 AND name = $2', [rid, catName]);
+        if (ex.rows[0]) catId = ex.rows[0].id;
+        else {
+          const ms = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM categories WHERE restaurant_id = $1', [rid]);
+          const c = await db.query('INSERT INTO categories (restaurant_id, name, sort_order) VALUES ($1, $2, $3) RETURNING id',
+            [rid, catName, Number(ms.rows[0].s) || 0]);
+          catId = c.rows[0].id;
+        }
+      }
+      set('category_id', catId);
+    }
+    if (b.image_url !== undefined) {
+      let stored = null;
+      if (b.image_url) {
+        try { stored = await storeImageUrl(db, String(b.image_url)); }
+        catch (e) { return res.status(400).json({ error: e.message }); }
+      }
+      set('image_url', stored);
+    }
+    if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+    vals.push(req.params.itemId, rid);
+    const { rows } = await db.query(
+      'UPDATE menu_items SET ' + sets.join(', ') + ' WHERE id = $' + vi + ' AND restaurant_id = $' + (vi + 1) + ' RETURNING *',
+      vals
+    );
+    await audit(req, 'menu_item_updated', 'restaurant', rid, { item_id: rows[0].id, name: rows[0].name });
+    res.json({ ok: true, item: rows[0] });
+  })
+);
+
+// DELETE /api/admin/restaurants/:id/menu/items/:itemId — audited.
+router.delete(
+  '/restaurants/:id/menu/items/:itemId',
+  ah(async (req, res) => {
+    const { rows: rRows } = await db.query('SELECT id FROM restaurants WHERE id = $1', [req.params.id]);
+    if (!rRows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    const rid = rRows[0].id;
+    const { rows } = await db.query('DELETE FROM menu_items WHERE id = $1 AND restaurant_id = $2 RETURNING id, name', [req.params.itemId, rid]);
+    if (!rows[0]) return res.status(404).json({ error: 'Menu item not found' });
+    await audit(req, 'menu_item_deleted', 'restaurant', rid, { item_id: rows[0].id, name: rows[0].name });
+    res.json({ ok: true, deleted: rows[0].id });
+  })
+);
+
 module.exports = router;
