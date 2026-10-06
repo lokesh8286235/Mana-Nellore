@@ -260,6 +260,11 @@ function defaultPricingRows() {
     },
     eta_minutes: 30,              // Honest ETA estimate shown to customers (not a guarantee)
     call_to_order_phone: ''       // support / phone-order line shown in the customer app
+    ,
+    // GST rates (%) charged on the customer bill. Editable from the admin
+    // Pricing screen; the customer app fetches them via GET /api/config so
+    // rate changes apply without an app rebuild.
+    tax_rates: { food_gst_pct: 5, delivery_gst_pct: 18, platform_gst_pct: 18 }
   };
 }
 
