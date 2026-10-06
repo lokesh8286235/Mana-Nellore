@@ -384,6 +384,26 @@ router.put(
   })
 );
 
+// GET /api/admin/otw-audit — on-the-way anti-scam audit trail: every
+// secondary-discount decision at placement (granted / stripped / rejected)
+// plus service-area determinations. Newest first.
+router.get(
+  '/otw-audit',
+  ah(async (req, res) => {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+    const { rows } = await db.query(
+      `SELECT l.*, r1.name AS primary_restaurant_name, r2.name AS secondary_restaurant_name
+       FROM otw_audit_log l
+       LEFT JOIN restaurants r1 ON r1.id = l.primary_restaurant_id
+       LEFT JOIN restaurants r2 ON r2.id = l.secondary_restaurant_id
+       ORDER BY l.created_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json({ events: rows });
+  })
+);
+
 // ---- Coupons ----
 router.get(
   '/coupons',

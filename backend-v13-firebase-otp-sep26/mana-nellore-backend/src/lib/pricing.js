@@ -40,7 +40,34 @@ async function loadPricingConfig(db) {
       (m.free_delivery_rules && m.free_delivery_rules.rules) || [],
     // Honest ETA estimate shown to customers ("Usually ~X min") — NOT a delivery promise.
     etaMinutes: Number(m.eta_minutes != null ? m.eta_minutes : 30),
+    // GST rates (%) charged on the customer bill. Backend-driven: the admin
+    // Pricing screen edits these, the customer app fetches them via /api/config.
+    taxRates: normalizeTaxRates(m.tax_rates),
   };
+}
+
+// Defensive normalization for the tax_rates pricing_config value.
+// Never throws; falls back to the founder's rates on bad data.
+function normalizeTaxRates(v) {
+  const d = { food_gst_pct: 5, delivery_gst_pct: 18, platform_gst_pct: 18 };
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return { ...d };
+  const out = {};
+  for (const k of Object.keys(d)) {
+    const n = Number(v[k]);
+    out[k] = v[k] == null || !Number.isFinite(n) || n < 0 ? d[k] : n;
+  }
+  return out;
+}
+
+// Component-wise GST, each component rounded to paise then summed.
+// Matches the customer app's bill math so displayed and charged totals agree.
+function computeGstPaise(taxRates, { foodPaise, deliveryPaise, platformPaise }) {
+  const r = normalizeTaxRates(taxRates);
+  const g = (base, pct) => Math.round((Number(base) || 0) * pct / 100);
+  const food = g(foodPaise, r.food_gst_pct);
+  const delivery = g(deliveryPaise, r.delivery_gst_pct);
+  const platform = g(platformPaise, r.platform_gst_pct);
+  return { food, delivery, platform, total: food + delivery + platform, rates: r };
 }
 
 // Marginal tiers: 0-3 km @ Rs 10/km, 3-8 km @ Rs 9/km, 8+ km @ Rs 8/km.
@@ -85,7 +112,7 @@ function riderPayoutPaise(cfg, distanceKm) {
   );
 }
 
-function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct }) {
+function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct, taxRates, gstFoodBasePaise }) {
   const net = subtotalPaise - discountPaise;
   const deliveryFee =
     distanceKm == null
@@ -96,19 +123,33 @@ function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, co
   const commissionPaise = Math.round((net * pct) / 100);
   const payout =
     distanceKm == null ? null : riderPayoutPaise(config.riderPayout, distanceKm);
+  // GST is charged on the customer bill at backend-driven rates. The food base
+  // is the pre-discount subtotal, matching the customer app's bill math so the
+  // displayed total and the charged total agree to the paise.
+  const gst = computeGstPaise(
+    taxRates || config.taxRates,
+    {
+      foodPaise: gstFoodBasePaise != null ? gstFoodBasePaise : subtotalPaise,
+      deliveryPaise: deliveryFee,
+      platformPaise: platformFeePaise
+    }
+  );
   return {
     deliveryFeePaise: deliveryFee,
     platformFeePaise,
-    taxPaise: 0,
+    taxPaise: gst.total,
+    gstBreakdown: gst,
     commissionPaise,
     riderPayoutPaise: payout,
-    totalPaise: net + deliveryFee + platformFeePaise
+    totalPaise: net + deliveryFee + platformFeePaise + gst.total
   };
 }
 
 module.exports = {
   haversineKm,
   loadPricingConfig,
+  normalizeTaxRates,
+  computeGstPaise,
   deliveryFeePaise,
   riderPayoutPaise,
   computeQuote

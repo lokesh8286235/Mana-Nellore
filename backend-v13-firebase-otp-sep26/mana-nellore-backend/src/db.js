@@ -124,6 +124,12 @@ async function migrate() {
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS tip_paise int NOT NULL DEFAULT 0');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_name text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_phone text');
+  // On-the-way grouping (anti-scam): which orders belong to a multi-restaurant
+  // group, their role, and whether a claimed secondary discount was denied.
+  await q("ALTER TABLE orders ADD COLUMN IF NOT EXISTS otw_role text");
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS otw_primary_order_id uuid');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS otw_group_size int');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS otw_discount_denied boolean NOT NULL DEFAULT false');
   // COD 'collected' status
   await q('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_status_check');
   await q(`ALTER TABLE orders ADD CONSTRAINT orders_payment_status_check

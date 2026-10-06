@@ -418,3 +418,23 @@ CREATE TABLE IF NOT EXISTS pending_registrations (
   created_at timestamptz NOT NULL DEFAULT now(),
   expires_at timestamptz NOT NULL
 );
+
+-- On-the-way anti-scam audit trail: every secondary-restaurant discount
+-- decision at placement (granted / stripped / rejected), plus service-area
+-- determinations. The founder reviews scam attempts from the admin panel.
+CREATE TABLE IF NOT EXISTS otw_audit_log (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  event text NOT NULL,
+  order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
+  customer_id uuid,
+  primary_restaurant_id uuid,
+  secondary_restaurant_id uuid,
+  address_id uuid,
+  fee_charged_paise int,
+  fee_full_paise int,
+  reason text,
+  meta jsonb NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_otw_audit_created ON otw_audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_otw_audit_customer ON otw_audit_log(customer_id);
