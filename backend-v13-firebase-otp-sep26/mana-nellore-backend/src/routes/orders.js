@@ -5,7 +5,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, computeQuote, computeGstPaise, deliveryFeePaise } = require('../lib/pricing');
-const { isOnRoute, isInServiceArea, otwDenyReason } = require('../lib/onetheway');
+const { isInServiceArea, otwDiscountDecision } = require('../lib/onetheway');
 
 const router = express.Router();
 router.use(authenticate);
@@ -276,10 +276,13 @@ async function multiGroupQuote(req, res, { groupDefs, dineIn, address_id, coupon
       excludedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: 'unavailable' });
       continue;
     }
-    if (!isOnRoute(sRest, primRest, address || {})) {
-      excludedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: otwDenyReason(sRest, primRest, address || {}) });
+    const routeDec = otwDiscountDecision(sRest, primRest, address || {});
+    if (routeDec.decision === 'deny') {
+      excludedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: routeDec.reason });
       continue;
     }
+    // 'grant' (verified on-route) or 'grant_unverifiable' (coords missing —
+    // matches the app's current permissive behavior; audit-flagged later).
     const sq = await priceQuoteItems(q, def.items, sRest.id);
     if (sq.error) return res.status(400).json({ error: sq.error });
     if (!sq.subtotal) { excludedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: 'no_valid_items' }); continue; }
@@ -560,8 +563,9 @@ router.post(
             'SELECT id, name, lat, lng FROM restaurants WHERE id = $1', [cand.restaurant_id]);
           const pRest = pRes.rows[0];
           if (!pRest) throw { status: 400, message: 'The main restaurant for this order is no longer available' };
-          if (!isOnRoute(primRest, pRest, address)) {
-            const reason = otwDenyReason(primRest, pRest, address);
+          const routeDec = otwDiscountDecision(primRest, pRest, address);
+          if (routeDec.decision === 'deny') {
+            const reason = routeDec.reason;
             await client.query('ROLLBACK');
             await otwAudit('secondary_stripped', {
               customer_id: req.user.id, primary_restaurant_id: pRest.id,
@@ -574,9 +578,19 @@ router.post(
               removed_off_route: [{ restaurant_id: primRest.id, name: primRest.name, reason }]
             });
           }
+          // 'grant' (verified on-route) or 'grant_unverifiable' (coords missing;
+          // the app lists such restaurants as on-the-way — flagged in audit).
           otwRole = 'secondary';
           otwPrimaryOrderId = cand.id;
           otwPrimaryRest = pRest;
+          if (routeDec.decision === 'grant_unverifiable') {
+            await otwAudit('secondary_discount_unverifiable', {
+              customer_id: req.user.id, primary_restaurant_id: pRest.id,
+              secondary_restaurant_id: primRest.id, address_id,
+              fee_charged_paise: null, reason: 'unverifiable_granted',
+              meta: { via: 'split_call' }
+            });
+          }
         } else {
           otwRole = 'primary';
           otwGroupSize = Number(group_size) || 2;
@@ -668,8 +682,9 @@ router.post(
             removedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: 'unavailable' });
             continue;
           }
-          if (!isOnRoute(sRest, primRest, address)) {
-            const reason = otwDenyReason(sRest, primRest, address);
+          const routeDec = otwDiscountDecision(sRest, primRest, address);
+          if (routeDec.decision === 'deny') {
+            const reason = routeDec.reason;
             removedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason });
             otwAudit('secondary_stripped', {
               customer_id: req.user.id, primary_restaurant_id: primRest.id,
@@ -677,6 +692,14 @@ router.post(
               fee_charged_paise: 0, reason, meta: { via: 'single_call' }
             });
             continue;
+          }
+          if (routeDec.decision === 'grant_unverifiable') {
+            otwAudit('secondary_discount_unverifiable', {
+              customer_id: req.user.id, primary_restaurant_id: primRest.id,
+              secondary_restaurant_id: sRest.id, address_id,
+              fee_charged_paise: null, reason: 'unverifiable_granted',
+              meta: { via: 'single_call' }
+            });
           }
           const priced = await pricePlacementItems(client, def.items, sRest.id);
           let secDist = null;

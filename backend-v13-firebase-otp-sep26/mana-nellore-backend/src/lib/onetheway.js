@@ -77,11 +77,35 @@ function otwDenyReason(secRest, primRest, address) {
   return 'off_route';
 }
 
+// True when all three parties have coordinates — i.e., the route check is verifiable.
+function otwCoordsComplete(sec, prim, addr) {
+  return [sec, prim, addr].every((p) => p && num(p.lat) !== null && num(p.lng) !== null);
+}
+
+// The discount decision.
+// - Verifiable route + on-route  -> grant the 20% discount.
+// - Verifiable route + off-route -> deny (strip/exclude) the secondary.
+// - Unverifiable (any coords missing) -> grant the 20%, flagged for audit.
+//
+// The third case is deliberate: the customer app is permissive when coords are
+// missing (it lists every open restaurant as on-the-way), and today NO
+// restaurant has coordinates. Denying here would break 100% of legitimate
+// on-the-way orders and contradict what the user sees. The strict gate
+// engages automatically the moment coordinates exist (capture them at
+// restaurant onboarding). Every permissive grant is audit-logged.
+function otwDiscountDecision(sec, prim, addr) {
+  if (!otwCoordsComplete(sec, prim, addr)) return { decision: 'grant_unverifiable' };
+  if (isOnRoute(sec, prim, addr)) return { decision: 'grant' };
+  return { decision: 'deny', reason: 'off_route' };
+}
+
 module.exports = {
   SERVICE_AREA,
   DETOUR_TOLERANCE,
   isOnRoute,
   isInServiceArea,
   extractPin,
-  otwDenyReason
+  otwDenyReason,
+  otwCoordsComplete,
+  otwDiscountDecision
 };
