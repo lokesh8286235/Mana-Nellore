@@ -59,6 +59,13 @@ async function loadPricingConfig(db) {
     riderPayoutExtraStopPaise: Number(
       m.rider_payout_extra_stop_paise != null ? m.rider_payout_extra_stop_paise : 1500
     ),
+    // Fallback distance (km) used for delivery-fee calculation when restaurant
+    // or address coordinates are missing. The fee is still computed via the
+    // admin-configurable delivery tiers — never a hardcoded rupee value.
+    // Default 5km is a sensible Nellore average; admin can tune via pricing_config.
+    fallbackDistanceKm: Number(
+      m.fallback_distance_km != null ? m.fallback_distance_km : 5
+    ),
   };
   _pricingCache = cfg;
   _pricingCacheAt = Date.now();
@@ -133,10 +140,10 @@ function riderPayoutPaise(cfg, distanceKm) {
 
 function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct, taxRates, gstFoodBasePaise }) {
   const net = subtotalPaise - discountPaise;
-  const deliveryFee =
-    distanceKm == null
-      ? 2500 // fallback Rs 25 when locations are unknown
-      : deliveryFeePaise(config.deliveryTiers, distanceKm, net, config.freeDeliveryRules);
+  // When locations are unknown, estimate via the tier engine at the
+  // admin-configurable fallback distance — never a hardcoded rupee value.
+  const effDist = distanceKm == null ? (Number(config.fallbackDistanceKm) || 5) : distanceKm;
+  const deliveryFee = deliveryFeePaise(config.deliveryTiers, effDist, net, config.freeDeliveryRules);
   const platformFeePaise = config.platformFeePaise;
   const pct = commissionPct != null ? Number(commissionPct) : config.defaultCommissionPct;
   const commissionPaise = Math.round((net * pct) / 100);

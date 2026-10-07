@@ -350,7 +350,7 @@ async function multiGroupQuote(req, res, { groupDefs, dineIn, address_id, coupon
     if (sRest.lat != null && sRest.lng != null && address.lat != null && address.lng != null) {
       secDist = haversineKm(Number(sRest.lat), Number(sRest.lng), Number(address.lat), Number(address.lng));
     }
-    const ownFee = secDist == null ? 2500 : deliveryFeePaise(config.deliveryTiers, secDist, sq.subtotal, config.freeDeliveryRules);
+    const ownFee = deliveryFeePaise(config.deliveryTiers, secDist == null ? (Number(config.fallbackDistanceKm) || 5) : secDist, sq.subtotal, config.freeDeliveryRules);
     const chargedFee = Math.round(ownFee * 0.2);
     secFood += sq.subtotal;
     secDelivery += chargedFee;
@@ -741,9 +741,7 @@ router.post(
 
       let deliveryFee, platformFee, gst, commissionPaise, deliveryFeeFull = null;
       if (otwRole === 'secondary') {
-        const ownFee = distanceKm == null
-          ? 2500
-          : deliveryFeePaise(config.deliveryTiers, distanceKm, primPriced.subtotal - discount, config.freeDeliveryRules);
+        const ownFee = deliveryFeePaise(config.deliveryTiers, distanceKm == null ? (Number(config.fallbackDistanceKm) || 5) : distanceKm, primPriced.subtotal - discount, config.freeDeliveryRules);
         deliveryFeeFull = ownFee;
         deliveryFee = Math.round(ownFee * 0.2);
         platformFee = 0; // no additional platform fee for secondaries
@@ -814,9 +812,7 @@ router.post(
           if (sRest.lat != null && sRest.lng != null && address.lat != null && address.lng != null) {
             secDist = haversineKm(Number(sRest.lat), Number(sRest.lng), Number(address.lat), Number(address.lng));
           }
-          const ownFee = secDist == null
-            ? 2500
-            : deliveryFeePaise(config.deliveryTiers, secDist, priced.subtotal, config.freeDeliveryRules);
+          const ownFee = deliveryFeePaise(config.deliveryTiers, secDist == null ? (Number(config.fallbackDistanceKm) || 5) : secDist, priced.subtotal, config.freeDeliveryRules);
           const chargedFee = Math.round(ownFee * 0.2);
           const secGst = computeGstPaise(config.taxRates, {
             foodPaise: priced.subtotal, deliveryPaise: chargedFee, platformPaise: 0
