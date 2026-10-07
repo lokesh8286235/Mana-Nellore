@@ -43,6 +43,11 @@ async function loadPricingConfig(db) {
     // GST rates (%) charged on the customer bill. Backend-driven: the admin
     // Pricing screen edits these, the customer app fetches them via /api/config.
     taxRates: normalizeTaxRates(m.tax_rates),
+    // Flat rider bonus per extra on-the-way pickup stop (beyond the primary).
+    // Falls back to ₹15 when the key is absent — no migration needed.
+    riderPayoutExtraStopPaise: Number(
+      m.rider_payout_extra_stop_paise != null ? m.rider_payout_extra_stop_paise : 1500
+    ),
   };
 }
 

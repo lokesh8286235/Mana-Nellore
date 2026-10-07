@@ -66,6 +66,90 @@ async function transition(orderId, status, by) {
   );
 }
 
+// ---------- Multi-stop (on-the-way) group helpers ----------
+// A customer order with on-the-way secondaries is stored as SPLIT rows:
+// one primary (otw_role='primary') + secondaries (otw_role='secondary',
+// otw_primary_order_id = primary id). One rider handles the whole group:
+// multiple pickups in route order, one final delivery.
+// Route order = placement order: primary first, then secondaries by placed_at.
+
+// All rows of a group (primary + secondaries) in route order.
+async function groupRows(primaryId) {
+  const { rows } = await db.query(
+    `SELECT * FROM orders WHERE id = $1 OR otw_primary_order_id = $1
+     ORDER BY CASE WHEN otw_role = 'primary' THEN 0 ELSE 1 END, placed_at ASC, id ASC`,
+    [primaryId]
+  );
+  return rows;
+}
+
+// Resolve any order row id to its group's primary id.
+async function groupPrimaryId(orderId) {
+  const { rows } = await db.query(
+    'SELECT id, otw_role, otw_primary_order_id FROM orders WHERE id = $1',
+    [orderId]
+  );
+  const o = rows[0];
+  if (!o) return null;
+  return o.otw_role === 'secondary' && o.otw_primary_order_id
+    ? String(o.otw_primary_order_id)
+    : String(o.id);
+}
+
+// Combined rider payout for a group: primary-leg distance payout plus a flat
+// bonus per extra pickup stop (from pricing config, default ₹15).
+function groupPayoutPaise(config, primaryDistanceKm, extraStops) {
+  const base =
+    primaryDistanceKm != null ? riderPayoutPaise(config.riderPayout, primaryDistanceKm) : 3000;
+  const bonus = Number(config.riderPayoutExtraStopPaise || 1500);
+  return base + Math.max(0, extraStops) * bonus;
+}
+
+// Number of ACTIVE delivery groups (not rows) a rider holds — the 3-slot limit.
+async function activeGroupCount(riderId) {
+  const { rows } = await db.query(
+    `SELECT COUNT(*) AS n FROM orders
+     WHERE rider_id = $1 AND status NOT IN ('delivered','cancelled')
+       AND (otw_role IS NULL OR otw_role = 'primary')`,
+    [riderId]
+  );
+  return Number(rows[0].n);
+}
+
+// Per-stop detail for a group: restaurant info + items + status + timeline,
+// in route order. Stops not assigned to this rider are flagged detached
+// (transitional only — cascade accept keeps groups whole going forward).
+async function groupStops(primaryId, riderId) {
+  const rows = await groupRows(primaryId);
+  const stops = [];
+  for (const o of rows) {
+    const r = await db.query(
+      'SELECT id, name, address, phone, lat, lng FROM restaurants WHERE id = $1',
+      [o.restaurant_id]
+    );
+    const items = await db.query(
+      'SELECT name_snapshot, qty, unit_price_paise FROM order_items WHERE order_id = $1',
+      [o.id]
+    );
+    const rest = r.rows[0] || {};
+    stops.push({
+      order_id: o.id,
+      restaurant_id: o.restaurant_id,
+      restaurant_name: rest.name || 'Restaurant',
+      restaurant_address: rest.address || null,
+      restaurant_phone: rest.phone || null,
+      rest_lat: rest.lat, rest_lng: rest.lng,
+      status: o.status,
+      timeline: o.timeline || [],
+      items: items.rows,
+      primary: o.otw_role !== 'secondary',
+      detached: String(o.rider_id || '') !== String(riderId),
+      pickup_photo: o.pickup_photo || null,
+    });
+  }
+  return stops;
+}
+
 function newDeliveryOtp() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
@@ -191,6 +275,11 @@ router.post(
 
 // Delivery detail (scoped to this rider's deliveries)
 async function deliveryDetail(orderId, riderId) {
+  // orderId is a group id: a primary row id (or a standalone row id).
+  // Returns the primary's fields plus stops[] for the whole group in route
+  // order. Backward compatible: a standalone order yields stops=[itself].
+  const primaryId = await groupPrimaryId(orderId);
+  if (!primaryId) return null;
   const { rows } = await db.query(
     `SELECT o.*, r.name AS restaurant_name, r.address AS restaurant_address,
             r.lat AS rest_lat, r.lng AS rest_lng, r.phone AS restaurant_phone,
@@ -202,59 +291,109 @@ async function deliveryDetail(orderId, riderId) {
      LEFT JOIN addresses a ON a.id = o.address_id
      JOIN users u ON u.id = o.customer_id
      WHERE o.id = $1 AND o.rider_id = $2`,
-    [orderId, riderId]
+    [primaryId, riderId]
   );
   const order = rows[0];
   if (!order) return null;
   delete order.delivery_otp_hash;
+  const stops = await groupStops(primaryId, riderId);
+  const grandTotal = stops.reduce((a, s) => a + (s.items || []).reduce((x, it) => x + Number(it.unit_price_paise || 0) * Number(it.qty || 0), 0), 0);
   const items = await db.query('SELECT name_snapshot, qty, unit_price_paise FROM order_items WHERE order_id = $1', [order.id]);
-  return { ...order, items: items.rows };
+  return {
+    ...order,
+    items: items.rows,
+    stops,
+    stop_count: stops.length,
+    grand_total_paise: grandTotal || Number(order.total_paise || 0),
+  };
+}
+
+// Single stop row belonging to this rider (for per-stop arrived/picked-up).
+// Returns { stop, primaryId } or null.
+async function stopRow(stopId, riderId) {
+  const { rows } = await db.query('SELECT * FROM orders WHERE id = $1 AND rider_id = $2', [stopId, riderId]);
+  const stop = rows[0];
+  if (!stop) return null;
+  const primaryId = stop.otw_role === 'secondary' && stop.otw_primary_order_id
+    ? String(stop.otw_primary_order_id) : String(stop.id);
+  return { stop, primaryId };
 }
 
 // GET /api/rider/deliveries/available — ready orders with no rider yet.
 // Sorted nearest-first by rider-to-restaurant distance when the rider's
 // location is known (proximity dispatch); oldest first as fallback.
+//
+// MULTI-STOP: one offer per GROUP (primary row id). Secondary rows never
+// appear alone — accepting the primary assigns the whole group to one rider.
+// A group is offered only when EVERY non-cancelled stop is 'ready', so the
+// rider can run the route without waiting on a kitchen.
 router.get(
   '/deliveries/available',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
     const { rows } = await db.query(
-      `SELECT o.id, o.total_paise, o.placed_at, o.payment_method,
-              r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
+      `SELECT o.id, o.total_paise, o.placed_at, o.payment_method, o.otw_group_size,
+              r.id AS rest_id, r.name AS restaurant_name, r.address AS rest_address,
+              r.lat AS rest_lat, r.lng AS rest_lng,
               a.line1, a.city, a.lat AS addr_lat, a.lng AS addr_lng
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
        LEFT JOIN addresses a ON a.id = o.address_id
        WHERE o.status = 'ready' AND o.rider_id IS NULL
          AND o.order_type = 'delivery'
+         AND (o.otw_role IS NULL OR o.otw_role = 'primary')
        ORDER BY o.placed_at ASC LIMIT 20`
     );
     const config = await loadPricingConfig(db);
-    const list = rows.map((o) => {
+    const list = [];
+    for (const o of rows) {
+      // Gather the group's secondary rows.
+      const sec = await db.query(
+        `SELECT s.id, s.status, r.name AS restaurant_name, r.address AS rest_address,
+                r.lat AS rest_lat, r.lng AS rest_lng
+         FROM orders s JOIN restaurants r ON r.id = s.restaurant_id
+         WHERE s.otw_primary_order_id = $1
+         ORDER BY s.placed_at ASC, s.id ASC`,
+        [o.id]
+      );
+      const liveSecs = sec.rows.filter((s) => s.status !== 'cancelled');
+      // Every live stop must be ready — otherwise the group isn't offerable yet.
+      if (liveSecs.some((s) => s.status !== 'ready')) continue;
+      const stops = [
+        { restaurant_id: o.rest_id, restaurant_name: o.restaurant_name, restaurant_address: o.rest_address, primary: true },
+        ...liveSecs.map((s) => ({
+          restaurant_id: s.restaurant_id, restaurant_name: s.restaurant_name,
+          restaurant_address: s.rest_address, primary: false,
+        })),
+      ];
+      const stopCount = stops.length;
       let distanceKm = null;
       let payout = null;
       let pickupKm = null;
       if (o.rest_lat != null && o.rest_lng != null && o.addr_lat != null && o.addr_lng != null) {
         distanceKm = haversineKm(o.rest_lat, o.rest_lng, o.addr_lat, o.addr_lng);
-        payout = riderPayoutPaise(config.riderPayout, distanceKm);
+        payout = groupPayoutPaise(config, distanceKm, stopCount - 1);
       }
-      // Rider-to-restaurant distance drives nearest-first sorting
+      // Rider-to-first-pickup distance drives nearest-first sorting
       if (rider.lat != null && rider.lng != null && o.rest_lat != null && o.rest_lng != null) {
         pickupKm = haversineKm(Number(rider.lat), Number(rider.lng), Number(o.rest_lat), Number(o.rest_lng));
       }
-      return {
+      list.push({
         id: o.id,
         total_paise: o.total_paise,
         placed_at: o.placed_at,
         payment_method: o.payment_method,
         restaurant_name: o.restaurant_name,
+        rest_address: o.rest_address,
         address: [o.line1, o.city].filter(Boolean).join(', '),
         distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
         pickup_km: pickupKm == null ? null : Math.round(pickupKm * 10) / 10,
-        payout_paise: payout
-      };
-    });
+        payout_paise: payout,
+        stop_count: stopCount,
+        stops,
+      });
+    }
     list.sort((a, b) => {
       if (a.pickup_km != null && b.pickup_km != null) return a.pickup_km - b.pickup_km;
       return new Date(a.placed_at) - new Date(b.placed_at);
@@ -263,13 +402,14 @@ router.get(
   })
 );
 
-// GET /api/rider/deliveries?status=active — my deliveries
+// GET /api/rider/deliveries?status=active — my deliveries, ONE entry per
+// GROUP (a multi-stop order counts as one delivery slot, not N rows).
 router.get(
   '/deliveries',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
-    let where = 'o.rider_id = $1';
+    let where = 'o.rider_id = $1 AND (o.otw_role IS NULL OR o.otw_role = \'primary\')';
     const params = [rider.id];
     if (req.query.status === 'active') {
       where += " AND o.status NOT IN ('delivered','cancelled')";
@@ -278,7 +418,10 @@ router.get(
       where += ` AND o.status = $${params.length}`;
     }
     const { rows } = await db.query(
-      `SELECT o.id, o.status, o.total_paise, o.placed_at, r.name AS restaurant_name
+      `SELECT o.id, o.status, o.total_paise, o.placed_at, r.name AS restaurant_name,
+              o.otw_role, o.otw_primary_order_id, o.otw_group_size,
+              (SELECT COUNT(*) FROM orders s
+                 WHERE s.otw_primary_order_id = o.id AND s.status <> 'cancelled') AS secondary_count
        FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params
@@ -299,102 +442,161 @@ router.get(
   })
 );
 
-// POST /api/rider/deliveries/:id/accept
+// POST /api/rider/deliveries/:id/accept — accepts a whole GROUP (primary +
+// its secondaries) in one transaction: one rider, multiple pickups, one
+// delivery. Accepting a secondary row directly is rejected. The 3-slot
+// limit counts groups, not rows.
 router.post(
   '/deliveries/:id/accept',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
     if (!rider.online) return res.status(409).json({ error: 'Go online to accept deliveries' });
-    // Max 3 concurrent active deliveries per rider.
-    const active = await db.query(
-      "SELECT COUNT(*) AS n FROM orders WHERE rider_id = $1 AND status NOT IN ('delivered','cancelled')",
-      [rider.id]
-    );
-    if (Number(active.rows[0].n) >= 3) {
+    // Max 3 concurrent active delivery GROUPS per rider.
+    if ((await activeGroupCount(rider.id)) >= 3) {
       return res.status(409).json({ error: 'You already have 3 active deliveries — complete one first' });
     }
-    const { rows } = await db.query(
-      `UPDATE orders SET rider_id = $1,
-         timeline = COALESCE(timeline, '[]'::jsonb)
-           || jsonb_build_object('status', 'rider_assigned', 'at', $3::text, 'by', 'rider')
-       WHERE id = $2 AND status = 'ready' AND rider_id IS NULL
-         AND (SELECT COUNT(*) FROM orders o
-              WHERE o.rider_id = $1 AND o.status NOT IN ('delivered', 'cancelled')) < 3
-       RETURNING *`,
-      [rider.id, req.params.id, new Date().toISOString()]
-    );
-    const order = rows[0];
-    if (!order) return res.status(409).json({ error: 'Delivery no longer available' });
-    await notify(order.customer_id, 'Rider assigned', 'Your rider is on the way to the restaurant.');
-    res.json({ ok: true });
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `SELECT * FROM orders WHERE id = $1 AND status = 'ready' AND rider_id IS NULL
+           AND (otw_role IS NULL OR otw_role = 'primary') FOR UPDATE`,
+        [req.params.id]
+      );
+      const order = rows[0];
+      if (!order) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Delivery no longer available' });
+      }
+      if ((await activeGroupCount(rider.id)) >= 3) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'You already have 3 active deliveries — complete one first' });
+      }
+      const now = new Date().toISOString();
+      // Assign the primary AND every live secondary of the group to this rider.
+      const upd = await client.query(
+        `UPDATE orders SET rider_id = $1,
+           timeline = COALESCE(timeline, '[]'::jsonb)
+             || jsonb_build_object('status', 'rider_assigned', 'at', $3::text, 'by', 'rider')
+         WHERE (id = $2 OR otw_primary_order_id = $2)
+           AND status = 'ready' AND rider_id IS NULL AND status <> 'cancelled'
+         RETURNING id, otw_role`,
+        [rider.id, req.params.id, now]
+      );
+      await client.query('COMMIT');
+      const stopCount = upd.rows.length;
+      await notify(order.customer_id, 'Rider assigned', 'Your rider is on the way to the restaurant.');
+      res.json({ ok: true, stop_count: stopCount });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_) { /* noop */ }
+      throw e;
+    } finally {
+      client.release();
+    }
   })
 );
 
-// POST /api/rider/deliveries/:id/cancel { reason? } — rider releases the delivery.
-// Only before pickup: the order returns to the available pool for another rider.
+// POST /api/rider/deliveries/:id/cancel { reason? } — rider releases the
+// delivery. Only before ANY pickup: the whole group returns to the available
+// pool for another rider.
 router.post(
   '/deliveries/:id/cancel',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
-    const { rows } = await db.query(
-      'SELECT * FROM orders WHERE id = $1 AND rider_id = $2',
-      [req.params.id, rider.id]
-    );
-    const order = rows[0];
-    if (!order) return res.status(404).json({ error: 'Delivery not found' });
-    if (!['ready'].includes(order.status)) {
+    const primaryId = await groupPrimaryId(req.params.id);
+    if (!primaryId) return res.status(404).json({ error: 'Delivery not found' });
+    const rows = await groupRows(primaryId);
+    const mine = rows.filter((o) => String(o.rider_id) === String(rider.id));
+    if (!mine.length) return res.status(404).json({ error: 'Delivery not found' });
+    if (mine.some((o) => !['ready'].includes(o.status))) {
       return res.status(409).json({ error: 'Too late to cancel — the food is already picked up' });
     }
-    const timeline = order.timeline || [];
+    const timeline = (rows[0].timeline || []);
     timeline.push({
       status: 'rider_cancelled', at: new Date().toISOString(), by: 'rider',
       reason: req.body.reason || 'Rider cancelled'
     });
     await db.query(
-      'UPDATE orders SET rider_id = NULL, timeline = $1::jsonb WHERE id = $2',
-      [JSON.stringify(timeline), order.id]
+      `UPDATE orders SET rider_id = NULL, timeline = $1::jsonb
+       WHERE (id = $2 OR otw_primary_order_id = $2) AND rider_id = $3`,
+      [JSON.stringify(timeline), primaryId, rider.id]
     );
     await db.query(
       'UPDATE riders SET cancelled_deliveries = COALESCE(cancelled_deliveries, 0) + 1 WHERE id = $1',
       [rider.id]
     );
-    await notify(order.customer_id, 'Finding you another rider 🛵',
+    await notify(rows[0].customer_id, 'Finding you another rider 🛵',
       'Your rider had to step away — we\u2019re assigning a new one right now.');
     res.json({ ok: true });
   })
 );
 
-// PUT /api/rider/deliveries/:id/arrived-restaurant
+// POST /api/rider/deliveries/:stopId/flag-issue { reason } — rider reports a
+// problem with one pickup stop (kitchen closed, unreachable, wrong items…).
+// The stop is flagged on its timeline and every admin is notified. The order
+// is NOT silently dropped: the stop stays visible in the rail as failed and
+// the rider continues with the remaining stops; admin follows up.
+router.post(
+  '/deliveries/:id/flag-issue',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const found = await stopRow(req.params.id, rider.id);
+    if (!found) return res.status(404).json({ error: 'Delivery not found' });
+    const reason = String((req.body && req.body.reason) || '').trim().slice(0, 280);
+    if (!reason) return res.status(400).json({ error: 'Tell us what went wrong at this stop' });
+    const timeline = found.stop.timeline || [];
+    timeline.push({
+      status: 'stop_issue', at: new Date().toISOString(), by: 'rider', reason,
+    });
+    await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
+      JSON.stringify(timeline), found.stop.id
+    ]);
+    const rname = rider.name || 'Rider';
+    const admins = await db.query("SELECT id FROM users WHERE role = 'admin'");
+    const stopName = found.stop.restaurant_id || 'a pickup stop';
+    await Promise.all(admins.rows.map((a) =>
+      notify(a.id, 'Rider stop issue — ' + rname,
+        `${rname} flagged a problem at stop ${stopName} (order ${found.primaryId}): ${reason}`)
+    ));
+    res.json({ ok: true });
+  })
+);
+
+// PUT /api/rider/deliveries/:stopId/arrived-restaurant — per pickup stop.
+// :stopId is the stop's own order row id (primary or secondary).
 router.put(
   '/deliveries/:id/arrived-restaurant',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
-    const detail = await deliveryDetail(req.params.id, rider.id);
-    if (!detail) return res.status(404).json({ error: 'Delivery not found' });
-    if (detail.status !== 'ready') return res.status(409).json({ error: `Invalid status ${detail.status}` });
-    const timeline = detail.timeline || [];
+    const found = await stopRow(req.params.id, rider.id);
+    if (!found) return res.status(404).json({ error: 'Delivery not found' });
+    if (found.stop.status !== 'ready') return res.status(409).json({ error: `Invalid status ${found.stop.status}` });
+    const timeline = found.stop.timeline || [];
     timeline.push({ status: 'arrived_restaurant', at: new Date().toISOString(), by: 'rider' });
     await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
-      JSON.stringify(timeline), detail.id
+      JSON.stringify(timeline), found.stop.id
     ]);
     res.json({ ok: true });
   })
 );
 
-// PUT /api/rider/deliveries/:id/picked-up { photo } — generates the delivery OTP
-// for the customer. Pickup photo (image data URL, max ~1.5MB) is REQUIRED and
-// is shown to the customer on live tracking as proof of packed-food pickup.
+// PUT /api/rider/deliveries/:stopId/picked-up { photo } — per pickup stop.
+// Pickup photo (image data URL, max ~1.5MB) is REQUIRED and is shown to the
+// customer on live tracking as proof of packed-food pickup.
+// The delivery OTP is generated only when the LAST stop is picked up, so the
+// customer gets a single OTP notification for the whole multi-stop order.
 router.put(
   '/deliveries/:id/picked-up',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
-    const detail = await deliveryDetail(req.params.id, rider.id);
-    if (!detail) return res.status(404).json({ error: 'Delivery not found' });
-    if (detail.status !== 'ready') return res.status(409).json({ error: `Invalid status ${detail.status}` });
+    const found = await stopRow(req.params.id, rider.id);
+    if (!found) return res.status(404).json({ error: 'Delivery not found' });
+    if (found.stop.status !== 'ready') return res.status(409).json({ error: `Invalid status ${found.stop.status}` });
 
     let photo = null;
     if (req.body.photo != null) {
@@ -409,18 +611,27 @@ router.put(
       return res.status(400).json({ error: 'A pickup photo is required to confirm pickup' });
     }
 
-    const code = newDeliveryOtp();
-    const hash = await bcrypt.hash(code, 8);
-    await db.query('UPDATE orders SET delivery_otp_hash = $1, pickup_photo = $2 WHERE id = $3',
-      [hash, photo, detail.id]);
-    await transition(detail.id, 'picked_up', 'rider');
-    await notify(detail.customer_id, 'Your delivery OTP',
-      `Your rider has picked up the order. Share this OTP to receive it: ${code}`);
+    await db.query('UPDATE orders SET pickup_photo = $1 WHERE id = $2', [photo, found.stop.id]);
+    await transition(found.stop.id, 'picked_up', 'rider');
+
+    // Last stop picked up? Generate the single delivery OTP on the primary
+    // and notify the customer once. (Single-stop orders: this stop IS the last.)
+    const grp = await groupRows(found.primaryId);
+    const mine = grp.filter((o) => String(o.rider_id) === String(rider.id) && o.status !== 'cancelled');
+    if (mine.length && mine.every((o) => o.status === 'picked_up')) {
+      const code = newDeliveryOtp();
+      const hash = await bcrypt.hash(code, 8);
+      await db.query('UPDATE orders SET delivery_otp_hash = $1 WHERE id = $2', [hash, found.primaryId]);
+      const cust = grp[0].customer_id;
+      await notify(cust, 'Your delivery OTP',
+        `Your rider has picked up the order. Share this OTP to receive it: ${code}`);
+    }
     res.json({ ok: true, status: 'picked_up' });
   })
 );
 
-// PUT /api/rider/deliveries/:id/arrived-customer
+// PUT /api/rider/deliveries/:id/arrived-customer — :id is the group (primary)
+// id. For multi-stop groups every stop must be picked up first.
 router.put(
   '/deliveries/:id/arrived-customer',
   ah(async (req, res) => {
@@ -429,29 +640,45 @@ router.put(
     const detail = await deliveryDetail(req.params.id, rider.id);
     if (!detail) return res.status(404).json({ error: 'Delivery not found' });
     if (detail.status !== 'picked_up') return res.status(409).json({ error: `Invalid status ${detail.status}` });
+    const open = (detail.stops || []).filter(
+      (s) => !s.detached && s.status !== 'cancelled' && s.status !== 'picked_up'
+    );
+    if (open.length) {
+      return res.status(409).json({ error: 'Pick up every stop before heading to the customer' });
+    }
     await transition(detail.id, 'on_way', 'rider');
     res.json({ ok: true, status: 'on_way' });
   })
 );
 
-// POST /api/rider/deliveries/:id/complete { otp }
+// POST /api/rider/deliveries/:id/complete { otp } — :id is the group
+// (primary) id. Completes the whole group: every stop cascades to
+// 'delivered', one combined payout is credited, and COD validates against
+// the GRAND total across all stops.
 router.post(
   '/deliveries/:id/complete',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
-    const { rows } = await db.query(
-      'SELECT * FROM orders WHERE id = $1 AND rider_id = $2',
-      [req.params.id, rider.id]
-    );
-    const order = rows[0];
-    if (!order) return res.status(404).json({ error: 'Delivery not found' });
+    const detail = await deliveryDetail(req.params.id, rider.id);
+    if (!detail) return res.status(404).json({ error: 'Delivery not found' });
+    const order = detail;
     if (order.status !== 'on_way') return res.status(409).json({ error: `Invalid status ${order.status}` });
+    const stops = (detail.stops || []).filter((s) => !s.detached && s.status !== 'cancelled');
+    if (stops.some((s) => s.status !== 'picked_up')) {
+      return res.status(409).json({ error: 'Pick up every stop before completing the delivery' });
+    }
     if (!order.delivery_otp_hash || !(await bcrypt.compare(String(req.body.otp || ''), order.delivery_otp_hash))) {
       return res.status(400).json({ error: 'Invalid delivery OTP' });
     }
 
-    // Compute payout from live pricing config
+    // Grand total across the group's stops — this is the cash to collect.
+    const grandTotal = stops.reduce(
+      (a, s) => a + (s.items || []).reduce((x, it) => x + Number(it.unit_price_paise || 0) * Number(it.qty || 0), 0), 0
+    ) || Number(order.total_paise || 0);
+
+    // Compute combined payout from live pricing config: primary-leg distance
+    // payout plus the flat per-extra-stop bonus.
     const loc = await db.query(
       `SELECT r.lat AS rest_lat, r.lng AS rest_lng, a.lat AS addr_lat, a.lng AS addr_lng
        FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
@@ -461,11 +688,13 @@ router.post(
     const l = loc.rows[0];
     const config = await loadPricingConfig(db);
     let distanceKm = null;
-    let payout = 3000; // fallback Rs 30 when locations unknown
     if (l.rest_lat != null && l.rest_lng != null && l.addr_lat != null && l.addr_lng != null) {
       distanceKm = haversineKm(l.rest_lat, l.rest_lng, l.addr_lat, l.addr_lng);
-      payout = riderPayoutPaise(config.riderPayout, distanceKm);
     }
+    const extraStops = Math.max(0, stops.length - 1);
+    const payout = distanceKm != null
+      ? groupPayoutPaise(config, distanceKm, extraStops)
+      : 3000 + extraStops * Number(config.riderPayoutExtraStopPaise || 1500);
 
     // COD: validate cash collection BEFORE any mutation — a failed confirmation
     // must not leave the order marked delivered with money uncollected.
@@ -475,9 +704,9 @@ router.post(
     if (cod) {
       const cashConfirmed = req.body.cash_confirmed === true;
       cashPaise = Math.round(Number(req.body.cash_amount_paise) || 0);
-      if (!cashConfirmed || cashPaise !== Number(order.total_paise)) {
+      if (!cashConfirmed || cashPaise !== Number(grandTotal)) {
         return res.status(400).json({
-          error: `Please confirm you collected exactly Rs ${(order.total_paise / 100).toFixed(2)} in cash`
+          error: `Please confirm you collected exactly Rs ${(grandTotal / 100).toFixed(2)} in cash`
         });
       }
       paymentStatus = 'collected';
@@ -495,7 +724,10 @@ router.post(
         [rider.id, order.id, cashPaise]
       );
     }
-    await transition(order.id, 'delivered', 'rider');
+    // Cascade delivered across the whole group.
+    for (const s of stops) {
+      await transition(s.order_id, 'delivered', 'rider');
+    }
 
     let deliveryPhoto = null;
     if (req.body.delivery_photo) {
