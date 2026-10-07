@@ -92,6 +92,40 @@ function buildGroupDefs({ bodyGroups, items, restaurant_id, dineIn }) {
   return [{ restaurant_id, items, primary: true }];
 }
 
+// Batch-fetch customization option prices/names for many items in ONE query
+// (fixes N+1: previously one query per item with customizations).
+// Returns Map "<menu_item_id>::<option_id>" -> { price_paise, name }.
+async function batchCustomizationOptions(q, items) {
+  const map = new Map();
+  const pairs = [];
+  for (const it of items) {
+    if (!Array.isArray(it.customizations) || !it.customizations.length) continue;
+    const seen = new Set();
+    for (const c of it.customizations) {
+      const oid = c && c.option_id;
+      if (!oid || seen.has(String(oid))) continue;
+      seen.add(String(oid));
+      pairs.push([it.menu_item_id, oid]);
+    }
+  }
+  if (!pairs.length) return map;
+  const optIds = [...new Set(pairs.map((x) => x[1]))];
+  const menuIds = [...new Set(pairs.map((x) => x[0]))];
+  const oRes = await q(
+    `SELECT o.id, o.name, o.price_paise, g.menu_item_id FROM customization_options o
+     JOIN customization_groups g ON g.id = o.group_id
+     WHERE o.id = ANY($1) AND g.menu_item_id = ANY($2)`,
+    [optIds, menuIds]
+  );
+  for (const o of oRes.rows) {
+    map.set(String(o.menu_item_id) + '::' + String(o.id), {
+      price_paise: Number(o.price_paise) || 0,
+      name: o.name
+    });
+  }
+  return map;
+}
+
 // Lenient item pricer for quotes: foreign/unavailable items are skipped (never priced).
 async function priceQuoteItems(q, items, restaurantId) {
   const ids = items.map((i) => i.menu_item_id);
@@ -100,6 +134,7 @@ async function priceQuoteItems(q, items, restaurantId) {
     [ids, restaurantId]
   );
   const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
+  const custMap = await batchCustomizationOptions(q, items);
   let subtotal = 0;
   for (const it of items) {
     const m = menuById[it.menu_item_id];
@@ -108,15 +143,13 @@ async function priceQuoteItems(q, items, restaurantId) {
     if (!Number.isInteger(qty) || qty <= 0) return { error: 'Quantity must be a positive integer' };
     let custExtra = 0;
     if (Array.isArray(it.customizations) && it.customizations.length) {
-      const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
-      if (optIds.length) {
-        const oRes = await q(
-          `SELECT o.id, o.price_paise FROM customization_options o
-           JOIN customization_groups g ON g.id = o.group_id
-           WHERE o.id = ANY($1) AND g.menu_item_id = $2`,
-          [optIds, m.id]
-        );
-        for (const o of oRes.rows) custExtra += Number(o.price_paise) || 0;
+      const seen = new Set();
+      for (const c of it.customizations) {
+        const oid = c && c.option_id;
+        if (!oid || seen.has(String(oid))) continue;
+        seen.add(String(oid));
+        const hit = custMap.get(String(m.id) + '::' + String(oid));
+        if (hit) custExtra += hit.price_paise;
       }
     }
     subtotal += (m.price_paise + custExtra) * qty;
@@ -132,6 +165,7 @@ async function pricePlacementItems(client, items, restaurantId) {
     [ids, restaurantId]
   );
   const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
+  const custMap = await batchCustomizationOptions((...a) => client.query(...a), items);
   let subtotal = 0;
   const snapshots = [];
   for (const it of items) {
@@ -143,17 +177,15 @@ async function pricePlacementItems(client, items, restaurantId) {
     let custExtra = 0;
     const custNames = [];
     if (Array.isArray(it.customizations) && it.customizations.length) {
-      const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
-      if (optIds.length) {
-        const oRes = await client.query(
-          `SELECT o.id, o.name, o.price_paise FROM customization_options o
-           JOIN customization_groups g ON g.id = o.group_id
-           WHERE o.id = ANY($1) AND g.menu_item_id = $2`,
-          [optIds, m.id]
-        );
-        for (const o of oRes.rows) {
-          custExtra += Number(o.price_paise) || 0;
-          custNames.push(o.name);
+      const seen = new Set();
+      for (const c of it.customizations) {
+        const oid = c && c.option_id;
+        if (!oid || seen.has(String(oid))) continue;
+        seen.add(String(oid));
+        const hit = custMap.get(String(m.id) + '::' + String(oid));
+        if (hit) {
+          custExtra += hit.price_paise;
+          custNames.push(hit.name);
         }
       }
     }
@@ -222,21 +254,25 @@ async function multiGroupQuote(req, res, { groupDefs, dineIn, address_id, coupon
   const q = (...a) => db.query(...a);
   const primDef = groupDefs.find((g) => g.primary) || groupDefs[0];
 
-  const rRes = await q(
-    "SELECT id, name, lat, lng, commission_pct FROM restaurants WHERE id = $1 AND status = 'approved'",
-    [primDef.restaurant_id]
-  );
+  // Independent reads run together: primary restaurant + address + pricing config.
+  const [rRes, aRes, config] = await Promise.all([
+    q(
+      "SELECT id, name, lat, lng, commission_pct FROM restaurants WHERE id = $1 AND status = 'approved'",
+      [primDef.restaurant_id]
+    ),
+    dineIn
+      ? Promise.resolve({ rows: [{}] })
+      : q('SELECT lat, lng FROM addresses WHERE id = $1 AND user_id = $2', [address_id, req.user.id]),
+    loadPricingConfig(db)
+  ]);
   const primRest = rRes.rows[0];
   if (!primRest) return res.status(404).json({ error: 'Restaurant not available' });
 
   let address = null;
   if (!dineIn) {
-    const aRes = await q('SELECT lat, lng FROM addresses WHERE id = $1 AND user_id = $2', [address_id, req.user.id]);
     address = aRes.rows[0];
     if (!address) return res.status(400).json({ error: 'Delivery address not found' });
   }
-
-  const config = await loadPricingConfig(db);
   const tipPaise = Math.max(0, Math.round(Number(tip_paise) || 0));
 
   // Primary group (coupon lives here, as the app sends it)
@@ -265,12 +301,20 @@ async function multiGroupQuote(req, res, { groupDefs, dineIn, address_id, coupon
   const excludedOffRoute = [];
   let secFood = 0, secDelivery = 0;
 
-  for (const def of groupDefs.filter((g) => !g.primary)) {
-    const sRes = await q(
-      "SELECT id, name, lat, lng, is_open, is_coming_soon FROM restaurants WHERE id = $1 AND status = 'approved'",
-      [def.restaurant_id]
-    );
-    const sRest = sRes.rows[0];
+  // Secondary restaurant rows are independent — fetch them together, then
+  // process in order (preserves exact behavior, just fewer round trips).
+  const secDefs = groupDefs.filter((g) => !g.primary);
+  const secRows = await Promise.all(
+    secDefs.map((def) =>
+      q(
+        "SELECT id, name, lat, lng, is_open, is_coming_soon FROM restaurants WHERE id = $1 AND status = 'approved'",
+        [def.restaurant_id]
+      )
+    )
+  );
+  for (let si = 0; si < secDefs.length; si++) {
+    const def = secDefs[si];
+    const sRest = secRows[si].rows[0];
     if (!sRest) { excludedOffRoute.push({ restaurant_id: def.restaurant_id, name: null, reason: 'not_found' }); continue; }
     if (sRest.is_coming_soon || !sRest.is_open) {
       excludedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: 'unavailable' });
@@ -347,10 +391,15 @@ router.post(
     if (groupDefs.length > 1) {
       return multiGroupQuote(req, res, { groupDefs, dineIn, address_id, coupon_code, tip_paise });
     }
-    const rRes = await db.query(
-      "SELECT id, lat, lng, commission_pct FROM restaurants WHERE id = $1 AND status = 'approved'",
-      [restaurant_id]
-    );
+    // Independent reads run together: restaurant row + pricing config.
+    // (Address/table check stays sequential to preserve error precedence.)
+    const [rRes, config] = await Promise.all([
+      db.query(
+        "SELECT id, lat, lng, commission_pct FROM restaurants WHERE id = $1 AND status = 'approved'",
+        [restaurant_id]
+      ),
+      loadPricingConfig(db)
+    ]);
     const restaurant = rRes.rows[0];
     if (!restaurant) return res.status(404).json({ error: 'Restaurant not available' });
 
@@ -369,35 +418,9 @@ router.post(
       if (!tRes.rows[0]) return res.status(400).json({ error: 'Table not found for this restaurant' });
     }
 
-    const ids = items.map((i) => i.menu_item_id);
-    const mRes = await db.query(
-      'SELECT id, price_paise, available FROM menu_items WHERE id = ANY($1) AND restaurant_id = $2',
-      [ids, restaurant_id]
-    );
-    const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
-    let subtotal = 0;
-    for (const it of items) {
-      const m = menuById[it.menu_item_id];
-      if (!m || !m.available) continue;
-      const qty = Number(it.qty);
-      if (!Number.isInteger(qty) || qty <= 0) {
-        return res.status(400).json({ error: 'Quantity must be a positive integer' });
-      }
-      let custExtra = 0;
-      if (Array.isArray(it.customizations) && it.customizations.length) {
-        const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
-        if (optIds.length) {
-          const oRes = await db.query(
-            `SELECT o.id, o.price_paise FROM customization_options o
-             JOIN customization_groups g ON g.id = o.group_id
-             WHERE o.id = ANY($1) AND g.menu_item_id = $2`,
-            [optIds, m.id]
-          );
-          for (const o of oRes.rows) custExtra += Number(o.price_paise) || 0;
-        }
-      }
-      subtotal += (m.price_paise + custExtra) * qty;
-    }
+    const pq = await priceQuoteItems((...a) => db.query(...a), items, restaurant_id);
+    if (pq.error) return res.status(400).json({ error: pq.error });
+    const subtotal = pq.subtotal;
 
     // Coupon (quote only — placement re-validates everything inside its transaction)
     let discount = 0;
@@ -437,7 +460,6 @@ router.post(
         Number(address.lng)
       );
     }
-    const config = await loadPricingConfig(db);
     const tipPaise = Math.max(0, Math.round(Number(tip_paise) || 0));
     const quote = computeQuote({
       config,
@@ -499,18 +521,27 @@ router.post(
       await client.query('BEGIN');
 
       // ---- address + Nellore service-area gate ----
+      // Independent reads (address/table row, pricing config, primary
+      // restaurant row) run together inside the transaction. Validation
+      // order is preserved exactly: address first, then restaurant.
+      const primDef = groupDefs.find((g) => g.primary) || groupDefs[0];
+      const addrQuery = dineIn
+        ? (table_id
+          ? client.query('SELECT id FROM tables WHERE id = $1 AND restaurant_id = $2', [table_id, restaurant_id])
+          : Promise.resolve({ rows: [{}] }))
+        : client.query('SELECT * FROM addresses WHERE id = $1 AND user_id = $2', [address_id, req.user.id]);
+      const [aRes, config, rRes] = await Promise.all([
+        addrQuery,
+        loadPricingConfig(client),
+        client.query("SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'", [primDef.restaurant_id])
+      ]);
+      const tipPaise = Math.max(0, Math.round(Number(tip_paise) || 0));
+
       let address = null;
       if (dineIn) {
         if (!table_id) throw { status: 400, message: 'Table is required for dine-in orders' };
-        const tRes = await client.query(
-          'SELECT id FROM tables WHERE id = $1 AND restaurant_id = $2', [table_id, restaurant_id]
-        );
-        if (!tRes.rows[0]) throw { status: 400, message: 'Table not found for this restaurant' };
+        if (!aRes.rows[0]) throw { status: 400, message: 'Table not found for this restaurant' };
       } else {
-        const aRes = await client.query(
-          'SELECT * FROM addresses WHERE id = $1 AND user_id = $2',
-          [address_id, req.user.id]
-        );
         address = aRes.rows[0];
         if (!address) throw { status: 400, message: 'Delivery address not found' };
         const area = isInServiceArea(address);
@@ -533,15 +564,7 @@ router.post(
         }
       }
 
-      const config = await loadPricingConfig(client);
-      const tipPaise = Math.max(0, Math.round(Number(tip_paise) || 0));
-
       // ---- primary restaurant (validated for every order) ----
-      const primDef = groupDefs.find((g) => g.primary) || groupDefs[0];
-      const rRes = await client.query(
-        "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'",
-        [primDef.restaurant_id]
-      );
       const primRest = rRes.rows[0];
       if (!primRest) throw { status: 404, message: 'Restaurant not available' };
       if (primRest.is_coming_soon) throw { status: 400, message: 'Restaurant is opening soon — not accepting orders yet' };
@@ -671,12 +694,17 @@ router.post(
       const removedOffRoute = [];
       const extraSpecs = [];
       if (multiGroup) {
-        for (const def of groupDefs.filter((g) => !g.primary)) {
-          const sRes = await client.query(
-            "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'",
-            [def.restaurant_id]
-          );
-          const sRest = sRes.rows[0];
+        // Secondary restaurant rows are independent — fetch together, then
+        // process in order (same behavior, fewer round trips).
+        const secDefs = groupDefs.filter((g) => !g.primary);
+        const secRows = await Promise.all(
+          secDefs.map((def) =>
+            client.query("SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'", [def.restaurant_id])
+          )
+        );
+        for (let si = 0; si < secDefs.length; si++) {
+          const def = secDefs[si];
+          const sRest = secRows[si].rows[0];
           if (!sRest) { removedOffRoute.push({ restaurant_id: def.restaurant_id, name: null, reason: 'not_found' }); continue; }
           if (sRest.is_coming_soon || !sRest.is_open) {
             removedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: 'unavailable' });
@@ -766,11 +794,18 @@ router.post(
         );
         const order = oRes.rows[0];
         if (idx === 0) primaryOrderId = order.id;
-        for (const s of spec.priced.snapshots) {
+        if (spec.priced.snapshots.length) {
+          const iv = [];
+          const ip = [];
+          spec.priced.snapshots.forEach((s, k) => {
+            const b = k * 6;
+            iv.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6})`);
+            ip.push(order.id, s.menu_item_id, s.name_snapshot, s.unit_price_paise, s.qty, s.instructions);
+          });
           await client.query(
             `INSERT INTO order_items (order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions)
-             VALUES ($1,$2,$3,$4,$5,$6)`,
-            [order.id, s.menu_item_id, s.name_snapshot, s.unit_price_paise, s.qty, s.instructions]
+             VALUES ${iv.join(',')}`,
+            ip
           );
         }
         if (spec.role === 'secondary') {
