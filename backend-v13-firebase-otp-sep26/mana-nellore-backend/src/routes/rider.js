@@ -332,6 +332,28 @@ router.get(
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
+    // ---- On-the-way rider rules (founder) ----
+    // Rule 3 (multi-delivery exclusivity): if the rider holds ANY active
+    // multi-restaurant group, they are locked to it — show zero other offers.
+    // Rule 1 (1km filter): with single-restaurant active deliveries, only show
+    // new offers whose restaurant is within 1km of an active delivery's
+    // restaurant. Missing coords never fail closed (offer stays visible).
+    const activeGroups = await db.query(
+      `SELECT o.id, r.lat AS rest_lat, r.lng AS rest_lng,
+              (SELECT COUNT(*) FROM orders s
+                 WHERE s.otw_primary_order_id = o.id AND s.status <> 'cancelled') AS secondary_count
+       FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.rider_id = $1 AND o.status NOT IN ('delivered','cancelled')
+         AND (o.otw_role IS NULL OR o.otw_role = 'primary')`,
+      [rider.id]
+    );
+    if (activeGroups.rows.some((g) => Number(g.secondary_count) > 0)) {
+      return res.json({ deliveries: [], multi_delivery_active: true, on_the_way_filter: false });
+    }
+    const anchors = activeGroups.rows
+      .filter((g) => g.rest_lat != null && g.rest_lng != null)
+      .map((g) => ({ lat: Number(g.rest_lat), lng: Number(g.rest_lng) }));
+    const onWayFilter = anchors.length > 0;
     const { rows } = await db.query(
       `SELECT o.id, o.total_paise, o.placed_at, o.payment_method, o.otw_group_size,
               r.id AS rest_id, r.name AS restaurant_name, r.address AS rest_address,
@@ -379,6 +401,15 @@ router.get(
       if (rider.lat != null && rider.lng != null && o.rest_lat != null && o.rest_lng != null) {
         pickupKm = haversineKm(Number(rider.lat), Number(rider.lng), Number(o.rest_lat), Number(o.rest_lng));
       }
+      // Rule 1 (1km on-the-way): when the rider already holds deliveries, only
+      // surface offers whose restaurant is within 1km of an active delivery's
+      // restaurant. Missing coords never hide an offer (fail open).
+      if (onWayFilter && o.rest_lat != null && o.rest_lng != null) {
+        const near = anchors.some(
+          (a) => haversineKm(a.lat, a.lng, Number(o.rest_lat), Number(o.rest_lng)) <= 1.0
+        );
+        if (!near) continue;
+      }
       list.push({
         id: o.id,
         total_paise: o.total_paise,
@@ -398,7 +429,7 @@ router.get(
       if (a.pickup_km != null && b.pickup_km != null) return a.pickup_km - b.pickup_km;
       return new Date(a.placed_at) - new Date(b.placed_at);
     });
-    res.json({ deliveries: list });
+    res.json({ deliveries: list, multi_delivery_active: false, on_the_way_filter: onWayFilter });
   })
 );
 
