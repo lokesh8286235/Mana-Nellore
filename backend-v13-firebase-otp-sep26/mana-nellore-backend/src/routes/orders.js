@@ -556,6 +556,33 @@ router.post(
     try {
       await client.query('BEGIN');
 
+      // ---- founder rule: ONE scheduled order per restaurant (strict) ----
+      // A customer can have only ONE active scheduled order from a given
+      // restaurant at a time, regardless of time slot — even two different
+      // times or two different dishes are not allowed. Different restaurants
+      // may each have their own scheduled order. Checked inside the
+      // transaction so double-taps cannot both slip through.
+      if (scheduledAt) {
+        const restIds = [...new Set(groupDefs.map((g) => String(g.restaurant_id)))];
+        const dup = await client.query(
+          `SELECT r.name AS restaurant_name
+             FROM orders o
+             JOIN restaurants r ON r.id = o.restaurant_id
+            WHERE o.customer_id = $1
+              AND o.restaurant_id = ANY($2)
+              AND o.status = 'scheduled'
+            LIMIT 1`,
+          [req.user.id, restIds]
+        );
+        if (dup.rows.length) {
+          const rName = dup.rows[0].restaurant_name || 'this restaurant';
+          throw {
+            status: 400,
+            message: `You already have a scheduled order from ${rName}.`
+          };
+        }
+      }
+
       // ---- address + Nellore service-area gate ----
       // Independent reads (address/table row, pricing config, primary
       // restaurant row) run together inside the transaction. Validation
