@@ -321,7 +321,7 @@ async function multiGroupQuote(req, res, { groupDefs, dineIn, address_id, coupon
       excludedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: 'unavailable' });
       continue;
     }
-    const routeDec = otwDiscountDecision(sRest, primRest, address || {});
+    const routeDec = await otwDiscountDecision(sRest, primRest, address || {});
     if (routeDec.decision === 'deny') {
       excludedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: routeDec.reason });
       continue;
@@ -587,7 +587,7 @@ router.post(
             'SELECT id, name, lat, lng FROM restaurants WHERE id = $1', [cand.restaurant_id]);
           const pRest = pRes.rows[0];
           if (!pRest) throw { status: 400, message: 'The main restaurant for this order is no longer available' };
-          const routeDec = otwDiscountDecision(primRest, pRest, address);
+          const routeDec = await otwDiscountDecision(primRest, pRest, address);
           if (routeDec.decision === 'deny') {
             const reason = routeDec.reason;
             await client.query('ROLLBACK');
@@ -711,7 +711,7 @@ router.post(
             removedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: 'unavailable' });
             continue;
           }
-          const routeDec = otwDiscountDecision(sRest, primRest, address);
+          const routeDec = await otwDiscountDecision(sRest, primRest, address);
           if (routeDec.decision === 'deny') {
             const reason = routeDec.reason;
             removedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason });
