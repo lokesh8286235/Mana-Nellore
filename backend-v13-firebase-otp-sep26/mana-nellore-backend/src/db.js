@@ -135,6 +135,27 @@ async function migrate() {
   await q('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_status_check');
   await q(`ALTER TABLE orders ADD CONSTRAINT orders_payment_status_check
     CHECK (payment_status IN ('pending','paid','failed','refunded','collected'))`);
+
+  // Scheduled ordering: scheduled_for + pre_accepted, new 'scheduled' /
+  // 'confirmed' statuses. Existing databases carry the old auto-named
+  // orders_status_check — replace it only when it lacks the new values.
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS scheduled_for timestamptz');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pre_accepted boolean NOT NULL DEFAULT false');
+  await q(`DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_status_check'
+               AND pg_get_constraintdef(oid) NOT LIKE '%scheduled%') THEN
+      ALTER TABLE orders DROP CONSTRAINT orders_status_check;
+    END IF;
+  END $$`);
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_status_check') THEN
+      ALTER TABLE orders ADD CONSTRAINT orders_status_check
+        CHECK (status IN ('placed','accepted','rejected','preparing','ready',
+                          'picked_up','on_way','delivered','cancelled',
+                          'scheduled','confirmed'));
+    END IF;
+  END $$`);
+  await q('CREATE INDEX IF NOT EXISTS idx_orders_status_scheduled ON orders(status, scheduled_for)');
   // Remove wallet/credit remnants
   await q('ALTER TABLE orders DROP COLUMN IF EXISTS credits_used_paise');
   await q('DROP TABLE IF EXISTS customer_credits');

@@ -7,6 +7,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { initDb } = require('./db');
+const { activateDueScheduledOrders } = require('./lib/scheduled');
 
 const app = express();
 // Behind Railway's proxy the client IP arrives in X-Forwarded-For. Without
@@ -96,6 +97,15 @@ if (!process.env.JWT_SECRET) {
 initDb()
   .then(() => {
     dbStatus.ready = true;
+    // Scheduled orders: promote due ones every 60s (30-min prep lead time).
+    // Idempotent via the status='scheduled' check; a single Railway instance
+    // runs this, so no distributed lock is needed. The same function also
+    // runs opportunistically on the rider-offers and restaurant-orders paths.
+    const tickScheduled = () => {
+      activateDueScheduledOrders().catch((e) => console.error('scheduled activation failed:', e.message));
+    };
+    tickScheduled();
+    setInterval(tickScheduled, 60 * 1000);
   })
   .catch((e) => {
     dbStatus.phase = e.phase || 'unknown';

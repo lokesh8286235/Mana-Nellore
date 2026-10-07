@@ -138,7 +138,8 @@ CREATE TABLE IF NOT EXISTS orders (
   address_id uuid REFERENCES addresses(id) ON DELETE SET NULL,
   status text NOT NULL DEFAULT 'placed'
     CHECK (status IN ('placed','accepted','rejected','preparing','ready',
-                      'picked_up','on_way','delivered','cancelled')),
+                      'picked_up','on_way','delivered','cancelled',
+                      'scheduled','confirmed')),
   subtotal_paise int NOT NULL,
   discount_paise int NOT NULL DEFAULT 0,
   delivery_fee_paise int NOT NULL DEFAULT 0,
@@ -167,7 +168,11 @@ CREATE TABLE IF NOT EXISTS orders (
   no_cutlery boolean NOT NULL DEFAULT false,
   tip_paise int NOT NULL DEFAULT 0,
   recipient_name text,
-  recipient_phone text
+  recipient_phone text,
+  -- Scheduled ordering: the customer-chosen delivery time (NULL for ASAP
+  -- orders) and whether the restaurant pre-accepted while still scheduled.
+  scheduled_for timestamptz,
+  pre_accepted boolean NOT NULL DEFAULT false
 );
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_restaurant ON orders(restaurant_id);
@@ -175,6 +180,8 @@ CREATE INDEX IF NOT EXISTS idx_orders_rest_status ON orders(restaurant_id, statu
 CREATE INDEX IF NOT EXISTS idx_orders_rest_packed ON orders(restaurant_id, placed_at) WHERE packed_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_rider ON orders(rider_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+-- Scheduled-order activation probe: due 'scheduled' rows by time.
+CREATE INDEX IF NOT EXISTS idx_orders_status_scheduled ON orders(status, scheduled_for);
 
 CREATE TABLE IF NOT EXISTS order_items (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

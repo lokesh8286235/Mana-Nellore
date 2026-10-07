@@ -3,6 +3,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
+const { activateDueScheduledOrders } = require('../lib/scheduled');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, riderPayoutPaise } = require('../lib/pricing');
 
@@ -350,6 +351,11 @@ router.get(
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
+    // Opportunistic activation: a scheduled order whose slot just came due
+    // goes live (placed -> ... -> ready) so offers pick it up on time.
+    // NOTE: scheduled orders never appear here directly — offers only list
+    // status='ready' (see the WHERE below); activation must run first.
+    try { await activateDueScheduledOrders(); } catch (e) { console.error('scheduled activation failed:', e.message); }
     // ---- On-the-way rider rules (founder) ----
     // Rule 3 (multi-delivery exclusivity): if the rider holds ANY active
     // multi-restaurant group, they are locked to it — show zero other offers.

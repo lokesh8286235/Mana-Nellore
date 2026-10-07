@@ -3,6 +3,7 @@
 const express = require('express');
 const db = require('../db');
 const { storeImageUrl } = require('../lib/images');
+const { activateDueScheduledOrders } = require('../lib/scheduled');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 
 const router = express.Router();
@@ -431,6 +432,9 @@ router.get(
   ah(async (req, res) => {
     const id = await requireRestaurant(req, res);
     if (!id) return;
+    // Opportunistic activation: promote due scheduled orders so the
+    // restaurant's Upcoming section goes live on time even between ticks.
+    try { await activateDueScheduledOrders(); } catch (e) { console.error('scheduled activation failed:', e.message); }
     const params = [id];
     let where = 'o.restaurant_id = $1';
     if (req.query.status) {
@@ -449,11 +453,77 @@ router.get(
 const OWNER_TRANSITIONS = {
   accept: { from: ['placed'], to: 'accepted' },
   reject: { from: ['placed'], to: 'rejected' },
-  preparing: { from: ['accepted'], to: 'preparing' },
+  // A pre-accepted scheduled order activates as 'confirmed' — the kitchen
+  // skips 'accept' and goes straight to cooking.
+  preparing: { from: ['accepted', 'confirmed'], to: 'preparing' },
   ready: { from: ['preparing'], to: 'ready' },
   // Dine-in orders finish at the table, not at a doorstep
   served: { from: ['ready'], to: 'delivered', dineinOnly: true }
 };
+
+// PUT /api/owner/orders/:id/pre-accept — kitchen confirms a scheduled order
+// ahead of time. Sets pre_accepted=true; the order still goes live at
+// activation (30 min before scheduled_for), landing in status 'confirmed'.
+router.put(
+  '/orders/:id/pre-accept',
+  ah(async (req, res) => {
+    const id = await requireRestaurant(req, res);
+    if (!id) return;
+    const { rows } = await db.query(
+      'SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2',
+      [req.params.id, id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status !== 'scheduled') {
+      return res.status(409).json({ error: 'Only scheduled orders can be pre-accepted' });
+    }
+    await db.query(
+      `UPDATE orders SET pre_accepted = true,
+         timeline = COALESCE(timeline, '[]'::jsonb)
+           || jsonb_build_object('status', 'pre_accepted', 'at', $1::text, 'by', 'restaurant_owner')
+       WHERE id = $2`,
+      [new Date().toISOString(), order.id]
+    );
+    const rName = (await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name;
+    const { formatKolkata } = require('../lib/scheduled');
+    await notify(db, order.customer_id, 'Restaurant confirmed ✅',
+      `${rName} confirmed your order scheduled for ${formatKolkata(order.scheduled_for)} — we'll start preparing 30 min before. 🎉`);
+    res.json({ ok: true, pre_accepted: true });
+  })
+);
+
+// PUT /api/owner/orders/:id/pre-reject { reason } — kitchen declines a
+// scheduled order before it goes live. The customer is notified; paid orders
+// are refunded.
+router.put(
+  '/orders/:id/pre-reject',
+  ah(async (req, res) => {
+    const id = await requireRestaurant(req, res);
+    if (!id) return;
+    const { rows } = await db.query(
+      'SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2',
+      [req.params.id, id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status !== 'scheduled') {
+      return res.status(409).json({ error: 'Only scheduled orders can be pre-rejected' });
+    }
+    await transition(order.id, 'cancelled', 'restaurant_owner');
+    const refunded = order.payment_status === 'paid';
+    const reason = String((req.body && req.body.reason) || '').trim().slice(0, 280)
+      || 'The restaurant could not take this order';
+    await db.query(
+      'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
+      [reason, refunded ? 'refunded' : order.payment_status, order.id]
+    );
+    const rName = (await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name;
+    await notify(db, order.customer_id, "Restaurant couldn't take your scheduled order",
+      `${rName}: ${reason}${refunded ? ' Your payment will be refunded.' : ''}`);
+    res.json({ ok: true, status: 'cancelled', refunded });
+  })
+);
 
 // PUT /api/owner/orders/:id/accept|reject|preparing|ready
 router.put(

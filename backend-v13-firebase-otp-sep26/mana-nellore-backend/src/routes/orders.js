@@ -33,6 +33,21 @@ function newDeliveryOtp() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
+// Scheduled ordering: validate an ISO 8601 scheduled_for. Must be strictly
+// in the future, more than 30 minutes out and less than 48 hours out.
+function parseScheduledFor(value) {
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return { ok: false, error: 'scheduled_for must be a valid ISO 8601 date-time' };
+  const now = Date.now();
+  if (d.getTime() <= now + 30 * 60 * 1000) {
+    return { ok: false, error: 'Scheduled orders must be placed at least 30 minutes in advance' };
+  }
+  if (d.getTime() >= now + 48 * 3600 * 1000) {
+    return { ok: false, error: 'Scheduled orders can be placed up to 48 hours in advance' };
+  }
+  return { ok: true, date: d };
+}
+
 // ---------- On-the-way helpers (server-side anti-scam) ----------
 
 // Best-effort audit insert. Audit must never break ordering, so failures are swallowed.
@@ -231,7 +246,7 @@ async function resolveCoupon(q, couponCode, subtotalPaise, userId) {
 // still has room for another secondary. Null => this call starts a new group.
 async function findOtwPrimary(client, customerId, addressId) {
   const { rows } = await client.query(
-    `SELECT o.id, o.restaurant_id, o.otw_group_size,
+    `SELECT o.id, o.restaurant_id, o.otw_group_size, o.status, o.scheduled_for,
             (SELECT COUNT(*) FROM orders s WHERE s.otw_primary_order_id = o.id) AS sec_count
      FROM orders o
      WHERE o.customer_id = $1 AND o.otw_role = 'primary' AND o.address_id = $2
@@ -508,6 +523,18 @@ router.post(
             is_on_the_way, group_size, client_total_paise } = req.body;
     const dineIn = order_type === 'dinein';
 
+    // Scheduled ordering is delivery-only.
+    const scheduledRaw = req.body.scheduled_for;
+    if (dineIn && scheduledRaw != null && scheduledRaw !== '') {
+      return res.status(400).json({ error: 'Scheduled ordering is available for delivery orders only' });
+    }
+    let scheduledAt = null;
+    if (!dineIn && scheduledRaw != null && scheduledRaw !== '') {
+      const v = parseScheduledFor(scheduledRaw);
+      if (!v.ok) return res.status(400).json({ error: v.error });
+      scheduledAt = v.date;
+    }
+
     const groupDefs = buildGroupDefs({ bodyGroups: req.body.groups, items, restaurant_id, dineIn });
     if (!Array.isArray(groupDefs)) return res.status(400).json({ error: groupDefs.error });
     if (!dineIn && !address_id) {
@@ -569,7 +596,9 @@ router.post(
       const primRest = rRes.rows[0];
       if (!primRest) throw { status: 404, message: 'Restaurant not available' };
       if (primRest.is_coming_soon) throw { status: 400, message: 'Restaurant is opening soon — not accepting orders yet' };
-      if (!primRest.is_open) throw { status: 400, message: 'Restaurant is currently closed' };
+      // Scheduled orders may be placed while the kitchen is closed — the
+      // restaurant pre-accepts (or pre-rejects) before activation.
+      if (!primRest.is_open && !scheduledAt) throw { status: 400, message: 'Restaurant is currently closed' };
 
       // ---- on-the-way role resolution ----
       // Split-call flow (today's app): one restaurant per call. A call flagged
@@ -580,6 +609,9 @@ router.post(
       let otwPrimaryOrderId = null;
       let otwGroupSize = null;
       let otwPrimaryRest = primRest;
+      // Split-call secondary joining a still-scheduled primary inherits its
+      // scheduled slot (goes live with the group at activation).
+      let inheritScheduledAt = null;
       if (!multiGroup && declaredOtw) {
         const cand = await findOtwPrimary(client, req.user.id, address_id);
         if (cand && String(cand.restaurant_id) !== String(primRest.id)) {
@@ -607,6 +639,9 @@ router.post(
           otwRole = 'secondary';
           otwPrimaryOrderId = cand.id;
           otwPrimaryRest = pRest;
+          if (cand.status === 'scheduled' && cand.scheduled_for) {
+            inheritScheduledAt = new Date(cand.scheduled_for);
+          }
           if (routeDec.decision === 'grant_unverifiable') {
             await otwAudit('secondary_discount_unverifiable', {
               customer_id: req.user.id, primary_restaurant_id: pRest.id,
@@ -707,7 +742,9 @@ router.post(
           const def = secDefs[si];
           const sRest = secRows[si].rows[0];
           if (!sRest) { removedOffRoute.push({ restaurant_id: def.restaurant_id, name: null, reason: 'not_found' }); continue; }
-          if (sRest.is_coming_soon || !sRest.is_open) {
+          // Closed kitchens are stripped from ASAP orders only — a scheduled
+          // order may still be pre-accepted before its slot.
+          if (sRest.is_coming_soon || (!sRest.is_open && !scheduledAt)) {
             removedOffRoute.push({ restaurant_id: sRest.id, name: sRest.name, reason: 'unavailable' });
             continue;
           }
@@ -762,8 +799,15 @@ router.post(
       }];
       for (const s of extraSpecs) specs.push(s);
 
-      const timeline = [{ status: 'placed', at: new Date().toISOString(), by: 'customer' }];
+      // Initial status: scheduled orders wait for activation; everything else
+      // is placed immediately (existing ASAP flow, untouched).
+      const scheduledForValue = scheduledAt || inheritScheduledAt || null;
+      const initialStatus = scheduledForValue ? 'scheduled' : 'placed';
+
+      const timeline = [{ status: initialStatus, at: new Date().toISOString(), by: 'customer' }];
       const etaMinutes = Number(config.etaMinutes) || 30;
+      // Scheduled orders promise the customer's chosen slot, not now()+30m.
+      const etaAt = scheduledForValue || new Date(Date.now() + etaMinutes * 60000);
       const created = [];
       let primaryOrderId = null;
 
@@ -789,18 +833,18 @@ router.post(
               delivery_note, no_cutlery, recipient_name, recipient_phone,
               payment_method, payment_status, timeline, eta_at, share_token,
               otw_role, otw_primary_order_id, otw_group_size, otw_discount_denied,
-              delivery_otp, delivery_otp_hash)
-           VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
-                   now() + ($20 || ' minutes')::interval, $21, $22, $23, $24, $25, $26, $27)
+              delivery_otp, delivery_otp_hash, scheduled_for)
+           VALUES ($1,$2,$3,$28,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
+                   $20, $21, $22, $23, $24, $25, $26, $27, $29)
            RETURNING *`,
           [req.user.id, spec.restaurant.id, dineIn ? null : address_id, dineIn ? 'dinein' : 'delivery',
            dineIn ? table_id : null,
            spec.priced.subtotal, spec.discount, spec.deliveryFee, spec.platformFee,
            spec.gst.total, spec.commissionPaise, specTotal, spec.tipPaise,
            delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
-           payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
+           payment_method || 'upi', JSON.stringify(timeline), etaAt, shareToken,
            spec.role, spec.primaryOrderId, spec.role === 'primary' ? spec.groupSize : null, false,
-           otpPlain, otpHash]
+           otpPlain, otpHash, initialStatus, scheduledForValue]
         );
         const order = oRes.rows[0];
         if (idx === 0) primaryOrderId = order.id;
@@ -845,18 +889,26 @@ router.post(
       }
       await client.query('COMMIT');
 
-      for (const c of created) {
-        const ownerRes = await db.query('SELECT owner_id FROM restaurants WHERE id = $1', [c.spec.restaurant.id]);
-        if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
-          await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
-            `${dineIn ? 'Dine-in table order' : 'Delivery order'} worth Rs ${(c.total / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
+      if (initialStatus === 'scheduled') {
+        // Scheduled orders stay invisible to kitchens and riders until
+        // activation (30 min before scheduled_for). Only the customer is told.
+        const { formatKolkata } = require('../lib/scheduled');
+        await notify(req.user.id, 'Order scheduled ✅',
+          `Order scheduled for ${formatKolkata(scheduledForValue)} — we'll start preparing 30 min before.`);
+      } else {
+        for (const c of created) {
+          const ownerRes = await db.query('SELECT owner_id FROM restaurants WHERE id = $1', [c.spec.restaurant.id]);
+          if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
+            await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
+              `${dineIn ? 'Dine-in table order' : 'Delivery order'} worth Rs ${(c.total / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
+          }
         }
+        const firstName = created[0].spec.restaurant.name;
+        const _otp0 = !dineIn && created[0] && created[0].order ? created[0].order.delivery_otp : null;
+        await notify(req.user.id, 'Order placed ✅',
+          `${firstName}${created.length > 1 ? ` (+${created.length - 1} more)` : ''} got your order and the kitchen is firing up! 🔥` +
+          (_otp0 ? ` Your delivery OTP is ${_otp0} — share it with your rider at handover.` : ''));
       }
-      const firstName = created[0].spec.restaurant.name;
-      const _otp0 = !dineIn && created[0] && created[0].order ? created[0].order.delivery_otp : null;
-      await notify(req.user.id, 'Order placed ✅',
-        `${firstName}${created.length > 1 ? ` (+${created.length - 1} more)` : ''} got your order and the kitchen is firing up! 🔥` +
-        (_otp0 ? ` Your delivery OTP is ${_otp0} — share it with your rider at handover.` : ''));
 
       const buildBreakdown = (c) => ({
         subtotal_paise: c.spec.priced.subtotal,
@@ -1025,11 +1077,11 @@ router.get(
     const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
     // Queue transparency: orders at this restaurant placed before mine, still active
     let queueAhead = 0;
-    if (['placed', 'accepted', 'preparing'].includes(order.status)) {
+    if (['placed', 'accepted', 'confirmed', 'preparing'].includes(order.status)) {
       const qRes = await db.query(
         `SELECT COUNT(*) AS n FROM orders
          WHERE restaurant_id = $1 AND placed_at < $2
-           AND status IN ('placed','accepted','preparing')`,
+           AND status IN ('placed','accepted','confirmed','preparing')`,
         [order.restaurant_id, order.placed_at]
       );
       queueAhead = Number(qRes.rows[0].n);
@@ -1115,7 +1167,8 @@ router.get(
   })
 );
 
-// POST /api/orders/:id/cancel { reason } — only before the restaurant accepts
+// POST /api/orders/:id/cancel { reason } — only before the restaurant accepts.
+// Scheduled orders can be cancelled any time before activation.
 router.post(
   '/:id/cancel',
   ah(async (req, res) => {
@@ -1125,15 +1178,33 @@ router.post(
     );
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status !== 'placed') {
+    if (!['placed', 'scheduled'].includes(order.status)) {
       return res.status(409).json({ error: 'Order can no longer be cancelled' });
     }
+    const wasScheduled = order.status === 'scheduled';
+    const wasPreAccepted = order.pre_accepted;
+    const scheduledFor = order.scheduled_for;
     await transition(order.id, 'cancelled', 'customer');
     const refunded = order.payment_status === 'paid';
     await db.query(
       'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
       [req.body.reason || 'Cancelled by customer', refunded ? 'refunded' : order.payment_status, order.id]
     );
+    await notify(req.user.id, 'Order cancelled',
+      `Your ${wasScheduled ? 'scheduled ' : ''}order has been cancelled.` +
+      (refunded ? ' Your payment will be refunded.' : ''));
+    // A pre-accepted scheduled order was already on the kitchen's radar —
+    // tell the restaurant it's gone. (Non-pre-accepted scheduled orders were
+    // never shown as active, so the kitchen gets nothing.)
+    if (wasScheduled && wasPreAccepted) {
+      const ownerRes = await db.query('SELECT owner_id FROM restaurants WHERE id = $1', [order.restaurant_id]);
+      if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
+        const { formatKolkata } = require('../lib/scheduled');
+        await notify(ownerRes.rows[0].owner_id, 'Scheduled order cancelled',
+          `The customer cancelled a scheduled order` +
+          (scheduledFor ? ` for ${formatKolkata(scheduledFor)}` : '') + `.`);
+      }
+    }
     res.json({ ok: true, refunded });
   })
 );
