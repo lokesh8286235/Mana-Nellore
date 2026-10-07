@@ -29,6 +29,66 @@ function formatKolkata(date) {
   }).format(d);
 }
 
+// Assign a pre-accepted scheduled group to its committed rider at
+// activation. Eligibility mirrors the live accept guards (online, no
+// multi-delivery lock, < 3 active groups). Ineligible -> the group stays
+// unassigned and flows into the normal offer pool; the rider is told why.
+async function handoffPreAcceptedRider(primaryId, riderId, firstRow) {
+  const rr = await db.query('SELECT id, user_id, online, status FROM riders WHERE id = $1', [riderId]);
+  const rider = rr.rows[0];
+  const rn = await db.query('SELECT name FROM restaurants WHERE id = $1', [firstRow.restaurant_id]);
+  const rname = (rn.rows[0] && rn.rows[0].name) || 'the restaurant';
+  const when = formatKolkata(firstRow.scheduled_for);
+  const release = async (reason) => {
+    if (rider && rider.user_id) {
+      await notify(rider.user_id, 'Scheduled delivery released',
+        `Your scheduled delivery from ${rname} (${when}) was released to other riders: ${reason}.`);
+    }
+  };
+  if (!rider || rider.status !== 'approved') {
+    await release('your account is not active');
+    return;
+  }
+  if (!rider.online) {
+    await release('you are offline');
+    return;
+  }
+  const md = await db.query(
+    `SELECT 1 FROM orders o
+     WHERE o.rider_id = $1 AND o.status NOT IN ('delivered','cancelled')
+       AND (o.otw_role IS NULL OR o.otw_role = 'primary')
+       AND EXISTS (SELECT 1 FROM orders s WHERE s.otw_primary_order_id = o.id
+                   AND s.status NOT IN ('delivered','cancelled'))
+     LIMIT 1`,
+    [riderId]
+  );
+  if (md.rows.length) {
+    await release('you are on a multi-restaurant delivery');
+    return;
+  }
+  const cnt = await db.query(
+    `SELECT COUNT(*) AS n FROM orders
+     WHERE rider_id = $1 AND status NOT IN ('delivered','cancelled')
+       AND (otw_role IS NULL OR otw_role = 'primary')`,
+    [riderId]
+  );
+  if (Number(cnt.rows[0].n) >= 3) {
+    await release('you already hold 3 active deliveries');
+    return;
+  }
+  const nowIso = new Date().toISOString();
+  await db.query(
+    `UPDATE orders SET rider_id = $1,
+       timeline = COALESCE(timeline, '[]'::jsonb)
+         || jsonb_build_object('status', 'rider_assigned', 'at', $3::text, 'by', 'system')
+     WHERE (id = $2 OR otw_primary_order_id = $2)
+       AND status IN ('placed','confirmed') AND rider_id IS NULL`,
+    [riderId, primaryId, nowIso]
+  );
+  await notify(rider.user_id, '🛵 Your scheduled delivery is live',
+    `Head to ${rname} — your scheduled order (${when}) is now being prepared.`);
+}
+
 // Promote every due scheduled group to live. Returns { activated } — the
 // number of groups transitioned (0 when nothing is due).
 async function activateDueScheduledOrders() {
@@ -124,6 +184,16 @@ async function activateGroup(primaryId) {
       // the last-pickup fallback does NOT re-notify because an OTP hash
       // already exists, so this is the customer's only OTP push.
       (otp ? ` Your delivery OTP is ${otp} — share it with your rider at handover.` : ''));
+
+    // Rider pre-acceptance handoff: a rider committed to this scheduled order
+    // ahead of time. Auto-assign them now if they're eligible (online, no
+    // multi-delivery lock, under the 3-slot cap) — the 1km on-the-way rule
+    // is a live-offers filter and doesn't apply to a prior commitment.
+    // Otherwise release to the normal offer pool.
+    const preRiderId = first.scheduled_rider_id;
+    if (preRiderId) {
+      await handoffPreAcceptedRider(primaryId, preRiderId, first);
+    }
     console.log(`scheduled: activated group ${primaryId} (${rows.length} rows)`);
     return true;
   } catch (e) {
@@ -134,4 +204,43 @@ async function activateGroup(primaryId) {
   }
 }
 
-module.exports = { activateDueScheduledOrders, formatKolkata, PREP_LEAD_MINUTES };
+module.exports = { activateDueScheduledOrders, remindRiderPreAccepted, formatKolkata, PREP_LEAD_MINUTES };
+
+// 1-hour rider reminder: for scheduled orders a rider pre-accepted, where
+// the slot is now within 60 minutes and we haven't reminded yet, push a
+// "get ready" notification to the rider. Idempotent via rider_reminded.
+async function remindRiderPreAccepted() {
+  if (remindRiderPreAccepted.running) return { reminded: 0, skipped: true };
+  remindRiderPreAccepted.running = true;
+  try {
+    const { rows } = await db.query(
+      `SELECT o.id, o.scheduled_for, o.scheduled_rider_id, rd.user_id AS rider_user_id,
+              r.name AS restaurant_name
+       FROM orders o
+       JOIN riders rd ON rd.id = o.scheduled_rider_id
+       JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.status = 'scheduled'
+         AND o.scheduled_rider_id IS NOT NULL
+         AND o.rider_reminded = false
+         AND (o.otw_role IS NULL OR o.otw_role = 'primary')
+         AND o.scheduled_for > now()
+         AND o.scheduled_for <= now() + interval '60 minutes'
+       LIMIT 50`
+    );
+    let reminded = 0;
+    for (const o of rows) {
+      await db.query(
+        `UPDATE orders SET rider_reminded = true
+         WHERE id = $1 AND rider_reminded = false`,
+        [o.id]
+      );
+      await notify(o.rider_user_id, '⏰ Scheduled delivery in 1 hour',
+        `Your scheduled delivery from ${o.restaurant_name} (${formatKolkata(o.scheduled_for)}) starts in 1 hour. Get ready!`);
+      reminded++;
+    }
+    return { reminded };
+  } finally {
+    remindRiderPreAccepted.running = false;
+  }
+}
+remindRiderPreAccepted.running = false;

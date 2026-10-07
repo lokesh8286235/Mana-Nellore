@@ -1213,6 +1213,14 @@ router.post(
           (scheduledFor ? ` for ${formatKolkata(scheduledFor)}` : '') + `.`);
       }
     }
+    // A rider had pre-accepted this scheduled order — tell them it's gone.
+    if (wasScheduled && order.scheduled_rider_id) {
+      const rr = await db.query('SELECT user_id FROM riders WHERE id = $1', [order.scheduled_rider_id]);
+      if (rr.rows[0]) {
+        await notify(rr.rows[0].user_id, 'Scheduled delivery cancelled',
+          'A scheduled delivery you accepted was cancelled by the customer.');
+      }
+    }
     res.json({ ok: true, refunded });
   })
 );

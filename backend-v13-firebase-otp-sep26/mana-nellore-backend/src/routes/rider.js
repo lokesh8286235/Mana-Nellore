@@ -457,6 +457,220 @@ router.get(
   })
 );
 
+// ---- Scheduled order pre-acceptance (founder) ----
+// Riders see future scheduled orders, commit to one now ("Accept for later"),
+// and get a reminder 1 hour before it goes live. At activation (30 min lead)
+// the group auto-assigns to the committed rider when eligible.
+
+// GET /api/rider/deliveries/scheduled-offers — future scheduled delivery
+// orders open for pre-acceptance. One entry per GROUP.
+router.get(
+  '/deliveries/scheduled-offers',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const { rows } = await db.query(
+      `SELECT o.id, o.scheduled_for, o.total_paise, o.payment_method, o.otw_group_size,
+              o.scheduled_rider_id,
+              r.id AS rest_id, r.name AS restaurant_name, r.address AS rest_address,
+              r.lat AS rest_lat, r.lng AS rest_lng,
+              a.line1, a.city, a.lat AS addr_lat, a.lng AS addr_lng
+       FROM orders o
+       JOIN restaurants r ON r.id = o.restaurant_id
+       LEFT JOIN addresses a ON a.id = o.address_id
+       WHERE o.status = 'scheduled' AND o.order_type = 'delivery'
+         AND o.scheduled_for > now()
+         AND (o.otw_role IS NULL OR o.otw_role = 'primary')
+         AND (o.scheduled_rider_id IS NULL OR o.scheduled_rider_id = $1)
+       ORDER BY o.scheduled_for ASC LIMIT 20`,
+      [rider.id]
+    );
+    const config = await loadPricingConfig(db);
+    const list = [];
+    for (const o of rows) {
+      const sec = await db.query(
+        `SELECT s.id, s.status, r.name AS restaurant_name, r.address AS rest_address
+         FROM orders s JOIN restaurants r ON r.id = s.restaurant_id
+         WHERE s.otw_primary_order_id = $1 AND s.status = 'scheduled'
+         ORDER BY s.placed_at ASC, s.id ASC`,
+        [o.id]
+      );
+      const stops = [
+        { restaurant_id: o.rest_id, restaurant_name: o.restaurant_name, restaurant_address: o.rest_address, primary: true },
+        ...sec.rows.map((s) => ({
+          restaurant_id: s.restaurant_id, restaurant_name: s.restaurant_name,
+          restaurant_address: s.rest_address, primary: false,
+        })),
+      ];
+      const stopCount = stops.length;
+      let distanceKm = null;
+      let payout = null;
+      let pickupKm = null;
+      if (o.rest_lat != null && o.rest_lng != null && o.addr_lat != null && o.addr_lng != null) {
+        distanceKm = haversineKm(o.rest_lat, o.rest_lng, o.addr_lat, o.addr_lng);
+        payout = groupPayoutPaise(config, distanceKm, stopCount - 1);
+      }
+      if (rider.lat != null && rider.lng != null && o.rest_lat != null && o.rest_lng != null) {
+        pickupKm = haversineKm(Number(rider.lat), Number(rider.lng), Number(o.rest_lat), Number(o.rest_lng));
+      }
+      list.push({
+        id: o.id,
+        scheduled_for: o.scheduled_for,
+        total_paise: o.total_paise,
+        payment_method: o.payment_method,
+        restaurant_name: o.restaurant_name,
+        rest_address: o.rest_address,
+        address: [o.line1, o.city].filter(Boolean).join(', '),
+        distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
+        pickup_km: pickupKm == null ? null : Math.round(pickupKm * 10) / 10,
+        payout_paise: payout,
+        stop_count: stopCount,
+        stops,
+        pre_accepted_by_me: String(o.scheduled_rider_id) === String(rider.id),
+      });
+    }
+    res.json({ scheduled: list });
+  })
+);
+
+// POST /api/rider/deliveries/:id/pre-accept — commit to a scheduled order now.
+router.post(
+  '/deliveries/:id/pre-accept',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    if (!rider.online) return res.status(409).json({ error: 'Go online to accept scheduled deliveries' });
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `SELECT * FROM orders WHERE id = $1 AND status = 'scheduled'
+           AND order_type = 'delivery'
+           AND (otw_role IS NULL OR otw_role = 'primary') FOR UPDATE`,
+        [req.params.id]
+      );
+      const order = rows[0];
+      if (!order) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Scheduled order no longer available' });
+      }
+      if (order.scheduled_rider_id && String(order.scheduled_rider_id) !== String(rider.id)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Another rider already accepted this scheduled order' });
+      }
+      if (order.scheduled_rider_id && String(order.scheduled_rider_id) === String(rider.id)) {
+        await client.query('ROLLBACK');
+        return res.json({ ok: true, already: true });
+      }
+      // Overlap warning: another pre-accepted scheduled order within 2 hours.
+      const ov = await client.query(
+        `SELECT id FROM orders
+         WHERE scheduled_rider_id = $1 AND status = 'scheduled' AND id <> $2
+           AND ABS(EXTRACT(EPOCH FROM (scheduled_for - $3::timestamptz))) < 7200
+         LIMIT 1`,
+        [rider.id, order.id, order.scheduled_for]
+      );
+      await client.query(
+        `UPDATE orders SET scheduled_rider_id = $1, scheduled_rider_at = now(), rider_reminded = false
+         WHERE id = $2`,
+        [rider.id, order.id]
+      );
+      await client.query('COMMIT');
+      const { formatKolkata } = require('../lib/scheduled');
+      await notify(rider.user_id, '✅ Scheduled delivery accepted',
+        `We'll remind you 1 hour before your scheduled delivery (${formatKolkata(order.scheduled_for)}).`);
+      res.json({ ok: true, overlap_warning: ov.rows.length > 0 });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_) { /* noop */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+  })
+);
+
+// POST /api/rider/deliveries/:id/pre-cancel — release my pre-acceptance.
+router.post(
+  '/deliveries/:id/pre-cancel',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const { rows } = await db.query(
+      `UPDATE orders SET scheduled_rider_id = NULL, scheduled_rider_at = NULL, rider_reminded = false
+       WHERE id = $1 AND scheduled_rider_id = $2 AND status = 'scheduled'
+       RETURNING id`,
+      [req.params.id, rider.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Scheduled delivery not found' });
+    res.json({ ok: true });
+  })
+);
+
+// GET /api/rider/deliveries/my-scheduled — scheduled orders I pre-accepted.
+router.get(
+  '/deliveries/my-scheduled',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const { rows } = await db.query(
+      `SELECT o.id, o.scheduled_for, o.total_paise, o.payment_method,
+              r.name AS restaurant_name, r.address AS rest_address,
+              a.line1, a.city
+       FROM orders o
+       JOIN restaurants r ON r.id = o.restaurant_id
+       LEFT JOIN addresses a ON a.id = o.address_id
+       WHERE o.scheduled_rider_id = $1 AND o.status = 'scheduled'
+         AND (o.otw_role IS NULL OR o.otw_role = 'primary')
+       ORDER BY o.scheduled_for ASC LIMIT 20`,
+      [rider.id]
+    );
+    res.json({
+      scheduled: rows.map((o) => ({
+        id: o.id,
+        scheduled_for: o.scheduled_for,
+        total_paise: o.total_paise,
+        payment_method: o.payment_method,
+        restaurant_name: o.restaurant_name,
+        rest_address: o.rest_address,
+        address: [o.line1, o.city].filter(Boolean).join(', '),
+      })),
+    });
+  })
+);
+
+// GET /api/rider/notifications — unread notifications for the rider.
+router.get(
+  '/notifications',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const { rows } = await db.query(
+      `SELECT id, title, body, created_at FROM notifications
+       WHERE user_id = $1 AND (read = false OR read IS NULL)
+       ORDER BY created_at DESC LIMIT 20`,
+      [rider.user_id]
+    );
+    res.json({ notifications: rows });
+  })
+);
+
+// POST /api/rider/notifications/read { ids: [] } — mark as read.
+router.post(
+  '/notifications/read',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const ids = Array.isArray(req.body.ids) ? req.body.ids.filter(Boolean) : [];
+    if (ids.length) {
+      await db.query(
+        `UPDATE notifications SET read = true WHERE user_id = $1 AND id = ANY($2::uuid[])`,
+        [rider.user_id, ids]
+      );
+    }
+    res.json({ ok: true });
+  })
+);
+
 // GET /api/rider/deliveries?status=active — my deliveries, ONE entry per
 // GROUP (a multi-stop order counts as one delivery slot, not N rows).
 router.get(

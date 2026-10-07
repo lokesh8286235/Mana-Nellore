@@ -171,6 +171,14 @@ async function migrate() {
   )`);
   await q('CREATE INDEX IF NOT EXISTS idx_sched_cancels_rest ON scheduled_cancels(restaurant_id, cancelled_at)');
 
+  // Rider scheduled pre-acceptance: a rider can commit to a scheduled order
+  // ahead of time (scheduled_rider_id). We remind them 1 hour before it goes
+  // live (rider_reminded) and auto-assign at activation when eligible.
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS scheduled_rider_id uuid REFERENCES riders(id) ON DELETE SET NULL');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS scheduled_rider_at timestamptz');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS rider_reminded boolean NOT NULL DEFAULT false');
+  await q('CREATE INDEX IF NOT EXISTS idx_orders_sched_rider ON orders(scheduled_rider_id) WHERE scheduled_rider_id IS NOT NULL');
+
   // Remove wallet/credit remnants
   await q('ALTER TABLE orders DROP COLUMN IF EXISTS credits_used_paise');
   await q('DROP TABLE IF EXISTS customer_credits');

@@ -539,6 +539,14 @@ router.put(
       `${rName} cancelled your order scheduled for ${schedLabel}: ${reason}${refunded ? ' Your payment will be refunded.' : ''} Tap Reorder to book again.`,
       { type: 'scheduled_cancelled', order_id: order.id, restaurant_id: id,
         restaurant_name: rName, scheduled_for: order.scheduled_for, is_late: isLate });
+    // A rider had pre-accepted this scheduled order — tell them it's gone.
+    if (order.scheduled_rider_id) {
+      const rr = await db.query('SELECT user_id FROM riders WHERE id = $1', [order.scheduled_rider_id]);
+      if (rr.rows[0]) {
+        await notify(db, rr.rows[0].user_id, 'Scheduled delivery cancelled',
+          `The scheduled delivery from ${rName} (${schedLabel}) you accepted was cancelled by the restaurant.`);
+      }
+    }
     res.json({ ok: true, status: 'cancelled', refunded, is_late: isLate });
   })
 );
