@@ -48,6 +48,7 @@ async function migrate() {
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_student boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code text');
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by uuid');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_otp text');
   await q(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_referred_by_fkey') THEN
       ALTER TABLE users ADD CONSTRAINT users_referred_by_fkey

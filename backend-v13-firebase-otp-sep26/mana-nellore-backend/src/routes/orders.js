@@ -774,6 +774,13 @@ router.post(
         }
         const specTotal = (spec.priced.subtotal - spec.discount) + spec.deliveryFee + spec.platformFee + spec.gst.total + spec.tipPaise;
         const shareToken = require('crypto').randomBytes(6).toString('hex');
+        // Delivery OTP: generated at order placement so the customer sees it
+        // immediately. Dine-in orders don't need one.
+        let otpPlain = null, otpHash = null;
+        if (!dineIn) {
+          otpPlain = newDeliveryOtp();
+          otpHash = await bcrypt.hash(otpPlain, 8);
+        }
         const oRes = await client.query(
           `INSERT INTO orders
              (customer_id, restaurant_id, address_id, status, order_type, table_id,
@@ -781,9 +788,10 @@ router.post(
               tax_paise, commission_paise, total_paise, tip_paise,
               delivery_note, no_cutlery, recipient_name, recipient_phone,
               payment_method, payment_status, timeline, eta_at, share_token,
-              otw_role, otw_primary_order_id, otw_group_size, otw_discount_denied)
+              otw_role, otw_primary_order_id, otw_group_size, otw_discount_denied,
+              delivery_otp, delivery_otp_hash)
            VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
-                   now() + ($20 || ' minutes')::interval, $21, $22, $23, $24, $25)
+                   now() + ($20 || ' minutes')::interval, $21, $22, $23, $24, $25, $26, $27)
            RETURNING *`,
           [req.user.id, spec.restaurant.id, dineIn ? null : address_id, dineIn ? 'dinein' : 'delivery',
            dineIn ? table_id : null,
@@ -791,7 +799,8 @@ router.post(
            spec.gst.total, spec.commissionPaise, specTotal, spec.tipPaise,
            delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
            payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
-           spec.role, spec.primaryOrderId, spec.role === 'primary' ? spec.groupSize : null, false]
+           spec.role, spec.primaryOrderId, spec.role === 'primary' ? spec.groupSize : null, false,
+           otpPlain, otpHash]
         );
         const order = oRes.rows[0];
         if (idx === 0) primaryOrderId = order.id;
@@ -844,8 +853,10 @@ router.post(
         }
       }
       const firstName = created[0].spec.restaurant.name;
+      const _otp0 = !dineIn && created[0] && created[0].order ? created[0].order.delivery_otp : null;
       await notify(req.user.id, 'Order placed ✅',
-        `${firstName}${created.length > 1 ? ` (+${created.length - 1} more)` : ''} got your order and the kitchen is firing up! 🔥`);
+        `${firstName}${created.length > 1 ? ` (+${created.length - 1} more)` : ''} got your order and the kitchen is firing up! 🔥` +
+        (_otp0 ? ` Your delivery OTP is ${_otp0} — share it with your rider at handover.` : ''));
 
       const buildBreakdown = (c) => ({
         subtotal_paise: c.spec.priced.subtotal,
@@ -1142,7 +1153,7 @@ router.post(
     }
     const code = newDeliveryOtp();
     const hash = await bcrypt.hash(code, 8);
-    await db.query('UPDATE orders SET delivery_otp_hash = $1 WHERE id = $2', [hash, order.id]);
+    await db.query('UPDATE orders SET delivery_otp = $1, delivery_otp_hash = $2 WHERE id = $3', [code, hash, order.id]);
     await notify(req.user.id, 'Your delivery OTP', `Share this OTP with your rider to receive the order: ${code}`);
     res.json({ ok: true, message: 'OTP re-sent to your notifications' });
   })

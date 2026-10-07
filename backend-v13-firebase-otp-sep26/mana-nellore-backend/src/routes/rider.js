@@ -116,6 +116,24 @@ async function activeGroupCount(riderId) {
   return Number(rows[0].n);
 }
 
+// True if the rider holds an active multi-restaurant (on-the-way) group.
+// A rider on a multi-delivery is locked to it: no other offers, no new accepts.
+async function hasActiveMultiDelivery(riderId) {
+  const { rows } = await db.query(
+    `SELECT 1 FROM orders o
+     WHERE o.rider_id = $1 AND o.status NOT IN ('delivered','cancelled')
+       AND (o.otw_role IS NULL OR o.otw_role = 'primary')
+       AND EXISTS (
+         SELECT 1 FROM orders s
+         WHERE s.otw_primary_order_id = o.id
+           AND s.status NOT IN ('delivered','cancelled')
+       )
+     LIMIT 1`,
+    [riderId]
+  );
+  return rows.length > 0;
+}
+
 // Per-stop detail for a group: restaurant info + items + status + timeline,
 // in route order. Stops not assigned to this rider are flagged detached
 // (transitional only — cascade accept keeps groups whole going forward).
@@ -483,6 +501,10 @@ router.post(
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
     if (!rider.online) return res.status(409).json({ error: 'Go online to accept deliveries' });
+    // Multi-delivery lock: a rider on a multi-restaurant order cannot accept more.
+    if (await hasActiveMultiDelivery(rider.id)) {
+      return res.status(409).json({ error: 'You are on a multi-restaurant delivery — complete it before accepting new orders' });
+    }
     // Max 3 concurrent active delivery GROUPS per rider.
     if ((await activeGroupCount(rider.id)) >= 3) {
       return res.status(409).json({ error: 'You already have 3 active deliveries — complete one first' });
@@ -499,6 +521,22 @@ router.post(
       if (!order) {
         await client.query('ROLLBACK');
         return res.status(409).json({ error: 'Delivery no longer available' });
+      }
+      const _md = await client.query(
+        `SELECT 1 FROM orders o
+         WHERE o.rider_id = $1 AND o.status NOT IN ('delivered','cancelled')
+           AND (o.otw_role IS NULL OR o.otw_role = 'primary')
+           AND EXISTS (
+             SELECT 1 FROM orders s
+             WHERE s.otw_primary_order_id = o.id
+               AND s.status NOT IN ('delivered','cancelled')
+           )
+         LIMIT 1`,
+        [rider.id]
+      );
+      if (_md.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'You are on a multi-restaurant delivery — complete it before accepting new orders' });
       }
       if ((await activeGroupCount(rider.id)) >= 3) {
         await client.query('ROLLBACK');
@@ -650,12 +688,17 @@ router.put(
     const grp = await groupRows(found.primaryId);
     const mine = grp.filter((o) => String(o.rider_id) === String(rider.id) && o.status !== 'cancelled');
     if (mine.length && mine.every((o) => o.status === 'picked_up')) {
-      const code = newDeliveryOtp();
-      const hash = await bcrypt.hash(code, 8);
-      await db.query('UPDATE orders SET delivery_otp_hash = $1 WHERE id = $2', [hash, found.primaryId]);
-      const cust = grp[0].customer_id;
-      await notify(cust, 'Your delivery OTP',
-        `Your rider has picked up the order. Share this OTP to receive it: ${code}`);
+      // OTP is generated at order placement now; this is a fallback for
+      // orders placed before that change.
+      const ex = await db.query('SELECT delivery_otp, delivery_otp_hash FROM orders WHERE id = $1', [found.primaryId]);
+      if (!ex.rows[0] || !ex.rows[0].delivery_otp_hash) {
+        const code = newDeliveryOtp();
+        const hash = await bcrypt.hash(code, 8);
+        await db.query('UPDATE orders SET delivery_otp = $1, delivery_otp_hash = $2 WHERE id = $3', [code, hash, found.primaryId]);
+        const cust = grp[0].customer_id;
+        await notify(cust, 'Your delivery OTP',
+          `Your rider has picked up the order. Share this OTP to receive it: ${code}`);
+      }
     }
     res.json({ ok: true, status: 'picked_up' });
   })
