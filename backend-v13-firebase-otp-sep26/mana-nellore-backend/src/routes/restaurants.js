@@ -123,7 +123,7 @@ router.get(
         birthday_dessert: !!r.birthday_dessert,
         chef_name: r.chef_name,
         chef_photo: r.chef_photo,
-        distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
+        distance_km: distanceKm == null || distanceKm > 200 ? null : Math.round(distanceKm * 10) / 10,
         delivery_fee_paise: fee,
         has_veg: !!r.has_veg,
         is_coming_soon: !!r.is_coming_soon,
@@ -370,7 +370,8 @@ router.get(
     const dLng = parseFloat(req.query.lng);
     let detailDist = null;
     if (Number.isFinite(dLat) && Number.isFinite(dLng) && restaurant.lat != null && restaurant.lng != null) {
-      detailDist = Math.round(haversineKm(dLat, dLng, Number(restaurant.lat), Number(restaurant.lng)) * 10) / 10;
+      const _dd = haversineKm(dLat, dLng, Number(restaurant.lat), Number(restaurant.lng));
+      detailDist = _dd > 200 ? null : Math.round(_dd * 10) / 10;
     }
     res.json({
       // Whitelisted public fields only: the raw row carries owner PII

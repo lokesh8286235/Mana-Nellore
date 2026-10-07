@@ -214,6 +214,14 @@ async function migrate() {
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
            WHERE share_token IS NULL`);
 
+  // Fix 2026-10-07: Clear restaurant coords outside India (bogus geocoding).
+  // Sri Durga had US coords showing 14708km from Nellore. Restaurants in
+  // Nellore must be within India bounds; anything outside is wrong data.
+  await q(`UPDATE restaurants SET lat = NULL, lng = NULL
+           WHERE lat IS NOT NULL AND (
+             lat < 6 OR lat > 38 OR lng < 68 OR lng > 98
+           )`);
+
   // Image store (v16): photo bytes as immutable files, not data-URLs in JSON.
   await q(`CREATE TABLE IF NOT EXISTS images (
     hash text PRIMARY KEY,
