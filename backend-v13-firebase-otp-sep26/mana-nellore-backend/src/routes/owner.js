@@ -36,9 +36,9 @@ function normSlots(v) {
   return ok.length ? ok : ['all'];
 }
 
-async function notify(dbConn, userId, title, body) {
-  await dbConn.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [
-    userId, title, body
+async function notify(dbConn, userId, title, body, data) {
+  await dbConn.query('INSERT INTO notifications (user_id, title, body, data) VALUES ($1, $2, $3, $4)', [
+    userId, title, body, data ? JSON.stringify(data) : null
   ]);
 }
 
@@ -519,9 +519,27 @@ router.put(
       [reason, refunded ? 'refunded' : order.payment_status, order.id]
     );
     const rName = (await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name;
+    // Late cancellation tracking: cancelled within 2 hours of scheduled time
+    let isLate = false;
+    if (order.scheduled_for) {
+      const msUntil = new Date(order.scheduled_for).getTime() - Date.now();
+      isLate = msUntil < 2 * 60 * 60 * 1000;
+    }
+    await db.query(
+      `INSERT INTO scheduled_cancels (restaurant_id, order_id, scheduled_for, is_late)
+       VALUES ($1, $2, $3, $4)`,
+      [id, order.id, order.scheduled_for || null, isLate]
+    );
+    if (isLate) {
+      await db.query('UPDATE restaurants SET late_cancels = late_cancels + 1 WHERE id = $1', [id]);
+    }
+    const { formatKolkata } = require('../lib/scheduled');
+    const schedLabel = order.scheduled_for ? formatKolkata(order.scheduled_for) : 'your scheduled time';
     await notify(db, order.customer_id, "Restaurant couldn't take your scheduled order",
-      `${rName}: ${reason}${refunded ? ' Your payment will be refunded.' : ''}`);
-    res.json({ ok: true, status: 'cancelled', refunded });
+      `${rName} cancelled your order scheduled for ${schedLabel}: ${reason}${refunded ? ' Your payment will be refunded.' : ''} Tap Reorder to book again.`,
+      { type: 'scheduled_cancelled', order_id: order.id, restaurant_id: id,
+        restaurant_name: rName, scheduled_for: order.scheduled_for, is_late: isLate });
+    res.json({ ok: true, status: 'cancelled', refunded, is_late: isLate });
   })
 );
 

@@ -533,6 +533,14 @@ router.post(
       const v = parseScheduledFor(scheduledRaw);
       if (!v.ok) return res.status(400).json({ error: v.error });
       scheduledAt = v.date;
+      // Block scheduling for restaurants suspended by admin for late cancellations
+      const { rows: suspRows } = await db.query(
+        'SELECT scheduling_suspended FROM restaurants WHERE id = $1',
+        [restaurant_id]
+      );
+      if (suspRows[0] && suspRows[0].scheduling_suspended) {
+        return res.status(403).json({ error: 'Scheduled ordering is temporarily unavailable for this restaurant' });
+      }
     }
 
     const groupDefs = buildGroupDefs({ bodyGroups: req.body.groups, items, restaurant_id, dineIn });

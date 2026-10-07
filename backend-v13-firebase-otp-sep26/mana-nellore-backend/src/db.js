@@ -156,6 +156,21 @@ async function migrate() {
     END IF;
   END $$`);
   await q('CREATE INDEX IF NOT EXISTS idx_orders_status_scheduled ON orders(status, scheduled_for)');
+  // Scheduled order cancellation protection: track late cancels per restaurant,
+  // allow admin to suspend scheduling, structured notification data.
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS late_cancels int NOT NULL DEFAULT 0');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS scheduling_suspended boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS data jsonb');
+  await q(`CREATE TABLE IF NOT EXISTS scheduled_cancels (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    restaurant_id uuid REFERENCES restaurants(id) ON DELETE SET NULL,
+    order_id uuid,
+    scheduled_for timestamptz,
+    cancelled_at timestamptz NOT NULL DEFAULT now(),
+    is_late boolean NOT NULL DEFAULT false
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_sched_cancels_rest ON scheduled_cancels(restaurant_id, cancelled_at)');
+
   // Remove wallet/credit remnants
   await q('ALTER TABLE orders DROP COLUMN IF EXISTS credits_used_paise');
   await q('DROP TABLE IF EXISTS customer_credits');

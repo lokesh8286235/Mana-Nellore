@@ -1345,7 +1345,7 @@ router.put(
     const rest = rRows[0];
     if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
     const { name, address, fssai, owner_name, lat, lng,
-      opens_at, closes_at, opens_at_we, closes_at_we } = req.body || {};
+      opens_at, closes_at, opens_at_we, closes_at_we, scheduling_suspended } = req.body || {};
     const updates = [];
     const vals = [];
     let i = 1;
@@ -1372,6 +1372,11 @@ router.put(
       const v = lng === null || lng === '' ? null : Number(lng);
       if (v !== null && !Number.isFinite(v)) return res.status(400).json({ error: 'lng must be a number' });
       updates.push('lng = $' + (i++)); vals.push(v); changes.lng = { from: rest.lng, to: v };
+    }
+    if (scheduling_suspended !== undefined) {
+      const v = !!scheduling_suspended;
+      updates.push('scheduling_suspended = $' + (i++)); vals.push(v);
+      changes.scheduling_suspended = { from: rest.scheduling_suspended, to: v };
     }
     for (const tf of ['opens_at', 'closes_at', 'opens_at_we', 'closes_at_we']) {
       const raw = { opens_at, closes_at, opens_at_we, closes_at_we }[tf];
