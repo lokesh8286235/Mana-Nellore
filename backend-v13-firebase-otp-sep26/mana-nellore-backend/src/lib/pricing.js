@@ -13,10 +13,21 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
+// Pricing config changes rarely (admin edits). Cache in memory for 60s to
+// avoid a DB round trip on every quote and placement. Admin changes apply
+// within a minute — acceptable for pricing.
+let _pricingCache = null;
+let _pricingCacheAt = 0;
+const PRICING_CACHE_TTL_MS = 60000;
+
 async function loadPricingConfig(db) {
+  const now = Date.now();
+  if (_pricingCache && now - _pricingCacheAt < PRICING_CACHE_TTL_MS) {
+    return _pricingCache;
+  }
   const { rows } = await db.query('SELECT key, value FROM pricing_config');
   const m = Object.fromEntries(rows.map((r) => [r.key, r.value]));
-  return {
+  const cfg = {
     deliveryTiers:
       (m.delivery_tiers && m.delivery_tiers.tiers) || [
         { up_to_km: 3, rate_paise_per_km: 1000 },
@@ -49,6 +60,9 @@ async function loadPricingConfig(db) {
       m.rider_payout_extra_stop_paise != null ? m.rider_payout_extra_stop_paise : 1500
     ),
   };
+  _pricingCache = cfg;
+  _pricingCacheAt = Date.now();
+  return cfg;
 }
 
 // Defensive normalization for the tax_rates pricing_config value.
