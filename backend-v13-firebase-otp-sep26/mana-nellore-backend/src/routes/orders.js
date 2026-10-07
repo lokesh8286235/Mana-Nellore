@@ -991,7 +991,7 @@ router.get(
       `SELECT o.*, r.name AS restaurant_name, r.image_url AS restaurant_image, r.phone AS restaurant_phone,
               r.verified AS restaurant_verified, r.lat AS rest_lat, r.lng AS rest_lng,
               rd.lat AS rider_lat, rd.lng AS rider_lng,
-              a.line1, a.line2, a.city,
+              a.line1, a.line2, a.city, a.lat AS addr_lat, a.lng AS addr_lng,
               ru.name AS rider_name, ru.phone AS rider_phone,
               rd.profile_photo AS rider_photo, rd.rating_avg AS rider_rating,
               COALESCE(rdc.cnt, 0) AS rider_deliveries
