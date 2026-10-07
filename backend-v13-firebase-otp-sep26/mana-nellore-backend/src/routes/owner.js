@@ -99,6 +99,7 @@ router.put(
     if (!id) return;
     const fields = ['name', 'description', 'address', 'lat', 'lng', 'phone', 'image_url', 'fssai',
       'chef_name', 'chef_photo', 'chef_story', 'gstin', 'birthday_dessert',
+      'cuisines', 'is_pure_veg',
       'opens_at', 'closes_at', 'opens_at_we', 'closes_at_we'];
     const sets = [];
     const params = [];

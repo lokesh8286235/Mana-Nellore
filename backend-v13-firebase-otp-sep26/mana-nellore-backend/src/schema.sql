@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS restaurants (
   chef_story text,
   gstin text,
   birthday_dessert boolean NOT NULL DEFAULT false,
+  cuisines text[] NOT NULL DEFAULT '{}',
+  is_pure_veg boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 

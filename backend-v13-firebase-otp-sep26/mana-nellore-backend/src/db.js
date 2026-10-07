@@ -164,6 +164,8 @@ async function migrate() {
   await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS requires_student boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS aadhar text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar text');
+  await q("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS cuisines text[] NOT NULL DEFAULT '{}'");
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS is_pure_veg boolean NOT NULL DEFAULT false');
 
   // Customer memory: preferences, favorites, coupon issuances (survive reinstalls)
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS veg_only boolean NOT NULL DEFAULT false');
