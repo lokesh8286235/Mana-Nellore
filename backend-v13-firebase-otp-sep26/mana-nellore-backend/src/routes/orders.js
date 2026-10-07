@@ -533,18 +533,25 @@ router.post(
       const v = parseScheduledFor(scheduledRaw);
       if (!v.ok) return res.status(400).json({ error: v.error });
       scheduledAt = v.date;
-      // Block scheduling for restaurants suspended by admin for late cancellations
-      const { rows: suspRows } = await db.query(
-        'SELECT scheduling_suspended FROM restaurants WHERE id = $1',
-        [restaurant_id]
-      );
-      if (suspRows[0] && suspRows[0].scheduling_suspended) {
-        return res.status(403).json({ error: 'Scheduled ordering is temporarily unavailable for this restaurant' });
-      }
     }
 
     const groupDefs = buildGroupDefs({ bodyGroups: req.body.groups, items, restaurant_id, dineIn });
     if (!Array.isArray(groupDefs)) return res.status(400).json({ error: groupDefs.error });
+
+    // Block scheduling for restaurants suspended by admin for late cancellations.
+    // Checks ALL restaurants in the group (primary + on-the-way secondaries).
+    if (scheduledAt) {
+      const suspIds = [...new Set(groupDefs.map((g) => String(g.restaurant_id)))];
+      const { rows: suspRows } = await db.query(
+        `SELECT r.name FROM restaurants r
+         WHERE r.id = ANY($1) AND r.scheduling_suspended = true LIMIT 1`,
+        [suspIds]
+      );
+      if (suspRows.length) {
+        const sName = suspRows[0].name || 'this restaurant';
+        return res.status(403).json({ error: `Scheduled ordering is temporarily unavailable for ${sName}` });
+      }
+    }
     if (!dineIn && !address_id) {
       return res.status(400).json({ error: 'address_id is required for delivery orders' });
     }
