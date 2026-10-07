@@ -180,8 +180,10 @@ CREATE INDEX IF NOT EXISTS idx_orders_rest_status ON orders(restaurant_id, statu
 CREATE INDEX IF NOT EXISTS idx_orders_rest_packed ON orders(restaurant_id, placed_at) WHERE packed_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_rider ON orders(rider_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
--- Scheduled-order activation probe: due 'scheduled' rows by time.
-CREATE INDEX IF NOT EXISTS idx_orders_status_scheduled ON orders(status, scheduled_for);
+-- NOTE: idx_orders_status_scheduled (on (status, scheduled_for)) is created
+-- in migrate() (db.js), AFTER the scheduled_for column itself is added — it
+-- cannot live here because on an existing database the column does not exist
+-- yet when the schema runs (same reason as the orders.table_id FK note).
 
 CREATE TABLE IF NOT EXISTS order_items (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -1344,7 +1344,7 @@ router.put(
     const { rows: rRows } = await db.query('SELECT * FROM restaurants WHERE id = $1', [req.params.id]);
     const rest = rRows[0];
     if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
-    const { name, address, fssai, owner_name, lat, lng,
+    const { name, address, fssai, owner_name,
       opens_at, closes_at, opens_at_we, closes_at_we } = req.body || {};
     const updates = [];
     const vals = [];
@@ -1362,16 +1362,6 @@ router.put(
     if (fssai !== undefined) {
       const v = String(fssai).trim() || null;
       updates.push('fssai = $' + (i++)); vals.push(v); changes.fssai = { from: rest.fssai, to: v };
-    }
-    if (lat !== undefined) {
-      const v = lat === null || lat === '' ? null : Number(lat);
-      if (v !== null && !Number.isFinite(v)) return res.status(400).json({ error: 'lat must be a number' });
-      updates.push('lat = $' + (i++)); vals.push(v); changes.lat = { from: rest.lat, to: v };
-    }
-    if (lng !== undefined) {
-      const v = lng === null || lng === '' ? null : Number(lng);
-      if (v !== null && !Number.isFinite(v)) return res.status(400).json({ error: 'lng must be a number' });
-      updates.push('lng = $' + (i++)); vals.push(v); changes.lng = { from: rest.lng, to: v };
     }
     for (const tf of ['opens_at', 'closes_at', 'opens_at_we', 'closes_at_we']) {
       const raw = { opens_at, closes_at, opens_at_we, closes_at_we }[tf];
