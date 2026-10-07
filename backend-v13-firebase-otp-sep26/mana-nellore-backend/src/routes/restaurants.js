@@ -3,6 +3,7 @@ const express = require('express');
 const db = require('../db');
 const { ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, deliveryFeePaise } = require('../lib/pricing');
+const { getBatchDurations, durationToEtaMinutes } = require('../lib/routesApi');
 
 const router = express.Router();
 
@@ -126,9 +127,48 @@ router.get(
         delivery_fee_paise: fee,
         has_veg: !!r.has_veg,
         is_coming_soon: !!r.is_coming_soon,
-        eta_minutes: distanceKm == null ? 30 : Math.round(20 + distanceKm * 3)
+        // Fallback ETA (haversine-based); replaced with Routes API below if available
+        eta_minutes: distanceKm == null ? 30 : Math.round(20 + distanceKm * 3),
+        _lat: r.lat,
+        _lng: r.lng,
       };
     });
+
+    // Accurate ETAs via Google Routes API (one batch call for all restaurants).
+    // Falls back to haversine estimates if the API is unavailable.
+    if (hasLoc) {
+      try {
+        const withCoords = [];
+        const idxMap = [];
+        list.forEach((item, i) => {
+          if (item._lat != null && item._lng != null) {
+            withCoords.push({ lat: Number(item._lat), lng: Number(item._lng) });
+            idxMap.push(i);
+          }
+        });
+        if (withCoords.length > 0) {
+          const durations = await getBatchDurations(custLat, custLng, withCoords);
+          durations.forEach((route, validIdx) => {
+            const listIdx = idxMap[validIdx];
+            if (listIdx != null && route.durationSec != null) {
+              // Real travel time + 15 min prep buffer (replaces 20 + dist*3 heuristic)
+              const eta = durationToEtaMinutes(route.durationSec, 15);
+              if (eta != null) list[listIdx].eta_minutes = eta;
+              // Update distance to real road distance if available
+              if (route.distanceMeters != null) {
+                list[listIdx].distance_km = Math.round(route.distanceMeters / 100) / 10;
+              }
+            }
+          });
+        }
+      } catch (e) {
+        console.error('Routes API batch ETA failed, using fallback:', e.message);
+      }
+      // Remove internal coords before sending
+      list.forEach(item => { delete item._lat; delete item._lng; });
+    } else {
+      list.forEach(item => { delete item._lat; delete item._lng; });
+    }
     // Nearest first when we know where the customer is
     if (hasLoc) {
       list.sort((a, b) => (a.distance_km == null ? 9999 : a.distance_km) - (b.distance_km == null ? 9999 : b.distance_km));

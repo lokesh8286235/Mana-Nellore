@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, computeQuote, computeGstPaise, deliveryFeePaise } = require('../lib/pricing');
+const { getRouteDuration } = require('../lib/routesApi');
 const { isInServiceArea, otwDiscountDecision } = require('../lib/onetheway');
 
 const router = express.Router();
@@ -1076,7 +1077,30 @@ router.get(
           });
       }
     }
-    res.json({ order: { ...order, items: items.rows, queue_ahead: queueAhead, no_response: noResponse, stops } });
+    // Live ETA: real driving time from rider's current position to customer.
+    // Only when rider is on the way with known GPS; cached 60s server-side.
+    // Falls back to null (frontend uses existing estimate).
+    let live_eta_minutes = null;
+    {
+      const riderOnWay = ['picked_up', 'on_the_way', 'out_for_delivery', 'dispatched']
+        .includes(String(order.status || '').toLowerCase());
+      const rLat = Number(order.rider_lat);
+      const rLng = Number(order.rider_lng);
+      const aLat = Number(order.addr_lat);
+      const aLng = Number(order.addr_lng);
+      if (riderOnWay && Number.isFinite(rLat) && Number.isFinite(rLng) &&
+          Number.isFinite(aLat) && Number.isFinite(aLng)) {
+        try {
+          const route = await getRouteDuration(rLat, rLng, aLat, aLng);
+          if (route && route.durationSec != null) {
+            live_eta_minutes = Math.max(1, Math.ceil(route.durationSec / 60));
+          }
+        } catch (e) {
+          console.error('Live ETA failed:', e.message);
+        }
+      }
+    }
+    res.json({ order: { ...order, items: items.rows, queue_ahead: queueAhead, no_response: noResponse, stops, live_eta_minutes } });
   })
 );
 
