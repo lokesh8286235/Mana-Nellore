@@ -196,7 +196,7 @@ async function pricePlacementItems(client, items, restaurantId) {
       name_snapshot: m.name + (custNames.length ? ' (' + custNames.join(', ') + ')' : ''),
       unit_price_paise: m.price_paise + custExtra,
       qty,
-      instructions: it.instructions || null
+      instructions: it.instructions || it.note || null
     });
   }
   return { subtotal, snapshots };
