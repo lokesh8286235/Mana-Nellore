@@ -1010,7 +1010,38 @@ router.get(
           [new Date().toISOString(), order.id]);
       }
     }
-    res.json({ order: { ...order, items: items.rows, queue_ahead: queueAhead, no_response: noResponse } });
+    // Multi-stop (on-the-way) groups: expose per-stop rider progress so the
+    // customer tracking screen can show "Rider reached {name}" / "Picked up
+    // from {name}" per restaurant in route order. Single-restaurant orders
+    // get an empty stops array and render exactly as before.
+    let stops = [];
+    {
+      const primaryId = order.otw_role === 'secondary' && order.otw_primary_order_id
+        ? String(order.otw_primary_order_id) : String(order.id);
+      const g = await db.query(
+        `SELECT o.id, o.status, o.timeline, r.name AS restaurant_name
+         FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
+         WHERE (o.id = $1 OR o.otw_primary_order_id = $1) AND o.customer_id = $2
+         ORDER BY CASE WHEN o.otw_role = 'primary' THEN 0 ELSE 1 END, o.placed_at ASC, o.id ASC`,
+        [primaryId, req.user.id]
+      );
+      if (g.rows.length > 1) {
+        stops = g.rows
+          .filter((r) => String(r.status).toLowerCase() !== 'cancelled')
+          .map((r) => {
+            const tl = Array.isArray(r.timeline) ? r.timeline : [];
+            const ev = (s) => tl.some((t) => String(t.status || '').toLowerCase() === s);
+            const picked = String(r.status).toLowerCase() === 'picked_up' || ev('picked_up');
+            return {
+              order_id: r.id,
+              restaurant_name: r.restaurant_name || 'Restaurant',
+              reached: ev('arrived_restaurant') || picked,
+              picked_up: picked,
+            };
+          });
+      }
+    }
+    res.json({ order: { ...order, items: items.rows, queue_ahead: queueAhead, no_response: noResponse, stops } });
   })
 );
 
