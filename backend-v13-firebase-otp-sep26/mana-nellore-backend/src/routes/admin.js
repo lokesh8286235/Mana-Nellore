@@ -5,6 +5,7 @@ const { seedSuggestedCats } = require('../lib/suggested-cats');
 const { storeImageUrl } = require('../lib/images');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
+const { idempotency } = require('../lib/idempotency');
 
 const router = express.Router();
 router.use(authenticate, requireRole('admin'));
@@ -516,10 +517,24 @@ router.get(
 // POST /api/admin/settlements { restaurant_id, period_start, period_end }
 router.post(
   '/settlements',
+  idempotency('admin:settlements:create'),
   ah(async (req, res) => {
     const { restaurant_id, period_start, period_end } = req.body;
     if (!restaurant_id || !period_start || !period_end) {
       return res.status(400).json({ error: 'restaurant_id, period_start and period_end are required' });
+    }
+    // Natural dedupe: an identical settlement already exists (e.g. double
+    // submitted with two different idempotency keys) — return it instead of
+    // creating an overlapping duplicate.
+    const dup = await db.query(
+      `SELECT s.*, r.name AS restaurant_name FROM settlements s
+       JOIN restaurants r ON r.id = s.restaurant_id
+       WHERE s.restaurant_id = $1 AND s.period_start = $2 AND s.period_end = $3
+       ORDER BY s.created_at DESC LIMIT 1`,
+      [restaurant_id, period_start, period_end]
+    );
+    if (dup.rows[0]) {
+      return res.json({ settlement: dup.rows[0], duplicate: true });
     }
     const agg = await db.query(
       `SELECT COALESCE(SUM(total_paise),0) AS gross,
@@ -546,7 +561,15 @@ router.post(
 
 router.post(
   '/settlements/:id/pay',
+  idempotency('admin:settlements:pay'),
   ah(async (req, res) => {
+    const cur = await db.query('SELECT status FROM settlements WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Settlement not found' });
+    // Already paid (e.g. double submitted): return it without re-auditing.
+    if (cur.rows[0].status === 'paid') {
+      const { rows } = await db.query('SELECT * FROM settlements WHERE id = $1', [req.params.id]);
+      return res.json({ settlement: rows[0], already_paid: true });
+    }
     const { rows } = await db.query(
       "UPDATE settlements SET status = 'paid', paid_at = now() WHERE id = $1 RETURNING *",
       [req.params.id]
@@ -577,6 +600,7 @@ router.get(
 
 router.post(
   '/refunds',
+  idempotency('admin:refunds:create'),
   ah(async (req, res) => {
     const { order_id, reason } = req.body;
     const oRes = await db.query('SELECT * FROM orders WHERE id = $1', [order_id]);
@@ -585,7 +609,7 @@ router.post(
     if (order.payment_status !== 'paid') {
       return res.status(409).json({ error: `Cannot refund an order with payment status ${order.payment_status}` });
     }
-    await db.query("UPDATE orders SET payment_status = 'refunded' WHERE id = $1", [order.id]);
+    await db.query("UPDATE orders SET payment_status = 'refunded', refunded_at = COALESCE(refunded_at, now()) WHERE id = $1", [order.id]);
     const tl = (await db.query('SELECT timeline FROM orders WHERE id = $1', [order.id])).rows[0].timeline || [];
     tl.push({ status: 'refunded', at: new Date().toISOString(), by: 'admin' });
     await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [JSON.stringify(tl), order.id]);
@@ -654,6 +678,7 @@ router.put(
 // Resolution note is required (same rule as closing a ticket).
 router.post(
   '/tickets/:id/resolve-action',
+  idempotency('admin:tickets:resolve-action'),
   ah(async (req, res) => {
     const { action, resolution_note } = req.body;
     if (!['refund', 'reorder'].includes(action)) {
@@ -675,7 +700,7 @@ router.post(
       if (!['paid', 'collected'].includes(order.payment_status)) {
         return res.status(409).json({ error: `Order payment is '${order.payment_status}' — nothing to refund` });
       }
-      await db.query("UPDATE orders SET payment_status = 'refunded' WHERE id = $1", [order.id]);
+      await db.query("UPDATE orders SET payment_status = 'refunded', refunded_at = COALESCE(refunded_at, now()) WHERE id = $1", [order.id]);
       note = `Refunded Rs ${(order.total_paise / 100).toFixed(2)}. ${note}`;
       await notify(order.customer_id, 'Refund issued 💸',
         `Rs ${(order.total_paise / 100).toFixed(2)} has been refunded for your order. ${note}`);
@@ -1131,6 +1156,7 @@ router.get(
 // POST /api/admin/rider-cod/:riderId/settle — mark all unsettled COD as settled (cash received)
 router.post(
   '/rider-cod/:riderId/settle',
+  idempotency('admin:rider-cod:settle'),
   ah(async (req, res) => {
     const r = await db.query(
       `UPDATE rider_cod_ledger SET settled = true, settled_at = now()

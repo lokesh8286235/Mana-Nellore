@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, computeQuote, computeGstPaise, deliveryFeePaise } = require('../lib/pricing');
+const { idempotency } = require('../lib/idempotency');
 const { getRouteDuration } = require('../lib/routesApi');
 const { isInServiceArea, otwDiscountDecision } = require('../lib/onetheway');
 
@@ -516,6 +517,7 @@ router.post(
 // the Nellore service area.
 router.post(
   '/',
+  idempotency('orders:create'),
   ah(async (req, res) => {
     const { restaurant_id, address_id, items, coupon_code, payment_method,
             order_type, table_id, delivery_note, no_cutlery, tip_paise,
@@ -1225,7 +1227,9 @@ router.post(
     await transition(order.id, 'cancelled', 'customer');
     const refunded = order.payment_status === 'paid';
     await db.query(
-      'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
+      `UPDATE orders SET cancel_reason = $1, payment_status = $2,
+         refunded_at = CASE WHEN $2 = 'refunded' THEN COALESCE(refunded_at, now()) ELSE refunded_at END
+       WHERE id = $3`,
       [req.body.reason || 'Cancelled by customer', refunded ? 'refunded' : order.payment_status, order.id]
     );
     await notify(req.user.id, 'Order cancelled',

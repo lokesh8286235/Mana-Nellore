@@ -515,7 +515,9 @@ router.put(
     const reason = String((req.body && req.body.reason) || '').trim().slice(0, 280)
       || 'The restaurant could not take this order';
     await db.query(
-      'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
+      `UPDATE orders SET cancel_reason = $1, payment_status = $2,
+         refunded_at = CASE WHEN $2 = 'refunded' THEN COALESCE(refunded_at, now()) ELSE refunded_at END
+       WHERE id = $3`,
       [reason, refunded ? 'refunded' : order.payment_status, order.id]
     );
     const rName = (await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name;
@@ -579,7 +581,9 @@ router.put(
       const reason = req.body.reason || 'Restaurant rejected the order';
       const refunded = order.payment_status === 'paid';
       await db.query(
-        "UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3",
+        `UPDATE orders SET cancel_reason = $1, payment_status = $2,
+           refunded_at = CASE WHEN $2 = 'refunded' THEN COALESCE(refunded_at, now()) ELSE refunded_at END
+         WHERE id = $3`,
         [reason, refunded ? 'refunded' : order.payment_status, order.id]
       );
       await notify(db, order.customer_id, 'Order rejected',

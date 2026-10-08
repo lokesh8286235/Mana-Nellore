@@ -252,6 +252,50 @@ async function migrate() {
     mime text NOT NULL DEFAULT 'image/jpeg',
     created_at timestamptz NOT NULL DEFAULT now()
   )`);
+
+  // Idempotency keys for money-mutating endpoints (order placement, refunds,
+  // settlements, COD settlement, ticket refunds). Scoped per endpoint + user.
+  // Rows are completed once and purged after 24h (see purgeOld).
+  await q(`CREATE TABLE IF NOT EXISTS idempotency_keys (
+    scope text NOT NULL,
+    key text NOT NULL,
+    completed boolean NOT NULL DEFAULT false,
+    status_code int,
+    response jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (scope, key)
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_idem_created ON idempotency_keys(created_at)');
+  await q(`DELETE FROM idempotency_keys WHERE created_at < now() - INTERVAL '24 hours'`);
+
+  // Refund flag on orders: refunded_at is set everywhere payment_status
+  // becomes 'refunded'; the generated `refunded` boolean flows into every
+  // order object (all serializers use SELECT o.*) so apps can exclude
+  // refunded orders (e.g. restaurant home revenue) without extra queries.
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_at timestamptz');
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'orders' AND column_name = 'refunded') THEN
+      ALTER TABLE orders ADD COLUMN refunded boolean
+        GENERATED ALWAYS AS (refunded_at IS NOT NULL) STORED;
+    END IF;
+  END $$`);
+  // Backfill: historical refunded orders predate the column.
+  await q(`UPDATE orders SET refunded_at = COALESCE(placed_at, now())
+           WHERE payment_status = 'refunded' AND refunded_at IS NULL`);
+
+  // Rider SOS alerts: created in an earlier deploy without a schema entry;
+  // declare it here so fresh databases get the table the routes expect.
+  await q(`CREATE TABLE IF NOT EXISTS sos_alerts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    rider_id uuid REFERENCES riders(id) ON DELETE SET NULL,
+    lat double precision,
+    lng double precision,
+    status text NOT NULL DEFAULT 'open',
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_sos_rider_created ON sos_alerts(rider_id, created_at)');
+
   await migrateDataUrlPhotos();
 }
 

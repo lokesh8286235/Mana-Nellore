@@ -6,6 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const { initDb } = require('./db');
 const { activateDueScheduledOrders, remindRiderPreAccepted } = require('./lib/scheduled');
 
@@ -42,8 +43,45 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   message: { ok: false, error: 'Too many attempts, please try again in a minute' }
 });
+// Per-phone OTP limits (on top of the per-IP authLimiter above): sending and
+// verifying OTPs is additionally throttled per phone number so one attacker
+// cannot burn SMS budget or brute-force a single victim's 6-digit code from
+// many IPs. Keys are last-10-digits + IP (normalized in the route handlers).
+const phoneKey = (req) => {
+  const raw = String((req.body && req.body.phone) || (req.query && req.query.phone) || '');
+  const digits = raw.replace(/\D/g, '');
+  return (digits.slice(-10) || 'nophone') + ':' + ipKeyGenerator(req.ip);
+};
+const otpSendLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 5, // 5 OTP sends per 10 min per phone
+  keyGenerator: phoneKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: 'Too many OTP requests for this number, please try again later' }
+});
+const otpVerifyLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 10, // 10 verify attempts per 10 min per phone (6-digit codes expire in 10 min)
+  keyGenerator: phoneKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: 'Too many wrong attempts, please request a fresh code' }
+});
+// /api/applications/check is an unauthenticated partner-number oracle —
+// throttle it aggressively per IP.
+const appCheckLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20, // 20 checks per hour per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: 'Too many checks, please try again later' }
+});
 app.use('/api/', apiLimiter);
 app.use('/api/auth/', authLimiter);
+app.use('/api/auth/send-otp', otpSendLimiter);
+app.use('/api/auth/verify-otp', otpVerifyLimiter);
+app.use('/api/applications/check', appCheckLimiter);
 
 app.get('/api/health', (req, res) => {
   // Public: readiness only. Never expose dbStatus.error — init failure

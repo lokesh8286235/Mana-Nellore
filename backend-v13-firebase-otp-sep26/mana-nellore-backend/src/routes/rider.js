@@ -276,6 +276,21 @@ router.post(
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
+    // Dedup window: one SOS per rider per 5 minutes — panic double-taps (and
+    // the client cooldown) must not page every admin repeatedly.
+    const recent = await db.query(
+      `SELECT id, created_at FROM sos_alerts
+       WHERE rider_id = $1 AND created_at > now() - INTERVAL '5 minutes'
+       ORDER BY created_at DESC LIMIT 1`,
+      [rider.id]
+    );
+    if (recent.rows[0]) {
+      return res.status(429).json({
+        ok: false,
+        error: 'SOS already sent recently — help is on the way',
+        alert_id: recent.rows[0].id
+      });
+    }
     const lat = req.body && req.body.lat != null ? Number(req.body.lat) : null;
     const lng = req.body && req.body.lng != null ? Number(req.body.lng) : null;
     await db.query(
@@ -992,7 +1007,10 @@ router.post(
 
     // COD: validate cash collection BEFORE any mutation — a failed confirmation
     // must not leave the order marked delivered with money uncollected.
-    const cod = order.payment_method === 'cod' && order.payment_status === 'pending';
+    // Fail closed: any COD order that isn't already paid/collected/refunded
+    // must confirm cash — never trust a missing or unexpected payment_status.
+    const cod = order.payment_method === 'cod'
+      && !['paid', 'collected', 'refunded'].includes(order.payment_status);
     let paymentStatus = order.payment_status;
     let cashPaise = 0;
     if (cod) {
