@@ -363,9 +363,9 @@ router.get(
       (byCat[key] = byCat[key] || []).push(it);
     }
     const photos = await db.query(
-      `SELECT photo_url, food_rating, created_at FROM ratings
-       WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND photo_url IS NOT NULL
-       ORDER BY created_at DESC LIMIT 12`,
+      `SELECT photo_url, food_rating, comment, created_at FROM ratings
+       WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND (photo_url IS NOT NULL OR comment IS NOT NULL)
+       ORDER BY created_at DESC LIMIT 20`,
       [restaurant.id]
     );
     const dLat = parseFloat(req.query.lat);
