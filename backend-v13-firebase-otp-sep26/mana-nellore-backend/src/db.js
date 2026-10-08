@@ -140,6 +140,10 @@ async function migrate() {
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_note text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS no_cutlery boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS tip_paise int NOT NULL DEFAULT 0');
+  // Post-delivery rider tip (added by the customer after delivery; 100% goes
+  // to the rider). Kept separate from tip_paise (pre-order checkout tip).
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS post_tip_paise int NOT NULL DEFAULT 0');
+  await q('ALTER TABLE rider_payouts ADD COLUMN IF NOT EXISTS tip_paise int NOT NULL DEFAULT 0');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_name text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_phone text');
   // On-the-way grouping (anti-scam): which orders belong to a multi-restaurant

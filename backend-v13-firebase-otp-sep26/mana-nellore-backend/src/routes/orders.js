@@ -1372,6 +1372,78 @@ router.post(
   })
 );
 
+// POST /api/orders/:id/tip { tip_paise, idempotency_key? }
+// Post-delivery rider tip. 100% goes to the rider — no platform cut.
+// One tip per order. The tip is credited to the rider's payout immediately;
+// money collection from the customer flows through Razorpay once live
+// (payment_pending in the response while RAZORPAY_KEY_ID is unset).
+router.post(
+  '/:id/tip',
+  idempotency('orders:tip'),
+  ah(async (req, res) => {
+    const tipPaise = Math.round(Number(req.body.tip_paise) || 0);
+    if (!Number.isInteger(tipPaise) || tipPaise < 1000 || tipPaise > 50000) {
+      return res.status(400).json({ error: 'Tip must be between ₹10 and ₹500' });
+    }
+    const { rows } = await db.query(
+      'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
+      [req.params.id, req.user.id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status !== 'delivered') {
+      return res.status(409).json({ error: 'You can tip only delivered orders' });
+    }
+    if (!order.rider_id) {
+      return res.status(409).json({ error: 'No rider on this order' });
+    }
+    if (Number(order.post_tip_paise || 0) > 0) {
+      return res.status(409).json({ error: 'Tip already added for this order' });
+    }
+    await db.query('BEGIN');
+    try {
+      const upd = await db.query(
+        'UPDATE orders SET post_tip_paise = $1 WHERE id = $2 AND post_tip_paise = 0',
+        [tipPaise, order.id]
+      );
+      if (upd.rowCount === 0) {
+        await db.query('ROLLBACK');
+        return res.status(409).json({ error: 'Tip already added for this order' });
+      }
+      // 100% to the rider: bump the tip column on their payout row.
+      // The payout row is created at delivery; upsert defensively.
+      await db.query(
+        `INSERT INTO rider_payouts (rider_id, order_id, amount_paise, tip_paise)
+         VALUES ($1, $2, 0, $3)
+         ON CONFLICT (order_id) DO UPDATE SET tip_paise = rider_payouts.tip_paise + EXCLUDED.tip_paise`,
+        [order.rider_id, order.id, tipPaise]
+      );
+      await db.query('COMMIT');
+    } catch (e) {
+      await db.query('ROLLBACK');
+      throw e;
+    }
+    // Tell the rider — their app polls /api/rider/notifications every 30s.
+    try {
+      const rp = await db.query('SELECT user_id FROM riders WHERE id = $1', [order.rider_id]);
+      if (rp.rows[0]) {
+        await notify(
+          rp.rows[0].user_id,
+          'You got a tip! 🎉',
+          `Your customer added a ₹${(tipPaise / 100).toFixed(0)} tip for order #${String(order.id).slice(0, 8)}.`
+        );
+      }
+    } catch (e) {
+      console.error('tip notify failed:', e.message);
+    }
+    res.json({
+      ok: true,
+      tip_paise: tipPaise,
+      payment_pending: !process.env.RAZORPAY_KEY_ID
+    });
+  })
+);
+
 // POST /api/orders/:id/report { type, notes? } — one-tap issue report
 // on a delivered order. Creates a support ticket for the ops team; no automatic
 // credits — every case is reviewed by a human.
