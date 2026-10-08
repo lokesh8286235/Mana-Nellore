@@ -174,6 +174,15 @@ CREATE TABLE IF NOT EXISTS orders (
   scheduled_for timestamptz,
   pre_accepted boolean NOT NULL DEFAULT false
 );
+CREATE TABLE IF NOT EXISTS restaurant_photos (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  restaurant_id uuid NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  photo_url text NOT NULL,
+  caption text,
+  sort_order int NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_rest_photos_rest ON restaurant_photos(restaurant_id);
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_restaurant ON orders(restaurant_id);
 CREATE INDEX IF NOT EXISTS idx_orders_rest_status ON orders(restaurant_id, status);

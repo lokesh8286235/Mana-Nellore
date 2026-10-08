@@ -362,6 +362,11 @@ router.get(
       const key = it.category_id || 'uncategorized';
       (byCat[key] = byCat[key] || []).push(it);
     }
+    const gallery = await db.query(
+      `SELECT photo_url, caption FROM restaurant_photos
+       WHERE restaurant_id = $1 ORDER BY sort_order ASC, created_at DESC`,
+      [restaurant.id]
+    );
     const photos = await db.query(
       `SELECT photo_url, food_rating, comment, created_at FROM ratings
        WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND (photo_url IS NOT NULL OR comment IS NOT NULL)
@@ -402,7 +407,8 @@ router.get(
       },
       categories: cats.rows.map((c) => ({ ...c, items: byCat[c.id] || [] })),
       uncategorized: byCat.uncategorized || [],
-      review_photos: photos.rows
+      review_photos: photos.rows,
+      gallery: gallery.rows
     });
   })
 );

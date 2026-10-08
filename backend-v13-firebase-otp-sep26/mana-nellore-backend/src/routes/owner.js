@@ -700,4 +700,40 @@ router.get(
   })
 );
 
+// GET /api/owner/restaurants/:id/photos — list gallery photos
+router.get(
+  '/restaurants/:id/photos',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT * FROM restaurant_photos WHERE restaurant_id = $1 ORDER BY sort_order ASC, created_at DESC`,
+      [req.params.id]
+    );
+    res.json({ photos: rows });
+  })
+);
+
+// POST /api/owner/restaurants/:id/photos { photo_url, caption? } — add photo
+router.post(
+  '/restaurants/:id/photos',
+  ah(async (req, res) => {
+    const { photo_url, caption } = req.body;
+    if (!photo_url) return res.status(400).json({ error: 'photo_url required' });
+    const { rows } = await db.query(
+      `INSERT INTO restaurant_photos (restaurant_id, photo_url, caption) VALUES ($1, $2, $3) RETURNING *`,
+      [req.params.id, photo_url, caption || null]
+    );
+    res.json({ photo: rows[0] });
+  })
+);
+
+// DELETE /api/owner/restaurants/:id/photos/:photoId — remove photo
+router.delete(
+  '/restaurants/:id/photos/:photoId',
+  ah(async (req, res) => {
+    await db.query(`DELETE FROM restaurant_photos WHERE id = $1 AND restaurant_id = $2`,
+      [req.params.photoId, req.params.id]);
+    res.json({ ok: true });
+  })
+);
+
 module.exports = router;
