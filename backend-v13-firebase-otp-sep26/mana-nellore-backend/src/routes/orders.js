@@ -1158,7 +1158,7 @@ router.get(
       const primaryId = order.otw_role === 'secondary' && order.otw_primary_order_id
         ? String(order.otw_primary_order_id) : String(order.id);
       const g = await db.query(
-        `SELECT o.id, o.status, o.timeline, r.name AS restaurant_name
+        `SELECT o.id, o.status, o.timeline, r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng
          FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
          WHERE (o.id = $1 OR o.otw_primary_order_id = $1) AND o.customer_id = $2
          ORDER BY CASE WHEN o.otw_role = 'primary' THEN 0 ELSE 1 END, o.placed_at ASC, o.id ASC`,
