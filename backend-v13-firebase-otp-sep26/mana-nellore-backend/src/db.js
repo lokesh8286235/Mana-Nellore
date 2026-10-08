@@ -92,6 +92,23 @@ async function migrate() {
   END $$`);
   await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS is_combo boolean NOT NULL DEFAULT false');
   await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS allergens jsonb NOT NULL DEFAULT '[]'");
+  // Dish ratings: aggregated from order food_ratings (each dish in a rated order
+  // gets one "vote" at the order's food_rating). Powers "Recommended dishes".
+  await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS rating_avg numeric NOT NULL DEFAULT 0');
+  await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS rating_count integer NOT NULL DEFAULT 0');
+  // Backfill dish ratings from historical order ratings
+  await q(`UPDATE menu_items mi SET
+             rating_count = sub.cnt,
+             rating_avg = sub.avg
+           FROM (
+             SELECT oi.menu_item_id AS mid, COUNT(*) AS cnt, AVG(r.food_rating)::numeric AS avg
+             FROM ratings r
+             JOIN order_items oi ON oi.order_id = r.order_id
+             WHERE r.ratee_type = 'restaurant' AND r.food_rating IS NOT NULL
+               AND oi.menu_item_id IS NOT NULL
+             GROUP BY oi.menu_item_id
+           ) sub
+           WHERE mi.id = sub.mid`);
 
   // Orders: new lifecycle fields
   await q(`DO $$ BEGIN

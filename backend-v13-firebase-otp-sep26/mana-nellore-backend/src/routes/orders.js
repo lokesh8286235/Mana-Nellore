@@ -1349,6 +1349,24 @@ router.post(
          ) WHERE id = $1`,
         [order.restaurant_id]
       );
+      // Dish-level ratings: each dish in this order gets one vote at the
+      // order's food_rating. Powers "Recommended dishes" (top-rated per restaurant).
+      await db.query(
+        `UPDATE menu_items mi SET
+           rating_count = sub.cnt,
+           rating_avg = sub.avg
+         FROM (
+           SELECT oi.menu_item_id AS mid, COUNT(*) AS cnt, AVG(r.food_rating)::numeric AS avg
+           FROM ratings r
+           JOIN order_items oi ON oi.order_id = r.order_id
+           WHERE r.ratee_type = 'restaurant' AND r.food_rating IS NOT NULL
+             AND oi.menu_item_id IS NOT NULL
+             AND oi.menu_item_id IN (SELECT menu_item_id FROM order_items WHERE order_id = $1)
+           GROUP BY oi.menu_item_id
+         ) sub
+         WHERE mi.id = sub.mid`,
+        [order.id]
+      );
     }
     res.json({ ok: true });
   })
