@@ -1321,126 +1321,77 @@ router.post(
     );
     if (existing.rows[0]) return res.status(409).json({ error: 'Order already rated' });
 
-    await db.query(
-      `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment, photo_url)
-       VALUES ($1,$2,'restaurant',$3,$4,$5,$6,$7)`,
-      [order.id, req.user.id, order.restaurant_id, foodRating, null, comment || null, photo]
-    );
-    if (order.rider_id && deliveryRating != null) {
-      const rp = await db.query('SELECT user_id FROM riders WHERE id = $1', [order.rider_id]);
-      await db.query(
-        `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment)
-         VALUES ($1,$2,'rider',$3,$4,$5,$6)`,
-        [order.id, req.user.id, rp.rows[0].user_id, null, deliveryRating, comment || null]
-      );
-      await db.query(
-        `UPDATE riders SET rating_avg = (
-           SELECT COALESCE(AVG(delivery_rating), 0) FROM ratings
-           WHERE ratee_type = 'rider' AND ratee_id = riders.user_id AND delivery_rating IS NOT NULL
-         ) WHERE id = $1`,
-        [order.rider_id]
-      );
-    }
-    if (foodRating != null) {
-      await db.query(
-        `UPDATE restaurants SET rating_avg = (
-           SELECT COALESCE(AVG(food_rating), 0) FROM ratings
-           WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
-         ) WHERE id = $1`,
-        [order.restaurant_id]
-      );
-      // Dish-level ratings: each dish in this order gets one vote at the
-      // order's food_rating. Powers "Recommended dishes" (top-rated per restaurant).
-      await db.query(
-        `UPDATE menu_items mi SET
-           rating_count = sub.cnt,
-           rating_avg = sub.avg
-         FROM (
-           SELECT oi.menu_item_id AS mid, COUNT(*) AS cnt, AVG(r.food_rating)::numeric AS avg
-           FROM ratings r
-           JOIN order_items oi ON oi.order_id = r.order_id
-           WHERE r.ratee_type = 'restaurant' AND r.food_rating IS NOT NULL
-             AND oi.menu_item_id IS NOT NULL
-             AND oi.menu_item_id IN (SELECT menu_item_id FROM order_items WHERE order_id = $1)
-           GROUP BY oi.menu_item_id
-         ) sub
-         WHERE mi.id = sub.mid`,
-        [order.id]
-      );
-    }
-    res.json({ ok: true });
-  })
-);
+    // Wrap the rating insert + aggregate recalculations in a transaction so
+    // a crash can never leave a rating recorded but aggregates stale.
+    // Each aggregate is a full recalculation from the ratings table (not an
+    // increment), so concurrent raters cannot lose each other's votes — the
+    // last commit simply recomputes from all committed rows.
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const qx = (text, params) => client.query(text, params);
 
-// POST /api/orders/:id/tip { tip_paise, idempotency_key? }
-// Post-delivery rider tip. 100% goes to the rider — no platform cut.
-// One tip per order. The tip is credited to the rider's payout immediately;
-// money collection from the customer flows through Razorpay once live
-// (payment_pending in the response while RAZORPAY_KEY_ID is unset).
-router.post(
-  '/:id/tip',
-  idempotency('orders:tip'),
-  ah(async (req, res) => {
-    const tipPaise = Math.round(Number(req.body.tip_paise) || 0);
-    if (!Number.isInteger(tipPaise) || tipPaise < 1000 || tipPaise > 50000) {
-      return res.status(400).json({ error: 'Tip must be between ₹10 and ₹500' });
-    }
-    const { rows } = await db.query(
-      'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
-      [req.params.id, req.user.id]
-    );
-    const order = rows[0];
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status !== 'delivered') {
-      return res.status(409).json({ error: 'You can tip only delivered orders' });
-    }
-    if (!order.rider_id) {
-      return res.status(409).json({ error: 'No rider on this order' });
-    }
-    if (Number(order.post_tip_paise || 0) > 0) {
-      return res.status(409).json({ error: 'Tip already added for this order' });
-    }
-    await db.query('BEGIN');
-    try {
-      const upd = await db.query(
-        'UPDATE orders SET post_tip_paise = $1 WHERE id = $2 AND post_tip_paise = 0',
-        [tipPaise, order.id]
+      await qx(
+        `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment, photo_url)
+         VALUES ($1,$2,'restaurant',$3,$4,$5,$6,$7)`,
+        [order.id, req.user.id, order.restaurant_id, foodRating, null, comment || null, photo]
       );
-      if (upd.rowCount === 0) {
-        await db.query('ROLLBACK');
-        return res.status(409).json({ error: 'Tip already added for this order' });
-      }
-      // 100% to the rider: bump the tip column on their payout row.
-      // The payout row is created at delivery; upsert defensively.
-      await db.query(
-        `INSERT INTO rider_payouts (rider_id, order_id, amount_paise, tip_paise)
-         VALUES ($1, $2, 0, $3)
-         ON CONFLICT (order_id) DO UPDATE SET tip_paise = rider_payouts.tip_paise + EXCLUDED.tip_paise`,
-        [order.rider_id, order.id, tipPaise]
-      );
-      await db.query('COMMIT');
-    } catch (e) {
-      await db.query('ROLLBACK');
-      throw e;
-    }
-    // Tell the rider — their app polls /api/rider/notifications every 30s.
-    try {
-      const rp = await db.query('SELECT user_id FROM riders WHERE id = $1', [order.rider_id]);
-      if (rp.rows[0]) {
-        await notify(
-          rp.rows[0].user_id,
-          'You got a tip! 🎉',
-          `Your customer added a ₹${(tipPaise / 100).toFixed(0)} tip for order #${String(order.id).slice(0, 8)}.`
+      if (order.rider_id && deliveryRating != null) {
+        const rp = await qx('SELECT user_id FROM riders WHERE id = $1', [order.rider_id]);
+        await qx(
+          `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment)
+           VALUES ($1,$2,'rider',$3,$4,$5,$6)`,
+          [order.id, req.user.id, rp.rows[0].user_id, null, deliveryRating, comment || null]
+        );
+        await qx(
+          `UPDATE riders SET rating_avg = (
+             SELECT COALESCE(AVG(delivery_rating), 0) FROM ratings
+             WHERE ratee_type = 'rider' AND ratee_id = riders.user_id AND delivery_rating IS NOT NULL
+           ) WHERE id = $1`,
+          [order.rider_id]
         );
       }
-    } catch (e) {
-      console.error('tip notify failed:', e.message);
+      if (foodRating != null) {
+        await qx(
+          `UPDATE restaurants SET
+             rating_avg = (
+               SELECT COALESCE(AVG(food_rating), 0) FROM ratings
+               WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
+             ),
+             rating_count = (
+               SELECT COUNT(*) FROM ratings
+               WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
+             )
+           WHERE id = $1`,
+          [order.restaurant_id]
+        );
+        // Dish-level ratings: each dish in this order gets one vote at the
+        // order's food_rating. Powers "Recommended dishes" (top-rated per restaurant).
+        await qx(
+          `UPDATE menu_items mi SET
+             rating_count = sub.cnt,
+             rating_avg = sub.avg
+           FROM (
+             SELECT oi.menu_item_id AS mid, COUNT(*) AS cnt, AVG(r.food_rating)::numeric AS avg
+             FROM ratings r
+             JOIN order_items oi ON oi.order_id = r.order_id
+             WHERE r.ratee_type = 'restaurant' AND r.food_rating IS NOT NULL
+               AND oi.menu_item_id IS NOT NULL
+               AND oi.menu_item_id IN (SELECT menu_item_id FROM order_items WHERE order_id = $1)
+             GROUP BY oi.menu_item_id
+           ) sub
+           WHERE mi.id = sub.mid`,
+          [order.id]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
-    res.json({
-      ok: true,
-      tip_paise: tipPaise,
-      payment_pending: !process.env.RAZORPAY_KEY_ID
-    });
+    res.json({ ok: true });
   })
 );
 

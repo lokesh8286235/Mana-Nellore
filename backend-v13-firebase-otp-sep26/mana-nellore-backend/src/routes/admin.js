@@ -153,7 +153,7 @@ router.get(
       [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    res.json({ restaurant: { ...rows[0], rating_avg: Number(rows[0].rating_avg) } });
+    res.json({ restaurant: { ...rows[0], rating_avg: Number(rows[0].rating_avg), rating_count: Number(rows[0].rating_count) || 0 } });
   })
 );
 

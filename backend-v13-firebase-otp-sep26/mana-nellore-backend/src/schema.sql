@@ -167,9 +167,6 @@ CREATE TABLE IF NOT EXISTS orders (
   delivery_note text,
   no_cutlery boolean NOT NULL DEFAULT false,
   tip_paise int NOT NULL DEFAULT 0,
-  -- Post-delivery rider tip (customer-added after delivery; 100% to rider).
-  -- Separate from tip_paise (pre-order checkout tip).
-  post_tip_paise int NOT NULL DEFAULT 0,
   recipient_name text,
   recipient_phone text,
   -- Scheduled ordering: the customer-chosen delivery time (NULL for ASAP
@@ -204,8 +201,6 @@ CREATE TABLE IF NOT EXISTS rider_payouts (
   rider_id uuid NOT NULL REFERENCES riders(id) ON DELETE CASCADE,
   order_id uuid UNIQUE NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
   amount_paise int NOT NULL,
-  -- Post-delivery tip from the customer; 100% goes to the rider.
-  tip_paise int NOT NULL DEFAULT 0,
   distance_km numeric,
   status text NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','paid')),

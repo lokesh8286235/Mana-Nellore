@@ -112,6 +112,7 @@ router.get(
         description: r.description,
         image_url: r.image_url,
         rating_avg: Number(r.rating_avg),
+        rating_count: Number(r.rating_count) || 0,
         verified: !!r.verified,
         is_open: isOpenNow(r),
         opens_at: r.opens_at,
@@ -193,7 +194,7 @@ router.get(
          WHERE cr.collection_id = $1 AND r.status = 'approved'`,
         [c.id]
       );
-      c.restaurants = rs.rows.map((r) => ({ ...r, rating_avg: Number(r.rating_avg) }));
+      c.restaurants = rs.rows.map((r) => ({ ...r, rating_avg: Number(r.rating_avg), rating_count: Number(r.rating_count) || 0 }));
     }
     res.json({ collections: rows });
   })
@@ -295,6 +296,7 @@ router.get(
         restaurant_id: d.restaurant_id,
         restaurant_name: d.restaurant_name,
         rating_avg: Number(d.rating_avg) || 0,
+        rating_count: Number(d.rating_count) || 0,
       })),
     });
   })
@@ -384,6 +386,7 @@ router.get(
         phone: restaurant.phone,
         image_url: restaurant.image_url,
         rating_avg: Number(restaurant.rating_avg),
+        rating_count: Number(restaurant.rating_count) || 0,
         is_open: isOpenNow(restaurant),
         verified: !!restaurant.verified,
         opens_at: restaurant.opens_at,

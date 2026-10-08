@@ -110,6 +110,21 @@ async function migrate() {
            ) sub
            WHERE mi.id = sub.mid`);
 
+  // Restaurant rating_count: aggregated from order food_ratings. The
+  // restaurants table only had rating_avg; the count powers the "(1.2k)"
+  // display on restaurant cards.
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS rating_count integer NOT NULL DEFAULT 0');
+  // Backfill restaurant rating counts from historical ratings
+  await q(`UPDATE restaurants r SET
+             rating_count = sub.cnt
+           FROM (
+             SELECT ratee_id AS rid, COUNT(*) AS cnt
+             FROM ratings
+             WHERE ratee_type = 'restaurant' AND food_rating IS NOT NULL
+             GROUP BY ratee_id
+           ) sub
+           WHERE r.id = sub.rid`);
+
   // Orders: new lifecycle fields
   await q(`DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'orders' AND column_name = 'promised_at')
@@ -140,10 +155,6 @@ async function migrate() {
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_note text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS no_cutlery boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS tip_paise int NOT NULL DEFAULT 0');
-  // Post-delivery rider tip (added by the customer after delivery; 100% goes
-  // to the rider). Kept separate from tip_paise (pre-order checkout tip).
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS post_tip_paise int NOT NULL DEFAULT 0');
-  await q('ALTER TABLE rider_payouts ADD COLUMN IF NOT EXISTS tip_paise int NOT NULL DEFAULT 0');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_name text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_phone text');
   // On-the-way grouping (anti-scam): which orders belong to a multi-restaurant

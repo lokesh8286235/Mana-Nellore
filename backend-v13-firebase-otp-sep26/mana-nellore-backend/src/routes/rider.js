@@ -1079,7 +1079,7 @@ router.get(
        WHERE rider_id = $1 AND settled = false`, [rider.id]
     );
     const earn = await db.query(
-      `SELECT COALESCE(SUM(amount_paise + tip_paise), 0) AS s FROM rider_payouts
+      `SELECT COALESCE(SUM(amount_paise), 0) AS s FROM rider_payouts
        WHERE rider_id = $1 AND status = 'pending'`, [rider.id]
     );
     const cashInHand = Number(cash.rows[0].s);
@@ -1102,7 +1102,7 @@ router.get(
     const from = req.query.from ? new Date(req.query.from) : new Date(Date.now() - 30 * 864e5);
     const to = req.query.to ? new Date(req.query.to) : new Date();
     const sum = await db.query(
-      `SELECT COALESCE(SUM(amount_paise + tip_paise), 0) AS total_paise, COUNT(*) AS trips
+      `SELECT COALESCE(SUM(amount_paise), 0) AS total_paise, COUNT(*) AS trips
        FROM rider_payouts WHERE rider_id = $1 AND created_at BETWEEN $2 AND $3`,
       [rider.id, from.toISOString(), to.toISOString()]
     );
