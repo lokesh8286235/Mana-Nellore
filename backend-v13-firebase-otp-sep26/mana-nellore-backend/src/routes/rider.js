@@ -311,10 +311,200 @@ router.post(
   })
 );
 
+// ---- Route optimization helpers (Phase 2: v2-insertion solver) ----
+// Shared by GET /route/optimized and POST /deliveries/evaluate.
+const AVG_KMH = 25;   // city riding speed for ETA estimates
+const STOP_MIN = 3;   // per-stop handling time
+const HYSTERESIS_MIN = 3; // keep old sequence unless new one saves >= 3 min
+
+// Build candidate stops from order rows. Same-restaurant pickups merged.
+function buildRouteCandidates(rows, now) {
+  const pickupByRest = new Map();
+  const candidates = [];
+  for (const o of rows) {
+    const pickedUp = o.status === 'picked_up' || o.status === 'on_way';
+    const addr = [o.addr_label, o.line1, o.line2, o.city].filter(Boolean).join(', ');
+    if (!pickedUp && o.rest_lat != null && o.rest_lng != null) {
+      const key = String(o.restaurant_id);
+      if (!pickupByRest.has(key)) {
+        const p = {
+          type: 'pickup', restaurant_id: key,
+          name: o.restaurant_name || 'Restaurant',
+          address: o.restaurant_address || '',
+          lat: Number(o.rest_lat), lng: Number(o.rest_lng),
+          phone: o.restaurant_phone || '', order_ids: [],
+          wait_minutes: 0
+        };
+        pickupByRest.set(key, p);
+        candidates.push(p);
+      }
+      const p = pickupByRest.get(key);
+      p.order_ids.push(String(o.id));
+      const assignedAt = Array.isArray(o.timeline)
+        ? o.timeline.filter(t => String(t.status || '').toLowerCase() === 'rider_assigned').map(t => new Date(t.at).getTime())
+        : [];
+      const latestAssign = assignedAt.length ? Math.max.apply(null, assignedAt) : null;
+      if (latestAssign && now - latestAssign < 5 * 60 * 1000) {
+        p.wait_minutes = Math.max(p.wait_minutes, 5); // give kitchen a few minutes
+      }
+    }
+    if (o.addr_lat != null && o.addr_lng != null) {
+      const deadline = o.eta_at ? new Date(o.eta_at).getTime()
+        : (o.placed_at ? new Date(o.placed_at).getTime() + 45 * 60 * 1000 : null);
+      candidates.push({
+        type: 'dropoff', order_ids: [String(o.id)],
+        name: o.customer_name || 'Customer',
+        address: addr, lat: Number(o.addr_lat), lng: Number(o.addr_lng),
+        phone: o.customer_phone || '',
+        deadline_at: deadline ? new Date(deadline).toISOString() : null,
+        total_paise: o.total_paise
+      });
+    }
+  }
+  return candidates;
+}
+
+function routeStopKey(s) {
+  return s.type + ':' + (s.order_ids || []).join(',');
+}
+
+// Nearest-neighbor sequencing with pickup-before-dropoff constraint and
+// urgency boost. Assigns a human-readable `reason` to every chosen stop.
+function sequenceRouteStops(candidates, rows, cur, now, haversineKm) {
+  const distKm = (a, b) => haversineKm(a.lat, a.lng, b.lat, b.lng);
+  const seq = [];
+  const remaining = candidates.slice();
+  const pickedRestIds = new Set();
+  rows.forEach(o => {
+    if (o.status === 'picked_up' || o.status === 'on_way') pickedRestIds.add(String(o.restaurant_id));
+  });
+  let curPt = cur;
+  if (!curPt && candidates.length) curPt = { lat: candidates[0].lat, lng: candidates[0].lng };
+  let first = true;
+  while (remaining.length) {
+    let best = -1, bestD = Infinity, bestReason = '', bestUrgent = false;
+    remaining.forEach((s, i) => {
+      if (s.type === 'dropoff') {
+        const oid = s.order_ids[0];
+        const o = rows.find(r => String(r.id) === String(oid));
+        const restKey = o ? String(o.restaurant_id) : null;
+        const pickupSeq = seq.some(x => x.type === 'pickup' && x.restaurant_id === restKey);
+        if (restKey && !pickedRestIds.has(restKey) && !pickupSeq) return; // not eligible yet
+      }
+      const d = curPt ? distKm(curPt, s) : 0;
+      let score = d, urgent = false, minsLeft = null;
+      if (s.type === 'dropoff' && s.deadline_at) {
+        minsLeft = (new Date(s.deadline_at).getTime() - now) / 60000;
+        if (minsLeft < 20) { score = d * 0.7; urgent = true; }
+      }
+      if (score < bestD) {
+        bestD = score; best = i; bestUrgent = urgent;
+        if (s.type === 'pickup' && s.order_ids.length > 1) {
+          bestReason = 'Combines ' + s.order_ids.length + ' orders from one restaurant';
+        } else if (urgent) {
+          bestReason = 'Urgent — about ' + Math.max(1, Math.round(minsLeft)) + ' min to deadline';
+        } else if (first) {
+          bestReason = 'Nearest to your current location';
+        } else {
+          bestReason = 'Next stop on the fastest route';
+        }
+      }
+    });
+    if (best < 0) break; // safety: no eligible stop (should not happen)
+    const next = remaining.splice(best, 1)[0];
+    next.reason = bestReason;
+    seq.push(next);
+    curPt = { lat: next.lat, lng: next.lng };
+    if (next.type === 'pickup') pickedRestIds.add(next.restaurant_id);
+    first = false;
+  }
+  return { seq, startPt: cur };
+}
+
+// Compute per-leg distance and minutes. Prefers Google Distance Matrix when a
+// key is available; falls back to haversine silently.
+async function computeRouteLegs(seq, startPt, gkey, haversineKm) {
+  const legKm = [], legMinutes = [];
+  for (let i = 0; i < seq.length; i++) {
+    const from = i === 0 ? startPt : { lat: seq[i - 1].lat, lng: seq[i - 1].lng };
+    const km = from ? Math.round(haversineKm(from.lat, from.lng, seq[i].lat, seq[i].lng) * 10) / 10 : 0;
+    legKm.push(km);
+    legMinutes.push((km / AVG_KMH) * 60 + STOP_MIN);
+  }
+  let trafficAware = false;
+  if (gkey && seq.length > 1 && startPt) {
+    try {
+      const pts = [startPt].concat(seq.map(s => ({ lat: s.lat, lng: s.lng })));
+      const joined = pts.map(p => p.lat + ',' + p.lng).join('|');
+      const url = 'https://maps.googleapis.com/maps/api/distancematrix/json?units=metric&mode=driving'
+        + '&origins=' + encodeURIComponent(joined)
+        + '&destinations=' + encodeURIComponent(joined)
+        + '&key=' + encodeURIComponent(gkey);
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 4000);
+      const r = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(t);
+      const dm = await r.json();
+      if (dm.status === 'OK' && Array.isArray(dm.rows)) {
+        const dmLegs = [];
+        for (let i = 0; i < seq.length; i++) {
+          const el = dm.rows[i] && dm.rows[i].elements && dm.rows[i].elements[i + 1];
+          if (el && el.status === 'OK' && el.duration && el.distance) {
+            dmLegs.push({ minutes: Math.round(el.duration.value / 60) + STOP_MIN, km: Math.round(el.distance.value / 100) / 10 });
+          } else { dmLegs.push(null); }
+        }
+        if (dmLegs.every(Boolean)) {
+          for (let i = 0; i < seq.length; i++) { legMinutes[i] = dmLegs[i].minutes; legKm[i] = dmLegs[i].km; }
+          trafficAware = true;
+        }
+      }
+    } catch (e) { /* fall back to haversine ETAs */ }
+  }
+  return { legKm, legMinutes, trafficAware };
+}
+
+function assembleRouteStops(seq, legKm, legMinutes, now) {
+  let cumMin = 0, totalKm = 0;
+  const stops = seq.map((s, i) => {
+    cumMin += legMinutes[i] || 0;
+    totalKm += legKm[i] || 0;
+    const stop = {
+      sequence: i + 1,
+      type: s.type,
+      order_ids: s.order_ids,
+      name: s.name,
+      address: s.address,
+      phone: s.phone,
+      lat: s.lat, lng: s.lng,
+      leg_km: legKm[i],
+      eta_minutes: Math.round(cumMin),
+      wait_minutes: s.wait_minutes || 0,
+      reason: s.reason || 'Next stop on the fastest route'
+    };
+    if (s.type === 'dropoff') {
+      stop.deadline_at = s.deadline_at;
+      stop.at_risk = !!(s.deadline_at && (now + cumMin * 60000) > new Date(s.deadline_at).getTime());
+    }
+    return stop;
+  });
+  return { stops, totalKm: Math.round(totalKm * 10) / 10, totalMinutes: Math.round(cumMin) };
+}
+
+async function ensureRouteCacheTable(db) {
+  await db.query(
+    `CREATE TABLE IF NOT EXISTS route_optimization_cache (
+       rider_id UUID PRIMARY KEY,
+       order_set_key TEXT NOT NULL,
+       stop_set_key TEXT NOT NULL,
+       seq_key TEXT NOT NULL,
+       total_minutes REAL NOT NULL,
+       updated_at TIMESTAMPTZ DEFAULT now()
+     )`
+  );
+}
+
 // GET /api/rider/route/optimized?lat=&lng= — optimal stop sequence for active deliveries.
-// Groups same-restaurant pickups, orders stops to minimize travel (nearest-neighbor
-// with pickup-before-dropoff), factors prep waits and delivery deadlines.
-// Uses Google Distance Matrix for ETAs when GOOGLE_MAPS_KEY is set, else haversine.
+// Phase 2: explainable reasons, solver version tag, 3-min hysteresis via cache.
 router.get(
   '/route/optimized',
   ah(async (req, res) => {
@@ -325,9 +515,10 @@ router.get(
       rlat = rider.lat != null ? Number(rider.lat) : null;
       rlng = rider.lng != null ? Number(rider.lng) : null;
     }
+    await ensureRouteCacheTable(db);
 
     const { rows } = await db.query(
-      `SELECT o.id, o.status, o.restaurant_id, o.placed_at, o.eta_at, o.total_paise,
+      `SELECT o.id, o.status, o.restaurant_id, o.placed_at, o.eta_at, o.total_paise, o.timeline,
               r.name AS restaurant_name, r.address AS restaurant_address,
               r.lat AS rest_lat, r.lng AS rest_lng, r.phone AS restaurant_phone,
               a.label AS addr_label, a.line1, a.line2, a.city,
@@ -341,166 +532,186 @@ router.get(
        ORDER BY o.placed_at ASC LIMIT 3`,
       [rider.id]
     );
+    const now = Date.now();
     if (!rows.length) {
-      return res.json({ stops: [], total_km: 0, total_minutes: 0, optimized_at: new Date().toISOString() });
+      return res.json({ stops: [], total_km: 0, total_minutes: 0, optimized_at: new Date().toISOString(), solver: 'v2-insertion', hysteresis_applied: false });
     }
 
     const { haversineKm } = require('../lib/pricing');
-    const AVG_KMH = 25;   // city riding speed for ETA estimates
-    const STOP_MIN = 3;   // per-stop handling time
-    const now = Date.now();
-
-    // Build candidate stops. Pickup needed while status is 'ready' (not yet picked up).
-    // Same-restaurant pickups are merged into one stop covering several orders.
-    const pickupByRest = new Map();
-    const candidates = [];
-    for (const o of rows) {
-      const pickedUp = o.status === 'picked_up' || o.status === 'on_way';
-      const addr = [o.addr_label, o.line1, o.line2, o.city].filter(Boolean).join(', ');
-      if (!pickedUp && o.rest_lat != null && o.rest_lng != null) {
-        const key = String(o.restaurant_id);
-        if (!pickupByRest.has(key)) {
-          const p = {
-            type: 'pickup', restaurant_id: key,
-            name: o.restaurant_name || 'Restaurant',
-            address: o.restaurant_address || '',
-            lat: Number(o.rest_lat), lng: Number(o.rest_lng),
-            phone: o.restaurant_phone || '', order_ids: [],
-            // prep wait: recently-assigned orders may still be packing
-            wait_minutes: 0
-          };
-          pickupByRest.set(key, p);
-          candidates.push(p);
-        }
-        const p = pickupByRest.get(key);
-        p.order_ids.push(o.id);
-        const assignedAt = Array.isArray(o.timeline)
-          ? o.timeline.filter(t => String(t.status || '').toLowerCase() === 'rider_assigned').map(t => new Date(t.at).getTime())
-          : [];
-        const latestAssign = assignedAt.length ? Math.max.apply(null, assignedAt) : null;
-        if (latestAssign && now - latestAssign < 5 * 60 * 1000) {
-          p.wait_minutes = Math.max(p.wait_minutes, 5); // give kitchen a few minutes
-        }
-      }
-      if (o.addr_lat != null && o.addr_lng != null) {
-        const deadline = o.eta_at ? new Date(o.eta_at).getTime()
-          : (o.placed_at ? new Date(o.placed_at).getTime() + 45 * 60 * 1000 : null);
-        candidates.push({
-          type: 'dropoff', order_ids: [o.id],
-          name: o.customer_name || 'Customer',
-          address: addr, lat: Number(o.addr_lat), lng: Number(o.addr_lng),
-          phone: o.customer_phone || '',
-          deadline_at: deadline ? new Date(deadline).toISOString() : null,
-          total_paise: o.total_paise
-        });
-      }
-    }
-
-    // Nearest-neighbor sequencing with pickup-before-dropoff constraint.
-    const distKm = (a, b) => haversineKm(a.lat, a.lng, b.lat, b.lng);
-    const seq = [];
-    const remaining = candidates.slice();
-    // dropoff is eligible only when its order's pickup is done (picked up already or sequenced)
-    const pickedRestIds = new Set();
-    rows.forEach(o => {
-      if (o.status === 'picked_up' || o.status === 'on_way') pickedRestIds.add(String(o.restaurant_id));
-    });
-    let cur = (rlat != null && rlng != null) ? { lat: rlat, lng: rlng } : null;
-    // If rider location unknown, start from the oldest order's restaurant
-    if (!cur && candidates.length) cur = { lat: candidates[0].lat, lng: candidates[0].lng };
-    while (remaining.length) {
-      let best = -1, bestD = Infinity;
-      remaining.forEach((s, i) => {
-        if (s.type === 'dropoff') {
-          // pickup must come first: order's restaurant pickup sequenced or already picked up
-          const oid = s.order_ids[0];
-          const o = rows.find(r => String(r.id) === String(oid));
-          const restKey = o ? String(o.restaurant_id) : null;
-          const pickupSeq = seq.some(x => x.type === 'pickup' && x.restaurant_id === restKey);
-          if (restKey && !pickedRestIds.has(restKey) && !pickupSeq) return; // not eligible yet
-        }
-        const d = cur ? distKm(cur, s) : 0;
-        // urgency boost: dropoffs nearing deadline jump the queue slightly
-        let score = d;
-        if (s.type === 'dropoff' && s.deadline_at) {
-          const minsLeft = (new Date(s.deadline_at).getTime() - now) / 60000;
-          if (minsLeft < 20) score = d * 0.7;
-        }
-        if (score < bestD) { bestD = score; best = i; }
-      });
-      if (best < 0) break; // safety: no eligible stop (should not happen)
-      const next = remaining.splice(best, 1)[0];
-      next.leg_km = cur ? Math.round(distKm(cur, next) * 10) / 10 : 0;
-      seq.push(next);
-      cur = { lat: next.lat, lng: next.lng };
-      if (next.type === 'pickup') pickedRestIds.add(next.restaurant_id);
-    }
-
-    // ETAs: prefer Google Distance Matrix drive times when key is available.
-    let legMinutes = seq.map(s => (s.leg_km / AVG_KMH) * 60 + STOP_MIN);
     const gkey = process.env.GOOGLE_MAPS_KEY;
-    if (gkey && seq.length > 1 && rlat != null && rlng != null) {
-      try {
-        const pts = [{ lat: rlat, lng: rlng }].concat(seq.map(s => ({ lat: s.lat, lng: s.lng })));
-        const origins = pts.map(p => p.lat + ',' + p.lng).join('|');
-        const url = 'https://maps.googleapis.com/maps/api/distancematrix/json?units=metric&mode=driving'
-          + '&origins=' + encodeURIComponent(origins)
-          + '&destinations=' + encodeURIComponent(origins)
-          + '&key=' + encodeURIComponent(gkey);
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), 4000);
-        const r = await fetch(url, { signal: ctrl.signal });
-        clearTimeout(t);
-        const dm = await r.json();
-        if (dm.status === 'OK' && Array.isArray(dm.rows)) {
-          const dmLegs = [];
-          for (let i = 0; i < seq.length; i++) {
-            const el = dm.rows[i] && dm.rows[i].elements && dm.rows[i].elements[i + 1];
-            if (el && el.status === 'OK' && el.duration && el.distance) {
-              dmLegs.push({
-                minutes: Math.round(el.duration.value / 60) + STOP_MIN,
-                km: Math.round(el.distance.value / 100) / 10
-              });
-            } else { dmLegs.push(null); }
-          }
-          if (dmLegs.every(Boolean)) {
-            legMinutes = dmLegs.map(l => l.minutes);
-            dmLegs.forEach((l, i) => { seq[i].leg_km = l.km; });
-          }
+    const candidates = buildRouteCandidates(rows, now);
+    const cur = (rlat != null && rlng != null) ? { lat: rlat, lng: rlng } : null;
+    const { seq, startPt } = sequenceRouteStops(candidates, rows, cur, now, haversineKm);
+
+    const orderSetKey = rows.map(o => String(o.id)).sort().join(',');
+    const stopSetKey = seq.map(routeStopKey).sort().join('|');
+    const freshSeqKey = seq.map(routeStopKey).join('|');
+
+    // Hysteresis: if the stop set is unchanged and the new sequence saves less
+    // than 3 minutes, keep the previous order (prevents route flip-flopping).
+    let hysteresisApplied = false;
+    let finalSeq = seq;
+    const cached = await db.query('SELECT * FROM route_optimization_cache WHERE rider_id = $1', [rider.id]);
+    const c = cached.rows[0];
+    if (c && c.order_set_key === orderSetKey && c.stop_set_key === stopSetKey && c.seq_key !== freshSeqKey) {
+      const saved = Number(c.total_minutes);
+      // compute fresh total with haversine legs only (cheap preview for the comparison)
+      const previewLegs = await computeRouteLegs(seq, startPt, null, haversineKm);
+      const previewTotal = previewLegs.legMinutes.reduce((a, b) => a + b, 0);
+      if ((saved - previewTotal) < HYSTERESIS_MIN) {
+        // Reorder fresh stops into the cached sequence.
+        const byKey = new Map(seq.map(s => [routeStopKey(s), s]));
+        const reordered = c.seq_key.split('|').map(k => byKey.get(k)).filter(Boolean);
+        if (reordered.length === seq.length) {
+          finalSeq = reordered;
+          hysteresisApplied = true;
         }
-      } catch (e) { /* fall back to haversine ETAs */ }
+      }
     }
 
-    // Assemble response with cumulative ETAs
-    let cumMin = 0, totalKm = 0;
-    const stops = seq.map((s, i) => {
-      cumMin += legMinutes[i] || 0;
-      totalKm += s.leg_km || 0;
-      const stop = {
-        sequence: i + 1,
-        type: s.type,
-        order_ids: s.order_ids,
-        name: s.name,
-        address: s.address,
-        phone: s.phone,
-        lat: s.lat, lng: s.lng,
-        leg_km: s.leg_km,
-        eta_minutes: Math.round(cumMin),
-        wait_minutes: s.wait_minutes || 0
-      };
-      if (s.type === 'dropoff') {
-        stop.deadline_at = s.deadline_at;
-        stop.at_risk = !!(s.deadline_at && (now + cumMin * 60000) > new Date(s.deadline_at).getTime());
-      }
-      return stop;
-    });
+    const { legKm, legMinutes, trafficAware } = await computeRouteLegs(finalSeq, startPt, gkey, haversineKm);
+    const { stops, totalKm, totalMinutes } = assembleRouteStops(finalSeq, legKm, legMinutes, now);
+
+    await db.query(
+      `INSERT INTO route_optimization_cache (rider_id, order_set_key, stop_set_key, seq_key, total_minutes, updated_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (rider_id) DO UPDATE SET order_set_key = $2, stop_set_key = $3, seq_key = $4, total_minutes = $5, updated_at = now()`,
+      [rider.id, orderSetKey, stopSetKey, finalSeq.map(routeStopKey).join('|'), totalMinutes]
+    );
 
     res.json({
       stops,
-      total_km: Math.round(totalKm * 10) / 10,
-      total_minutes: Math.round(cumMin),
+      total_km: totalKm,
+      total_minutes: totalMinutes,
       optimized_at: new Date().toISOString(),
-      traffic_aware: !!gkey
+      traffic_aware: trafficAware,
+      solver: 'v2-insertion',
+      hysteresis_applied: hysteresisApplied
+    });
+  })
+);
+
+// POST /api/rider/deliveries/evaluate { order_ids: [] } — batch efficiency scoring.
+// Answers: would accepting these orders improve Rs/hr without risking deadlines?
+router.post(
+  '/deliveries/evaluate',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    await db.query(
+      `CREATE TABLE IF NOT EXISTS batch_evaluations (
+         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+         rider_id UUID NOT NULL,
+         order_ids UUID[] NOT NULL,
+         score INT,
+         recommendation TEXT,
+         projected_rs_per_hr REAL,
+         created_at TIMESTAMPTZ DEFAULT now()
+       )`
+    );
+    const ids = Array.isArray(req.body.order_ids) ? req.body.order_ids.filter(Boolean) : [];
+    if (!ids.length) return res.status(400).json({ error: 'order_ids required' });
+    if (ids.length > 3) return res.status(400).json({ error: 'Evaluate at most 3 orders at once' });
+
+    const { haversineKm, riderPayoutPaise, loadPricingConfig } = require('../lib/pricing');
+    const config = await loadPricingConfig(db);
+    const now = Date.now();
+
+    const orderCols = `o.id, o.status, o.rider_id, o.restaurant_id, o.placed_at, o.eta_at, o.timeline,
+      r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
+      a.lat AS addr_lat, a.lng AS addr_lng,
+      u.name AS customer_name`;
+    const { rows: candRows } = await db.query(
+      `SELECT ${orderCols} FROM orders o
+       JOIN restaurants r ON r.id = o.restaurant_id
+       LEFT JOIN addresses a ON a.id = o.address_id
+       JOIN users u ON u.id = o.customer_id
+       WHERE o.id = ANY($1)`, [ids]);
+    const dec = await db.query(
+      'SELECT order_id FROM rider_declines WHERE rider_id = $1 AND order_id = ANY($2)',
+      [rider.id, ids]);
+    const declinedSet = new Set(dec.rows.map(r => String(r.order_id)));
+    const eligible = candRows.filter(o => o.status === 'ready' && !o.rider_id && !declinedSet.has(String(o.id)));
+    const ineligible = ids.filter(id => !eligible.some(o => String(o.id) === String(id)));
+
+    const { rows: actRows } = await db.query(
+      `SELECT ${orderCols} FROM orders o
+       JOIN restaurants r ON r.id = o.restaurant_id
+       LEFT JOIN addresses a ON a.id = o.address_id
+       JOIN users u ON u.id = o.customer_id
+       WHERE o.rider_id = $1 AND o.status NOT IN ('delivered','cancelled')`, [rider.id]);
+
+    const payoutFor = (o) => {
+      if (o.rest_lat != null && o.rest_lng != null && o.addr_lat != null && o.addr_lng != null) {
+        const km = haversineKm(o.rest_lat, o.rest_lng, o.addr_lat, o.addr_lng);
+        return { payout: riderPayoutPaise(config.riderPayout, km), km };
+      }
+      return { payout: 3000, km: 0 };
+    };
+
+    // Simulate a batch: sequence stops, sum payout and minutes, count deadline risks.
+    const simulate = (orderRows) => {
+      const rows = orderRows.map(o => Object.assign({}, o));
+      const candidates = buildRouteCandidates(rows, now);
+      const rlat = rider.lat != null ? Number(rider.lat) : null;
+      const rlng = rider.lng != null ? Number(rider.lng) : null;
+      const cur = (Number.isFinite(rlat) && Number.isFinite(rlng)) ? { lat: rlat, lng: rlng } : null;
+      const { seq, startPt } = sequenceRouteStops(candidates, rows, cur, now, haversineKm);
+      let minutes = 0, km = 0, payout = 0, atRisk = 0;
+      let pt = startPt;
+      const perOrder = new Map();
+      rows.forEach(o => { const p = payoutFor(o); perOrder.set(String(o.id), p); payout += p.payout; });
+      seq.forEach(s => {
+        const from = pt || { lat: s.lat, lng: s.lng };
+        const legKm = haversineKm(from.lat, from.lng, s.lat, s.lng);
+        km += legKm;
+        minutes += (legKm / AVG_KMH) * 60 + STOP_MIN;
+        if (s.type === 'dropoff' && s.deadline_at) {
+          if (now + minutes * 60000 > new Date(s.deadline_at).getTime()) atRisk++;
+        }
+        pt = { lat: s.lat, lng: s.lng };
+      });
+      return { minutes, km, payout, atRisk, orderCount: rows.length };
+    };
+
+    const current = simulate(actRows);
+    const projected = simulate(actRows.concat(eligible));
+    const curRate = current.minutes > 0 ? (current.payout / 100) / (current.minutes / 60) : 0;
+    const projRate = projected.minutes > 0 ? (projected.payout / 100) / (projected.minutes / 60) : 0;
+
+    const reasons = [];
+    if (ineligible.length) reasons.push(ineligible.length + ' order(s) no longer available');
+    if (actRows.length + eligible.length > 3) reasons.push('Would exceed the 3-delivery limit');
+    if (projected.atRisk > current.atRisk) reasons.push((projected.atRisk - current.atRisk) + ' deliverie(s) would risk missing deadlines');
+    if (eligible.length && projRate < curRate * 0.95) reasons.push('Lowers your Rs/hr from ' + Math.round(curRate) + ' to ' + Math.round(projRate));
+    if (eligible.length && projRate >= curRate) reasons.push('Improves Rs/hr from ' + Math.round(curRate) + ' to ' + Math.round(projRate));
+
+    let recommendation = 'decline';
+    if (eligible.length && !ineligible.length && actRows.length + eligible.length <= 3
+        && projected.atRisk === current.atRisk && projRate >= curRate * 0.95) {
+      recommendation = 'accept';
+    }
+    const score = Math.max(0, Math.min(100, Math.round(
+      50 + (projRate - curRate) * 2 - (projected.atRisk - current.atRisk) * 25 - ineligible.length * 30
+    )));
+
+    await db.query(
+      'INSERT INTO batch_evaluations (rider_id, order_ids, score, recommendation, projected_rs_per_hr) VALUES ($1, $2, $3, $4, $5)',
+      [rider.id, eligible.map(o => o.id), score, recommendation, Math.round(projRate * 10) / 10]
+    );
+
+    res.json({
+      score,
+      recommendation,
+      reasons,
+      current_rs_per_hr: Math.round(curRate * 10) / 10,
+      projected_rs_per_hr: Math.round(projRate * 10) / 10,
+      total_minutes: Math.round(projected.minutes),
+      total_earnings_paise: Math.round(projected.payout),
+      total_km: Math.round(projected.km * 10) / 10,
+      eligible_order_ids: eligible.map(o => String(o.id)),
+      ineligible_order_ids: ineligible.map(String),
+      at_risk_deliveries: projected.atRisk
     });
   })
 );
