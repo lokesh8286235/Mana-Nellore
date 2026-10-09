@@ -190,6 +190,68 @@ router.get(
   })
 );
 
+
+// GET /api/restaurants/on-the-way?from_lat=&from_lng=&to_lat=&to_lng=&primary_id=
+// Returns approved restaurants within 1km of the straight line from the
+// primary restaurant (X) to the delivery address (Z), sorted by position along
+// the route. Used for the "On your way" multi-restaurant checkout.
+router.get(
+  '/on-the-way',
+  ah(async (req, res) => {
+    const fromLat = Number(req.query.from_lat);
+    const fromLng = Number(req.query.from_lng);
+    const toLat = Number(req.query.to_lat);
+    const toLng = Number(req.query.to_lng);
+    if (![fromLat, fromLng, toLat, toLng].every((n) => Number.isFinite(n))) {
+      return res.status(400).json({ error: 'from_lat, from_lng, to_lat, to_lng are required' });
+    }
+    const primaryId = req.query.primary_id ? String(req.query.primary_id) : null;
+
+    // Equirectangular projection (good enough for <15km): x = lng*cos(lat), y = lat
+    const meanLat = ((fromLat + toLat) / 2) * Math.PI / 180;
+    const kx = 111.32 * Math.cos(meanLat); // km per degree lng
+    const ky = 110.57; // km per degree lat
+    const ax = fromLng * kx, ay = fromLat * ky;
+    const bx = toLng * kx, by = toLat * ky;
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+
+    function proj(px, py) {
+      if (len2 === 0) return { t: 0, dist: Math.hypot(px - ax, py - ay) };
+      const t = ((px - ax) * dx + (py - ay) * dy) / len2;
+      const tc = Math.max(0, Math.min(1, t));
+      const cx = ax + tc * dx, cy = ay + tc * dy;
+      return { t: tc, dist: Math.hypot(px - cx, py - cy) };
+    }
+
+    const { rows } = await db.query(
+      `SELECT id, name, photo_url, image_url, lat, lng, is_open, rating, delivery_time_min
+       FROM restaurants
+       WHERE status = 'approved' AND lat IS NOT NULL AND lng IS NOT NULL`
+    );
+    const out = [];
+    for (const r of rows) {
+      if (primaryId && String(r.id) === primaryId) continue;
+      const pr = proj(Number(r.lng) * kx, Number(r.lat) * ky);
+      if (pr.dist <= 1.0) {
+        out.push({
+          id: r.id,
+          name: r.name,
+          photo_url: r.photo_url,
+          image_url: r.image_url,
+          is_open: !!r.is_open,
+          rating: r.rating,
+          delivery_time_min: r.delivery_time_min,
+          route_dist_km: Math.round(pr.dist * 100) / 100,
+          route_pos: Math.round(pr.t * 1000) / 1000
+        });
+      }
+    }
+    out.sort((a, b) => a.route_pos - b.route_pos);
+    res.json({ restaurants: out.slice(0, 20) });
+  })
+);
+
 // GET /api/restaurants/:id -> restaurant + categories + available menu items
 router.get(
   '/:id',

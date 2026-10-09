@@ -138,16 +138,86 @@ router.post(
       commissionPct: restaurant.commission_pct
     });
 
+    // Multi-restaurant on-the-way quote: group items by restaurant_id (item-level),
+    // primary = cart.restaurant_id (100% fee), others = 20% of their own normal fee.
+    let groupsOut = null;
+    if (!dineIn) {
+      const byRest = {};
+      for (const it of items) {
+        const rid = String(it.restaurant_id || restaurant_id);
+        (byRest[rid] = byRest[rid] || []).push(it);
+      }
+      const rids = Object.keys(byRest);
+      if (rids.length > 1) {
+        const primaryRid = String(restaurant_id);
+        const ordered = [primaryRid, ...rids.filter((r) => r !== primaryRid)];
+        const rAll = await db.query(
+          "SELECT id, lat, lng, commission_pct FROM restaurants WHERE id = ANY($1) AND status = 'approved'",
+          [ordered]
+        );
+        const rMap = Object.fromEntries(rAll.rows.map((r) => [String(r.id), r]));
+        groupsOut = [];
+        for (let gi = 0; gi < ordered.length; gi++) {
+          const rid = ordered[gi];
+          const rr = rMap[rid];
+          if (!rr) continue;
+          const gItems = byRest[rid];
+          const gIds = gItems.map((i) => i.menu_item_id);
+          const gmRes = await db.query(
+            'SELECT id, price_paise, available FROM menu_items WHERE id = ANY($1) AND restaurant_id = $2',
+            [gIds, rid]
+          );
+          const gmById = Object.fromEntries(gmRes.rows.map((m) => [m.id, m]));
+          let gSub = 0;
+          for (const it of gItems) {
+            const m = gmById[it.menu_item_id];
+            if (!m || !m.available) continue;
+            gSub += m.price_paise * (Number(it.qty) || 1);
+          }
+          let gDist = null;
+          if (rr.lat != null && rr.lng != null && address.lat != null && address.lng != null) {
+            gDist = haversineKm(Number(rr.lat), Number(rr.lng), Number(address.lat), Number(address.lng));
+          }
+          const gQuote = computeQuote({
+            config,
+            distanceKm: gDist,
+            subtotalPaise: gSub,
+            discountPaise: gi === 0 ? discount : 0,
+            commissionPct: rr.commission_pct
+          });
+          const isPrim = gi === 0;
+          groupsOut.push({
+            restaurant_id: rid,
+            is_primary: isPrim,
+            subtotal_paise: gSub,
+            normal_fee_paise: gQuote.deliveryFeePaise,
+            delivery_fee_paise: isPrim ? gQuote.deliveryFeePaise : Math.round(gQuote.deliveryFeePaise * 0.2),
+            platform_fee_paise: isPrim ? gQuote.platformFeePaise : 0
+          });
+        }
+      }
+    }
+
+    const billDelivery = dineIn ? 0 : quote.deliveryFeePaise;
+    const billPlatform = quote.platformFeePaise;
+    // When groups exist, bill reflects summed per-group fees
+    let totalDelivery = billDelivery, totalPlatform = billPlatform;
+    if (groupsOut) {
+      totalDelivery = groupsOut.reduce((s, g) => s + g.delivery_fee_paise, 0);
+      totalPlatform = groupsOut.reduce((s, g) => s + g.platform_fee_paise, 0);
+    }
+
     res.json({
       bill: {
         subtotal_paise: subtotal,
         discount_paise: discount,
-        delivery_fee_paise: dineIn ? 0 : quote.deliveryFeePaise,
-        platform_fee_paise: quote.platformFeePaise,
+        delivery_fee_paise: dineIn ? 0 : totalDelivery,
+        platform_fee_paise: totalPlatform,
         tax_paise: quote.taxPaise,
         tip_paise: tipPaise,
-        total_paise: (dineIn ? 0 : quote.deliveryFeePaise) + quote.platformFeePaise + tipPaise + (subtotal - discount)
+        total_paise: (dineIn ? 0 : totalDelivery) + totalPlatform + tipPaise + (subtotal - discount)
       },
+      groups: groupsOut,
       coupon_error: couponError,
       eta_minutes: Number(config.etaMinutes) || 30
     });
@@ -155,12 +225,242 @@ router.post(
 );
 
 // POST /api/orders { restaurant_id, address_id?, order_type?, table_id?, items:[{menu_item_id, qty, instructions, customizations}], coupon_code?, payment_method?, delivery_note?, no_cutlery?, tip_paise?, recipient_name?, recipient_phone? }
+
+// POST /api/orders with groups[] — on-the-way multi-restaurant checkout.
+// groups[0] = primary (100% of its own normal delivery fee + platform fee).
+// groups[1..] = secondaries (20% of their OWN normal delivery fee each, platform fee 0).
+// Off-route secondaries are REMOVED (never repriced) and reported in removed_off_route.
+async function placeMultiGroupOrder(req, res) {
+  const { groups, address_id, coupon_code, payment_method,
+          delivery_note, no_cutlery, tip_paise,
+          recipient_name, recipient_phone } = req.body;
+  const OFF_ROUTE_MSG = "You entered a new address, so the cart restaurants are not on the way and can't be delivered.";
+
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Address (delivery only — groups path never handles dine-in)
+    const aRes = await client.query(
+      'SELECT * FROM addresses WHERE id = $1 AND user_id = $2',
+      [address_id, req.user.id]
+    );
+    const address = aRes.rows[0];
+    if (!address) throw { status: 400, message: 'Delivery address not found' };
+
+    // Validate + load all restaurants
+    const restIds = groups.map((g) => g.restaurant_id).filter(Boolean);
+    if (!restIds.length) throw { status: 400, message: 'groups with restaurant_id are required' };
+    const rRes = await client.query(
+      "SELECT * FROM restaurants WHERE id = ANY($1) AND status = 'approved'",
+      [restIds]
+    );
+    const restById = Object.fromEntries(rRes.rows.map((r) => [String(r.id), r]));
+    const primary = restById[String(groups[0].restaurant_id)];
+    if (!primary) throw { status: 404, message: 'Primary restaurant not available' };
+    if (!primary.is_open) throw { status: 400, message: 'Primary restaurant is currently closed' };
+
+    // Route validation: secondary must be within 1km of segment primary->address
+    const removed_off_route = [];
+    const validGroups = [groups[0]];
+    for (let i = 1; i < groups.length; i++) {
+      const g = groups[i];
+      const r = restById[String(g.restaurant_id)];
+      if (!r || !r.is_open) {
+        removed_off_route.push({ restaurant_id: g.restaurant_id, name: (r && r.name) || 'Restaurant', reason: 'unavailable' });
+        continue;
+      }
+      let onRoute = true;
+      if (primary.lat != null && primary.lng != null && address.lat != null && address.lng != null &&
+          r.lat != null && r.lng != null) {
+        const d = otwPointToSegKm(Number(r.lng), Number(r.lat),
+          Number(primary.lng), Number(primary.lat),
+          Number(address.lng), Number(address.lat));
+        onRoute = d <= 1.0;
+      }
+      if (!onRoute) {
+        removed_off_route.push({ restaurant_id: g.restaurant_id, name: r.name, reason: 'off_route' });
+      } else {
+        validGroups.push(g);
+      }
+    }
+
+    const config = await loadPricingConfig(client);
+    const orders = [];
+
+    for (let gi = 0; gi < validGroups.length; gi++) {
+      const g = validGroups[gi];
+      const isPrimary = gi === 0;
+      const restaurant = restById[String(g.restaurant_id)];
+      const items = Array.isArray(g.items) ? g.items : [];
+      if (!items.length) continue;
+
+      // Menu validation + subtotal
+      const ids = items.map((it) => it.menu_item_id);
+      const mRes = await client.query(
+        'SELECT id, name, price_paise, available FROM menu_items WHERE id = ANY($1) AND restaurant_id = $2',
+        [ids, restaurant.id]
+      );
+      const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
+      let subtotal = 0;
+      const snapshots = [];
+      for (const it of items) {
+        const m = menuById[it.menu_item_id];
+        const qty = Number(it.qty);
+        if (!m) throw { status: 400, message: 'A menu item is not from this restaurant' };
+        if (!m.available) throw { status: 400, message: `"${m.name}" is currently unavailable` };
+        if (!Number.isInteger(qty) || qty <= 0) throw { status: 400, message: 'Quantity must be a positive integer' };
+        let custExtra = 0;
+        const custNames = [];
+        if (Array.isArray(it.customizations) && it.customizations.length) {
+          const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
+          if (optIds.length) {
+            const oRes = await client.query(
+              `SELECT o.id, o.name, o.price_paise FROM customization_options o
+               JOIN customization_groups gg ON gg.id = o.group_id
+               WHERE o.id = ANY($1) AND gg.menu_item_id = $2`,
+              [optIds, m.id]
+            );
+            for (const o of oRes.rows) { custExtra += Number(o.price_paise) || 0; custNames.push(o.name); }
+          }
+        }
+        subtotal += (m.price_paise + custExtra) * qty;
+        snapshots.push({
+          menu_item_id: m.id,
+          name_snapshot: m.name + (custNames.length ? ' (' + custNames.join(', ') + ')' : ''),
+          unit_price_paise: m.price_paise + custExtra,
+          qty,
+          instructions: it.instructions || null
+        });
+      }
+
+      // Coupon only on primary
+      let discount = 0;
+      if (isPrimary && coupon_code) {
+        const cRes = await client.query('SELECT * FROM coupons WHERE code = $1 AND active = true',
+          [String(coupon_code).toUpperCase()]);
+        const coupon = cRes.rows[0];
+        const now = new Date();
+        if (coupon && !(coupon.valid_from && new Date(coupon.valid_from) > now) &&
+            !(coupon.valid_to && new Date(coupon.valid_to) < now) &&
+            subtotal >= coupon.min_order_paise) {
+          let studentOk = true;
+          if (coupon.requires_student) {
+            const uRes = await client.query('SELECT is_student FROM users WHERE id = $1', [req.user.id]);
+            studentOk = !!(uRes.rows[0] && uRes.rows[0].is_student);
+          }
+          if (studentOk) {
+            discount = coupon.discount_type === 'flat' ? coupon.value : Math.round((subtotal * coupon.value) / 100);
+            if (coupon.max_discount_paise != null) discount = Math.min(discount, coupon.max_discount_paise);
+            discount = Math.min(discount, subtotal);
+          }
+        }
+      }
+
+      // Fees: primary = 100% of its own normal fee; secondary = 20% of its OWN normal fee, platform 0
+      let distanceKm = null;
+      if (restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
+        distanceKm = haversineKm(Number(restaurant.lat), Number(restaurant.lng), Number(address.lat), Number(address.lng));
+      }
+      const quote = computeQuote({
+        config,
+        distanceKm,
+        subtotalPaise: subtotal,
+        discountPaise: discount,
+        commissionPct: restaurant.commission_pct
+      });
+      const normalFee = quote.deliveryFeePaise;
+      const deliveryFee = isPrimary ? normalFee : Math.round(normalFee * 0.2);
+      const platformFee = isPrimary ? quote.platformFeePaise : 0;
+      const tipPaise = isPrimary ? Math.max(0, Math.round(Number(tip_paise) || 0)) : 0;
+      const finalTotal = (subtotal - discount) + deliveryFee + platformFee + tipPaise;
+
+      const timeline = [{ status: 'placed', at: new Date().toISOString(), by: 'customer' }];
+      const etaMinutes = Number(config.etaMinutes) || 30;
+      const shareToken = require('crypto').randomBytes(6).toString('hex');
+
+      const oRes = await client.query(
+        `INSERT INTO orders
+           (customer_id, restaurant_id, address_id, status, order_type,
+            subtotal_paise, discount_paise, delivery_fee_paise, platform_fee_paise,
+            tax_paise, commission_paise, total_paise, tip_paise,
+            delivery_note, no_cutlery, recipient_name, recipient_phone,
+            payment_method, payment_status, timeline, eta_at, share_token)
+         VALUES ($1,$2,$3,'placed','delivery',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17::jsonb,
+                 now() + ($18 || ' minutes')::interval, $19)
+         RETURNING *`,
+        [req.user.id, restaurant.id, address_id,
+         subtotal, discount, deliveryFee, platformFee,
+         quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
+         delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
+         payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken]
+      );
+      const order = oRes.rows[0];
+      for (const s of snapshots) {
+        await client.query(
+          `INSERT INTO order_items (order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [order.id, s.menu_item_id, s.name_snapshot, s.unit_price_paise, s.qty, s.instructions]
+        );
+      }
+      orders.push({
+        order: { ...order, items: snapshots },
+        group_index: gi,
+        is_primary: isPrimary,
+        delivery_fee_paise: deliveryFee,
+        normal_fee_paise: normalFee,
+        platform_fee_paise: platformFee
+      });
+
+      // Notify this restaurant owner (each sees only its own order)
+      const ownerRes = await client.query('SELECT owner_id FROM restaurants WHERE id = $1', [restaurant.id]);
+      if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
+        await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
+          `Delivery order worth Rs ${(finalTotal / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
+      }
+    }
+
+    await client.query('COMMIT');
+    await notify(req.user.id, 'Order placed ✅', 'Your restaurants got the orders and kitchens are firing up! 🔥');
+
+    res.status(201).json({
+      orders,
+      removed_off_route,
+      off_route_message: removed_off_route.length ? OFF_ROUTE_MSG : null
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// ---- On-the-way helpers ----
+function otwPointToSegKm(px, py, ax, ay, bx, by) {
+  // Equirectangular km projection around mean lat
+  const meanLat = ((ay + by) / 2) * Math.PI / 180;
+  const kx = 111.32 * Math.cos(meanLat), ky = 110.57;
+  const Ax = ax * kx, Ay = ay * ky, Bx = bx * kx, By = by * ky;
+  const Px = px * kx, Py = py * ky;
+  const dx = Bx - Ax, dy = By - Ay;
+  const len2 = dx * dx + dy * dy;
+  if (!len2) return Math.hypot(Px - Ax, Py - Ay);
+  const t = Math.max(0, Math.min(1, ((Px - Ax) * dx + (Py - Ay) * dy) / len2));
+  return Math.hypot(Px - (Ax + t * dx), Py - (Ay + t * dy));
+}
+
 router.post(
   '/',
   ah(async (req, res) => {
     const { restaurant_id, address_id, items, coupon_code, payment_method,
             order_type, table_id, delivery_note, no_cutlery, tip_paise,
-            recipient_name, recipient_phone } = req.body;
+            recipient_name, recipient_phone, groups } = req.body;
+    // Multi-restaurant on-the-way checkout: groups[0] = primary, rest = secondaries.
+    if (Array.isArray(groups) && groups.length > 1 && order_type !== 'dinein') {
+      return await placeMultiGroupOrder(req, res);
+    }
     const dineIn = order_type === 'dinein';
     if (!restaurant_id || !Array.isArray(items) || !items.length) {
       return res.status(400).json({ error: 'restaurant_id and items are required' });
