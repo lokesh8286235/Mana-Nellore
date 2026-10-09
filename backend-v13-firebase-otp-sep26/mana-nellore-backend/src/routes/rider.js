@@ -164,6 +164,7 @@ async function groupStops(primaryId, riderId) {
       primary: o.otw_role !== 'secondary',
       detached: String(o.rider_id || '') !== String(riderId),
       pickup_photo: o.pickup_photo || null,
+      total_paise: o.total_paise,
     });
   }
   return stops;
@@ -331,7 +332,7 @@ async function deliveryDetail(orderId, riderId) {
   if (!order) return null;
   delete order.delivery_otp_hash;
   const stops = await groupStops(primaryId, riderId);
-  const grandTotal = stops.reduce((a, s) => a + (s.items || []).reduce((x, it) => x + Number(it.unit_price_paise || 0) * Number(it.qty || 0), 0), 0);
+  const grandTotal = stops.reduce((a, s) => a + Number(s.total_paise || 0), 0);
   const items = await db.query('SELECT name_snapshot, qty, unit_price_paise FROM order_items WHERE order_id = $1', [order.id]);
   return {
     ...order,
@@ -974,7 +975,7 @@ router.post(
     const order = detail;
     if (order.status !== 'on_way') return res.status(409).json({ error: `Invalid status ${order.status}` });
     const stops = (detail.stops || []).filter((s) => !s.detached && s.status !== 'cancelled');
-    if (stops.some((s) => s.status !== 'picked_up')) {
+    if (stops.some((s) => s.status !== 'picked_up' && s.status !== 'on_way')) {
       return res.status(409).json({ error: 'Pick up every stop before completing the delivery' });
     }
     if (!order.delivery_otp_hash || !(await bcrypt.compare(String(req.body.otp || ''), order.delivery_otp_hash))) {
@@ -982,9 +983,8 @@ router.post(
     }
 
     // Grand total across the group's stops — this is the cash to collect.
-    const grandTotal = stops.reduce(
-      (a, s) => a + (s.items || []).reduce((x, it) => x + Number(it.unit_price_paise || 0) * Number(it.qty || 0), 0), 0
-    ) || Number(order.total_paise || 0);
+    const grandTotal = stops.reduce((a, s) => a + Number(s.total_paise || 0), 0)
+      || Number(order.total_paise || 0);
 
     // Compute combined payout from live pricing config: primary-leg distance
     // payout plus the flat per-extra-stop bonus.
