@@ -978,7 +978,10 @@ router.post(
     if (stops.some((s) => s.status !== 'picked_up' && s.status !== 'on_way')) {
       return res.status(409).json({ error: 'Pick up every stop before completing the delivery' });
     }
-    if (!order.delivery_otp_hash || !(await bcrypt.compare(String(req.body.otp || ''), order.delivery_otp_hash))) {
+    /* deliveryDetail strips delivery_otp_hash — fetch it directly */
+    const otpRow = await db.query('SELECT delivery_otp_hash FROM orders WHERE id = $1', [order.id]);
+    const otpHash = otpRow.rows[0] && otpRow.rows[0].delivery_otp_hash;
+    if (!otpHash || !(await bcrypt.compare(String(req.body.otp || ''), otpHash))) {
       return res.status(400).json({ error: 'Invalid delivery OTP' });
     }
 
