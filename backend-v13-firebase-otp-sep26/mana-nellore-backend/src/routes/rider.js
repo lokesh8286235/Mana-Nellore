@@ -390,10 +390,8 @@ router.get(
     if (activeGroups.rows.some((g) => Number(g.secondary_count) > 0)) {
       return res.json({ deliveries: [], multi_delivery_active: true, on_the_way_filter: false });
     }
-    const anchors = activeGroups.rows
-      .filter((g) => g.rest_lat != null && g.rest_lng != null)
-      .map((g) => ({ lat: Number(g.rest_lat), lng: Number(g.rest_lng) }));
-    const onWayFilter = anchors.length > 0;
+    const anchors = [];
+    const onWayFilter = false; /* TEMP-DISABLED for testing — every order pops up */
     const { rows } = await db.query(
       `SELECT o.id, o.total_paise, o.placed_at, o.payment_method, o.otw_group_size,
               r.id AS rest_id, r.name AS restaurant_name, r.address AS rest_address,
