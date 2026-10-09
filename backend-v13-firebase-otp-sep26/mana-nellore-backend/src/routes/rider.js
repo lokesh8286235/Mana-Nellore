@@ -1058,7 +1058,7 @@ router.post(
       );
     } else {
       await db.query(
-        'UPDATE orders SET delivered_at = now(), payment_status = $1 WHERE id = $3',
+        'UPDATE orders SET delivered_at = now(), payment_status = $1 WHERE id = $2',
         [paymentStatus, order.id]
       );
     }
