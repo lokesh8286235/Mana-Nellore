@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { ah } = require('../lib/async');
+const { ah } = require('../middleware/auth');
 
 /* POST /api/ai/ask — Ask Mana AI via Groq/Llama
    Body: { message, context? }
