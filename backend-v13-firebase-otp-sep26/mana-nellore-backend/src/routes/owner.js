@@ -2,16 +2,13 @@
 // restaurant — an owner can never see or touch another restaurant's data.
 const express = require('express');
 const db = require('../db');
-const { storeImageUrl } = require('../lib/images');
-const { activateDueScheduledOrders } = require('../lib/scheduled');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 
 const router = express.Router();
 router.use(authenticate, requireRole('restaurant_owner'));
 
 async function ownRestaurantId(userId) {
-  // Newest first: an owner test account can hold placeholder restaurants; the live one wins.
-  const { rows } = await db.query('SELECT id FROM restaurants WHERE owner_id = $1 ORDER BY created_at DESC', [userId]);
+  const { rows } = await db.query('SELECT id FROM restaurants WHERE owner_id = $1', [userId]);
   return rows[0] ? rows[0].id : null;
 }
 
@@ -36,24 +33,21 @@ function normSlots(v) {
   return ok.length ? ok : ['all'];
 }
 
-async function notify(dbConn, userId, title, body, data) {
-  await dbConn.query('INSERT INTO notifications (user_id, title, body, data) VALUES ($1, $2, $3, $4)', [
-    userId, title, body, data ? JSON.stringify(data) : null
+async function notify(dbConn, userId, title, body) {
+  await dbConn.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [
+    userId, title, body
   ]);
 }
 
 async function transition(orderId, status, by) {
-  // Single UPDATE with a jsonb append: concurrent transitions can no longer
-  // silently drop each other's timeline entries (read-modify-write race).
+  const { rows } = await db.query('SELECT timeline FROM orders WHERE id = $1', [orderId]);
+  const timeline = rows[0].timeline || [];
+  timeline.push({ status, at: new Date().toISOString(), by });
   // "Packed fresh" stamp: the moment the kitchen taps Ready for pickup
   const packed = status === 'ready' ? ', packed_at = now()' : '';
-  await db.query(
-    `UPDATE orders SET status = $1,
-       timeline = COALESCE(timeline, '[]'::jsonb)
-                || jsonb_build_object('status', $1::text, 'at', $2::text, 'by', $3::text)${packed}
-     WHERE id = $4`,
-    [status, new Date().toISOString(), by, orderId]
-  );
+  await db.query(`UPDATE orders SET status = $1, timeline = $2::jsonb${packed} WHERE id = $3`, [
+    status, JSON.stringify(timeline), orderId
+  ]);
 }
 
 // ---- Restaurant profile ----
@@ -73,7 +67,7 @@ router.post(
          (owner_id, name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at, opens_at_we, closes_at_we)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [req.user.id, name, description || null, address || null, lat || null, lng || null,
-       phone || null, await storeImageUrl(db, image_url), fssai || null, opens_at || null, closes_at || null,
+       phone || null, image_url || null, fssai || null, opens_at || null, closes_at || null,
        opens_at_we || null, closes_at_we || null]
     );
     await seedSuggestedCats(db, rows[0].id);
@@ -100,15 +94,12 @@ router.put(
     if (!id) return;
     const fields = ['name', 'description', 'address', 'lat', 'lng', 'phone', 'image_url', 'fssai',
       'chef_name', 'chef_photo', 'chef_story', 'gstin', 'birthday_dessert',
-      'cuisines', 'is_pure_veg',
       'opens_at', 'closes_at', 'opens_at_we', 'closes_at_we'];
     const sets = [];
     const params = [];
     for (const f of fields) {
       if (req.body[f] !== undefined) {
-        let v = req.body[f];
-        if (f === 'image_url' || f === 'chef_photo') v = await storeImageUrl(db, v);
-        params.push(v);
+        params.push(req.body[f]);
         sets.push(`${f} = $${params.length}`);
       }
     }
@@ -261,12 +252,6 @@ router.post(
     if (!name || price_paise == null) {
       return res.status(400).json({ error: 'Name and price_paise are required' });
     }
-    // Guard against NaN ("abc" -> 22P02 -> misleading 404) and negative prices
-    // (a negative-priced item would shrink the customer's bill at checkout).
-    const pricePaise = Math.round(Number(price_paise));
-    if (!Number.isFinite(pricePaise) || pricePaise < 0) {
-      return res.status(400).json({ error: 'price_paise must be a non-negative number' });
-    }
     if (category_id) {
       const c = await db.query('SELECT id FROM categories WHERE id = $1 AND restaurant_id = $2', [
         category_id, id
@@ -278,8 +263,8 @@ router.post(
          (restaurant_id, category_id, name, description, image_url, price_paise, veg, available, prep_minutes, sort_order,
           meal_slot, is_combo, allergens)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) RETURNING *`,
-      [id, category_id || null, name, description || null, await storeImageUrl(db, image_url),
-       pricePaise, !!veg, available !== false,
+      [id, category_id || null, name, description || null, image_url || null,
+       Math.round(Number(price_paise)), !!veg, available !== false,
        prep_minutes || 20, sort_order || 0,
        normSlots(meal_slot),
        !!is_combo, JSON.stringify(Array.isArray(allergens) ? allergens : [])]
@@ -300,16 +285,8 @@ router.put(
     for (const f of fields) {
       if (req.body[f] !== undefined) {
         let v = req.body[f];
-        if (f === 'price_paise') {
-          v = Math.round(Number(v));
-          if (!Number.isFinite(v) || v < 0) {
-            const err = new Error('price_paise must be a non-negative number');
-            err.status = 400;
-            throw err;
-          }
-        }
+        if (f === 'price_paise') v = Math.round(Number(v));
         if (f === 'meal_slot') v = normSlots(v);
-        if (f === 'image_url') v = await storeImageUrl(db, v);
         params.push(v);
         sets.push(`${f} = $${params.length}`);
       }
@@ -432,9 +409,6 @@ router.get(
   ah(async (req, res) => {
     const id = await requireRestaurant(req, res);
     if (!id) return;
-    // Opportunistic activation: promote due scheduled orders so the
-    // restaurant's Upcoming section goes live on time even between ticks.
-    try { await activateDueScheduledOrders(); } catch (e) { console.error('scheduled activation failed:', e.message); }
     const params = [id];
     let where = 'o.restaurant_id = $1';
     if (req.query.status) {
@@ -453,105 +427,11 @@ router.get(
 const OWNER_TRANSITIONS = {
   accept: { from: ['placed'], to: 'accepted' },
   reject: { from: ['placed'], to: 'rejected' },
-  // A pre-accepted scheduled order activates as 'confirmed' — the kitchen
-  // skips 'accept' and goes straight to cooking.
-  preparing: { from: ['accepted', 'confirmed'], to: 'preparing' },
+  preparing: { from: ['accepted'], to: 'preparing' },
   ready: { from: ['preparing'], to: 'ready' },
   // Dine-in orders finish at the table, not at a doorstep
   served: { from: ['ready'], to: 'delivered', dineinOnly: true }
 };
-
-// PUT /api/owner/orders/:id/pre-accept — kitchen confirms a scheduled order
-// ahead of time. Sets pre_accepted=true; the order still goes live at
-// activation (30 min before scheduled_for), landing in status 'confirmed'.
-router.put(
-  '/orders/:id/pre-accept',
-  ah(async (req, res) => {
-    const id = await requireRestaurant(req, res);
-    if (!id) return;
-    const { rows } = await db.query(
-      'SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2',
-      [req.params.id, id]
-    );
-    const order = rows[0];
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status !== 'scheduled') {
-      return res.status(409).json({ error: 'Only scheduled orders can be pre-accepted' });
-    }
-    await db.query(
-      `UPDATE orders SET pre_accepted = true,
-         timeline = COALESCE(timeline, '[]'::jsonb)
-           || jsonb_build_object('status', 'pre_accepted', 'at', $1::text, 'by', 'restaurant_owner')
-       WHERE id = $2`,
-      [new Date().toISOString(), order.id]
-    );
-    const rName = (await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name;
-    const { formatKolkata } = require('../lib/scheduled');
-    await notify(db, order.customer_id, 'Restaurant confirmed ✅',
-      `${rName} confirmed your order scheduled for ${formatKolkata(order.scheduled_for)} — we'll start preparing 30 min before. 🎉`);
-    res.json({ ok: true, pre_accepted: true });
-  })
-);
-
-// PUT /api/owner/orders/:id/pre-reject { reason } — kitchen declines a
-// scheduled order before it goes live. The customer is notified; paid orders
-// are refunded.
-router.put(
-  '/orders/:id/pre-reject',
-  ah(async (req, res) => {
-    const id = await requireRestaurant(req, res);
-    if (!id) return;
-    const { rows } = await db.query(
-      'SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2',
-      [req.params.id, id]
-    );
-    const order = rows[0];
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status !== 'scheduled') {
-      return res.status(409).json({ error: 'Only scheduled orders can be pre-rejected' });
-    }
-    await transition(order.id, 'cancelled', 'restaurant_owner');
-    const refunded = order.payment_status === 'paid';
-    const reason = String((req.body && req.body.reason) || '').trim().slice(0, 280)
-      || 'The restaurant could not take this order';
-    await db.query(
-      `UPDATE orders SET cancel_reason = $1, payment_status = $2,
-         refunded_at = CASE WHEN $2 = 'refunded' THEN COALESCE(refunded_at, now()) ELSE refunded_at END
-       WHERE id = $3`,
-      [reason, refunded ? 'refunded' : order.payment_status, order.id]
-    );
-    const rName = (await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name;
-    // Late cancellation tracking: cancelled within 2 hours of scheduled time
-    let isLate = false;
-    if (order.scheduled_for) {
-      const msUntil = new Date(order.scheduled_for).getTime() - Date.now();
-      isLate = msUntil < 2 * 60 * 60 * 1000;
-    }
-    await db.query(
-      `INSERT INTO scheduled_cancels (restaurant_id, order_id, scheduled_for, is_late)
-       VALUES ($1, $2, $3, $4)`,
-      [id, order.id, order.scheduled_for || null, isLate]
-    );
-    if (isLate) {
-      await db.query('UPDATE restaurants SET late_cancels = late_cancels + 1 WHERE id = $1', [id]);
-    }
-    const { formatKolkata } = require('../lib/scheduled');
-    const schedLabel = order.scheduled_for ? formatKolkata(order.scheduled_for) : 'your scheduled time';
-    await notify(db, order.customer_id, "Restaurant couldn't take your scheduled order",
-      `${rName} cancelled your order scheduled for ${schedLabel}: ${reason}${refunded ? ' Your payment will be refunded.' : ''} Tap Reorder to book again.`,
-      { type: 'scheduled_cancelled', order_id: order.id, restaurant_id: id,
-        restaurant_name: rName, scheduled_for: order.scheduled_for, is_late: isLate });
-    // A rider had pre-accepted this scheduled order — tell them it's gone.
-    if (order.scheduled_rider_id) {
-      const rr = await db.query('SELECT user_id FROM riders WHERE id = $1', [order.scheduled_rider_id]);
-      if (rr.rows[0]) {
-        await notify(db, rr.rows[0].user_id, 'Scheduled delivery cancelled',
-          `The scheduled delivery from ${rName} (${schedLabel}) you accepted was cancelled by the restaurant.`);
-      }
-    }
-    res.json({ ok: true, status: 'cancelled', refunded, is_late: isLate });
-  })
-);
 
 // PUT /api/owner/orders/:id/accept|reject|preparing|ready
 router.put(
@@ -581,9 +461,7 @@ router.put(
       const reason = req.body.reason || 'Restaurant rejected the order';
       const refunded = order.payment_status === 'paid';
       await db.query(
-        `UPDATE orders SET cancel_reason = $1, payment_status = $2,
-           refunded_at = CASE WHEN $2 = 'refunded' THEN COALESCE(refunded_at, now()) ELSE refunded_at END
-         WHERE id = $3`,
+        "UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3",
         [reason, refunded ? 'refunded' : order.payment_status, order.id]
       );
       await notify(db, order.customer_id, 'Order rejected',
@@ -697,42 +575,6 @@ router.get(
       return { order_id: x.order_id, rider_name: x.rider_name, status: x.status, eta_minutes: etaMin };
     });
     res.json({ approaching: list });
-  })
-);
-
-// GET /api/owner/restaurants/:id/photos — list gallery photos
-router.get(
-  '/restaurants/:id/photos',
-  ah(async (req, res) => {
-    const { rows } = await db.query(
-      `SELECT * FROM restaurant_photos WHERE restaurant_id = $1 ORDER BY sort_order ASC, created_at DESC`,
-      [req.params.id]
-    );
-    res.json({ photos: rows });
-  })
-);
-
-// POST /api/owner/restaurants/:id/photos { photo_url, caption? } — add photo
-router.post(
-  '/restaurants/:id/photos',
-  ah(async (req, res) => {
-    const { photo_url, caption } = req.body;
-    if (!photo_url) return res.status(400).json({ error: 'photo_url required' });
-    const { rows } = await db.query(
-      `INSERT INTO restaurant_photos (restaurant_id, photo_url, caption) VALUES ($1, $2, $3) RETURNING *`,
-      [req.params.id, photo_url, caption || null]
-    );
-    res.json({ photo: rows[0] });
-  })
-);
-
-// DELETE /api/owner/restaurants/:id/photos/:photoId — remove photo
-router.delete(
-  '/restaurants/:id/photos/:photoId',
-  ah(async (req, res) => {
-    await db.query(`DELETE FROM restaurant_photos WHERE id = $1 AND restaurant_id = $2`,
-      [req.params.photoId, req.params.id]);
-    res.json({ ok: true });
   })
 );
 

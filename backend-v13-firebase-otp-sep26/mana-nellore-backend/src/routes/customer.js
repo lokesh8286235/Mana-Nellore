@@ -14,13 +14,8 @@ router.put(
   ah(async (req, res) => {
     const { lat, lng } = req.body;
     if (lat == null || lng == null) return res.status(400).json({ error: 'lat and lng are required' });
-    const la = Number(lat);
-    const ln = Number(lng);
-    if (!Number.isFinite(la) || !Number.isFinite(ln) || Math.abs(la) > 90 || Math.abs(ln) > 180) {
-      return res.status(400).json({ error: 'Invalid lat/lng' });
-    }
-    await db.query('UPDATE users SET lat = $1, lng = $2 WHERE id = $3', [la, ln, req.user.id]);
-    res.json({ ok: true, lat: la, lng: ln });
+    await db.query('UPDATE users SET lat = $1, lng = $2 WHERE id = $3', [lat, lng, req.user.id]);
+    res.json({ ok: true, lat, lng });
   })
 );
 
@@ -260,17 +255,8 @@ router.get(
     let { rows } = await db.query('SELECT referral_code FROM users WHERE id = $1', [req.user.id]);
     let code = rows[0].referral_code;
     if (!code) {
-      // Retry on the astronomically rare referral_code collision (UNIQUE key).
-      for (let attempt = 0; attempt < 3; attempt++) {
-        code = makeReferralCode();
-        try {
-          await db.query('UPDATE users SET referral_code = $1 WHERE id = $2', [code, req.user.id]);
-          break;
-        } catch (e) {
-          if (e.code !== '23505' || attempt === 2) throw e;
-          code = null;
-        }
-      }
+      code = makeReferralCode();
+      await db.query('UPDATE users SET referral_code = $1 WHERE id = $2', [code, req.user.id]);
     }
     const count = await db.query('SELECT COUNT(*) AS n FROM users WHERE referred_by = $1', [req.user.id]);
     res.json({ code, referrals: Number(count.rows[0].n) });
@@ -291,15 +277,6 @@ router.post(
     if (friend.rows[0].id === req.user.id) {
       return res.status(400).json({ error: 'You are entering your own referral code 🙂' });
     }
-    // Atomically claim the referral: concurrent double-taps (or replays) of
-    // "apply" can no longer mint the Rs 50 coupon pair twice.
-    const claimed = await db.query(
-      'UPDATE users SET referred_by = $1 WHERE id = $2 AND referred_by IS NULL RETURNING id',
-      [friend.rows[0].id, req.user.id]
-    );
-    if (!claimed.rows[0]) {
-      return res.status(409).json({ error: 'You already used a referral code' });
-    }
     const mkCoupon = async (suffix) => {
       const c = 'REF' + suffix + Math.random().toString(36).slice(2, 7).toUpperCase();
       await db.query(
@@ -310,7 +287,7 @@ router.post(
     };
     const myCoupon = await mkCoupon('ME');
     const friendCoupon = await mkCoupon('FR');
-    // (referred_by was already claimed atomically above)
+    await db.query('UPDATE users SET referred_by = $1 WHERE id = $2', [friend.rows[0].id, req.user.id]);
     // Record issuance so GET /api/customer/coupons can list them (survives reinstalls)
     await db.query(
       `INSERT INTO coupon_issuances (user_id, coupon_code, source) VALUES ($1, $2, 'referral')
@@ -458,51 +435,6 @@ router.get(
       };
     });
     res.json({ coupons });
-  })
-);
-
-// GET /api/customer/vouchers — user's coupons in voucher format
-router.get(
-  '/vouchers',
-  ah(async (req, res) => {
-    const { rows } = await db.query(
-      `SELECT ci.coupon_code AS code, ci.source, ci.issued_at,
-              c.discount_type, c.value, c.min_order_paise, c.max_discount_paise,
-              c.active, c.valid_from, c.valid_to
-       FROM coupon_issuances ci
-       LEFT JOIN coupons c ON c.code = ci.coupon_code
-       WHERE ci.user_id = $1
-       ORDER BY ci.issued_at DESC`,
-      [req.user.id]
-    );
-    const now = new Date();
-    const vouchers = rows.map((r) => {
-      let desc = '';
-      if (r.discount_type === 'percent') desc = r.value + '% off';
-      else if (r.discount_type === 'flat') desc = '₹' + (r.value/100) + ' off';
-      if (r.min_order_paise) desc += ' on orders above ₹' + (r.min_order_paise/100);
-      if (r.valid_to && new Date(r.valid_to) < now) desc += ' (expired)';
-      return { code: r.code, title: r.code, description: desc, issued_at: r.issued_at, source: r.source };
-    });
-    res.json({ vouchers });
-  })
-);
-
-// GET /api/customer/refunds — user's refunded orders
-router.get(
-  '/refunds',
-  ah(async (req, res) => {
-    const { rows } = await db.query(
-      `SELECT o.id, o.total_paise, o.payment_status, o.refunded_at, o.created_at,
-              r.name AS restaurant_name
-       FROM orders o
-       LEFT JOIN restaurants r ON r.id = o.restaurant_id
-       WHERE o.user_id = $1 AND o.payment_status = 'refunded'
-       ORDER BY o.refunded_at DESC NULLS LAST, o.created_at DESC
-       LIMIT 50`,
-      [req.user.id]
-    );
-    res.json({ refunds: rows });
   })
 );
 

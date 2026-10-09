@@ -57,7 +57,6 @@ CREATE TABLE IF NOT EXISTS restaurants (
   closes_at time,
   opens_at_we time,
   closes_at_we time,
-  is_coming_soon boolean NOT NULL DEFAULT false,
   commission_pct numeric NOT NULL DEFAULT 12,
   rating_avg numeric NOT NULL DEFAULT 0,
   verified boolean NOT NULL DEFAULT false,
@@ -66,8 +65,6 @@ CREATE TABLE IF NOT EXISTS restaurants (
   chef_story text,
   gstin text,
   birthday_dessert boolean NOT NULL DEFAULT false,
-  cuisines text[] NOT NULL DEFAULT '{}',
-  is_pure_veg boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -96,7 +93,6 @@ CREATE TABLE IF NOT EXISTS menu_items (
   allergens jsonb NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_menu_restaurant ON menu_items(restaurant_id);
-CREATE INDEX IF NOT EXISTS idx_menu_rest_veg_avail ON menu_items(restaurant_id, available, veg);
 
 CREATE TABLE IF NOT EXISTS addresses (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -138,8 +134,7 @@ CREATE TABLE IF NOT EXISTS orders (
   address_id uuid REFERENCES addresses(id) ON DELETE SET NULL,
   status text NOT NULL DEFAULT 'placed'
     CHECK (status IN ('placed','accepted','rejected','preparing','ready',
-                      'picked_up','on_way','delivered','cancelled',
-                      'scheduled','confirmed')),
+                      'picked_up','on_way','delivered','cancelled')),
   subtotal_paise int NOT NULL,
   discount_paise int NOT NULL DEFAULT 0,
   delivery_fee_paise int NOT NULL DEFAULT 0,
@@ -151,7 +146,6 @@ CREATE TABLE IF NOT EXISTS orders (
   payment_status text NOT NULL DEFAULT 'pending'
     CHECK (payment_status IN ('pending','paid','failed','refunded','collected')),
   delivery_otp_hash text,
-  delivery_otp text,
   cancel_reason text,
   timeline jsonb NOT NULL DEFAULT '[]',
   placed_at timestamptz NOT NULL DEFAULT now(),
@@ -168,31 +162,12 @@ CREATE TABLE IF NOT EXISTS orders (
   no_cutlery boolean NOT NULL DEFAULT false,
   tip_paise int NOT NULL DEFAULT 0,
   recipient_name text,
-  recipient_phone text,
-  -- Scheduled ordering: the customer-chosen delivery time (NULL for ASAP
-  -- orders) and whether the restaurant pre-accepted while still scheduled.
-  scheduled_for timestamptz,
-  pre_accepted boolean NOT NULL DEFAULT false
+  recipient_phone text
 );
-CREATE TABLE IF NOT EXISTS restaurant_photos (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  restaurant_id uuid NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
-  photo_url text NOT NULL,
-  caption text,
-  sort_order int NOT NULL DEFAULT 0,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_rest_photos_rest ON restaurant_photos(restaurant_id);
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_restaurant ON orders(restaurant_id);
-CREATE INDEX IF NOT EXISTS idx_orders_rest_status ON orders(restaurant_id, status);
-CREATE INDEX IF NOT EXISTS idx_orders_rest_packed ON orders(restaurant_id, placed_at) WHERE packed_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_rider ON orders(rider_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
--- NOTE: idx_orders_status_scheduled (on (status, scheduled_for)) is created
--- in migrate() (db.js), AFTER the scheduled_for column itself is added — it
--- cannot live here because on an existing database the column does not exist
--- yet when the schema runs (same reason as the orders.table_id FK note).
 
 CREATE TABLE IF NOT EXISTS order_items (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -419,43 +394,3 @@ CREATE TABLE IF NOT EXISTS student_applications (
     CHECK (status IN ('pending','approved','rejected')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
-
--- Image store: photo bytes live here ONCE; API JSON only carries /img/<hash>.
--- Keeps restaurant-list and menu payloads tiny at 1000+ restaurants.
-CREATE TABLE IF NOT EXISTS images (
-  hash text PRIMARY KEY,
-  data bytea NOT NULL,
-  mime text NOT NULL DEFAULT 'image/jpeg',
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
--- Pending customer registrations (password flow): staged here until OTP is verified.
--- Registration expires after 10 minutes; verify-register promotes to users.
-CREATE TABLE IF NOT EXISTS pending_registrations (
-  phone text PRIMARY KEY,
-  name text NOT NULL,
-  password_hash text NOT NULL,
-  address text,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  expires_at timestamptz NOT NULL
-);
-
--- On-the-way anti-scam audit trail: every secondary-restaurant discount
--- decision at placement (granted / stripped / rejected), plus service-area
--- determinations. The founder reviews scam attempts from the admin panel.
-CREATE TABLE IF NOT EXISTS otw_audit_log (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at timestamptz NOT NULL DEFAULT now(),
-  event text NOT NULL,
-  order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
-  customer_id uuid,
-  primary_restaurant_id uuid,
-  secondary_restaurant_id uuid,
-  address_id uuid,
-  fee_charged_paise int,
-  fee_full_paise int,
-  reason text,
-  meta jsonb NOT NULL DEFAULT '{}'
-);
-CREATE INDEX IF NOT EXISTS idx_otw_audit_created ON otw_audit_log(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_otw_audit_customer ON otw_audit_log(customer_id);

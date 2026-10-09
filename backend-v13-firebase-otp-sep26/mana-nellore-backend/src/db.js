@@ -48,7 +48,6 @@ async function migrate() {
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_student boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code text');
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by uuid');
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_otp text');
   await q(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_referred_by_fkey') THEN
       ALTER TABLE users ADD CONSTRAINT users_referred_by_fkey
@@ -69,11 +68,6 @@ async function migrate() {
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS gstin text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS birthday_dessert boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS opens_at_we time');
-  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS is_coming_soon boolean NOT NULL DEFAULT false');
-  // Coming soon means NOT approved yet: any coming-soon restaurant that is still
-  // marked approved+verified gets moved back to pending+unverified (idempotent).
-  await q(`UPDATE restaurants SET verified = false, status = 'pending'
-           WHERE is_coming_soon = true AND status = 'approved'`);
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS closes_at_we time');
 
   // Menu items: meal slots, combos, allergens
@@ -92,38 +86,6 @@ async function migrate() {
   END $$`);
   await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS is_combo boolean NOT NULL DEFAULT false');
   await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS allergens jsonb NOT NULL DEFAULT '[]'");
-  // Dish ratings: aggregated from order food_ratings (each dish in a rated order
-  // gets one "vote" at the order's food_rating). Powers "Recommended dishes".
-  await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS rating_avg numeric NOT NULL DEFAULT 0');
-  await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS rating_count integer NOT NULL DEFAULT 0');
-  // Backfill dish ratings from historical order ratings
-  await q(`UPDATE menu_items mi SET
-             rating_count = sub.cnt,
-             rating_avg = sub.avg
-           FROM (
-             SELECT oi.menu_item_id AS mid, COUNT(*) AS cnt, AVG(r.food_rating)::numeric AS avg
-             FROM ratings r
-             JOIN order_items oi ON oi.order_id = r.order_id
-             WHERE r.ratee_type = 'restaurant' AND r.food_rating IS NOT NULL
-               AND oi.menu_item_id IS NOT NULL
-             GROUP BY oi.menu_item_id
-           ) sub
-           WHERE mi.id = sub.mid`);
-
-  // Restaurant rating_count: aggregated from order food_ratings. The
-  // restaurants table only had rating_avg; the count powers the "(1.2k)"
-  // display on restaurant cards.
-  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS rating_count integer NOT NULL DEFAULT 0');
-  // Backfill restaurant rating counts from historical ratings
-  await q(`UPDATE restaurants r SET
-             rating_count = sub.cnt
-           FROM (
-             SELECT ratee_id AS rid, COUNT(*) AS cnt
-             FROM ratings
-             WHERE ratee_type = 'restaurant' AND food_rating IS NOT NULL
-             GROUP BY ratee_id
-           ) sub
-           WHERE r.id = sub.rid`);
 
   // Orders: new lifecycle fields
   await q(`DO $$ BEGIN
@@ -157,60 +119,10 @@ async function migrate() {
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS tip_paise int NOT NULL DEFAULT 0');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_name text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_phone text');
-  // On-the-way grouping (anti-scam): which orders belong to a multi-restaurant
-  // group, their role, and whether a claimed secondary discount was denied.
-  await q("ALTER TABLE orders ADD COLUMN IF NOT EXISTS otw_role text");
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS otw_primary_order_id uuid');
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS otw_group_size int');
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS otw_discount_denied boolean NOT NULL DEFAULT false');
   // COD 'collected' status
   await q('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_status_check');
   await q(`ALTER TABLE orders ADD CONSTRAINT orders_payment_status_check
     CHECK (payment_status IN ('pending','paid','failed','refunded','collected'))`);
-
-  // Scheduled ordering: scheduled_for + pre_accepted, new 'scheduled' /
-  // 'confirmed' statuses. Existing databases carry the old auto-named
-  // orders_status_check — replace it only when it lacks the new values.
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS scheduled_for timestamptz');
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pre_accepted boolean NOT NULL DEFAULT false');
-  await q(`DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_status_check'
-               AND pg_get_constraintdef(oid) NOT LIKE '%scheduled%') THEN
-      ALTER TABLE orders DROP CONSTRAINT orders_status_check;
-    END IF;
-  END $$`);
-  await q(`DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_status_check') THEN
-      ALTER TABLE orders ADD CONSTRAINT orders_status_check
-        CHECK (status IN ('placed','accepted','rejected','preparing','ready',
-                          'picked_up','on_way','delivered','cancelled',
-                          'scheduled','confirmed'));
-    END IF;
-  END $$`);
-  await q('CREATE INDEX IF NOT EXISTS idx_orders_status_scheduled ON orders(status, scheduled_for)');
-  // Scheduled order cancellation protection: track late cancels per restaurant,
-  // allow admin to suspend scheduling, structured notification data.
-  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS late_cancels int NOT NULL DEFAULT 0');
-  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS scheduling_suspended boolean NOT NULL DEFAULT false');
-  await q('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS data jsonb');
-  await q(`CREATE TABLE IF NOT EXISTS scheduled_cancels (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    restaurant_id uuid REFERENCES restaurants(id) ON DELETE SET NULL,
-    order_id uuid,
-    scheduled_for timestamptz,
-    cancelled_at timestamptz NOT NULL DEFAULT now(),
-    is_late boolean NOT NULL DEFAULT false
-  )`);
-  await q('CREATE INDEX IF NOT EXISTS idx_sched_cancels_rest ON scheduled_cancels(restaurant_id, cancelled_at)');
-
-  // Rider scheduled pre-acceptance: a rider can commit to a scheduled order
-  // ahead of time (scheduled_rider_id). We remind them 1 hour before it goes
-  // live (rider_reminded) and auto-assign at activation when eligible.
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS scheduled_rider_id uuid REFERENCES riders(id) ON DELETE SET NULL');
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS scheduled_rider_at timestamptz');
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS rider_reminded boolean NOT NULL DEFAULT false');
-  await q('CREATE INDEX IF NOT EXISTS idx_orders_sched_rider ON orders(scheduled_rider_id) WHERE scheduled_rider_id IS NOT NULL');
-
   // Remove wallet/credit remnants
   await q('ALTER TABLE orders DROP COLUMN IF EXISTS credits_used_paise');
   await q('DROP TABLE IF EXISTS customer_credits');
@@ -240,8 +152,6 @@ async function migrate() {
   await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS requires_student boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS aadhar text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar text');
-  await q("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS cuisines text[] NOT NULL DEFAULT '{}'");
-  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS is_pure_veg boolean NOT NULL DEFAULT false');
 
   // Customer memory: preferences, favorites, coupon issuances (survive reinstalls)
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS veg_only boolean NOT NULL DEFAULT false');
@@ -268,103 +178,6 @@ async function migrate() {
   // Backfill share tokens for old orders
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
            WHERE share_token IS NULL`);
-
-  // Fix 2026-10-07: Clear restaurant coords outside India (bogus geocoding).
-  // Sri Durga had US coords showing 14708km from Nellore. Restaurants in
-  // Nellore must be within India bounds; anything outside is wrong data.
-  await q(`UPDATE restaurants SET lat = NULL, lng = NULL
-           WHERE lat IS NOT NULL AND (
-             lat < 6 OR lat > 38 OR lng < 68 OR lng > 98
-           )`);
-
-  // Image store (v16): photo bytes as immutable files, not data-URLs in JSON.
-  await q(`CREATE TABLE IF NOT EXISTS images (
-    hash text PRIMARY KEY,
-    data bytea NOT NULL,
-    mime text NOT NULL DEFAULT 'image/jpeg',
-    created_at timestamptz NOT NULL DEFAULT now()
-  )`);
-
-  // Idempotency keys for money-mutating endpoints (order placement, refunds,
-  // settlements, COD settlement, ticket refunds). Scoped per endpoint + user.
-  // Rows are completed once and purged after 24h (see purgeOld).
-  await q(`CREATE TABLE IF NOT EXISTS idempotency_keys (
-    scope text NOT NULL,
-    key text NOT NULL,
-    completed boolean NOT NULL DEFAULT false,
-    status_code int,
-    response jsonb,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scope, key)
-  )`);
-  await q('CREATE INDEX IF NOT EXISTS idx_idem_created ON idempotency_keys(created_at)');
-  await q(`DELETE FROM idempotency_keys WHERE created_at < now() - INTERVAL '24 hours'`);
-
-  // Refund flag on orders: refunded_at is set everywhere payment_status
-  // becomes 'refunded'; the generated `refunded` boolean flows into every
-  // order object (all serializers use SELECT o.*) so apps can exclude
-  // refunded orders (e.g. restaurant home revenue) without extra queries.
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_at timestamptz');
-  await q(`DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name = 'orders' AND column_name = 'refunded') THEN
-      ALTER TABLE orders ADD COLUMN refunded boolean
-        GENERATED ALWAYS AS (refunded_at IS NOT NULL) STORED;
-    END IF;
-  END $$`);
-  // Backfill: historical refunded orders predate the column.
-  await q(`UPDATE orders SET refunded_at = COALESCE(placed_at, now())
-           WHERE payment_status = 'refunded' AND refunded_at IS NULL`);
-
-  // Rider SOS alerts: created in an earlier deploy without a schema entry;
-  // declare it here so fresh databases get the table the routes expect.
-  await q(`CREATE TABLE IF NOT EXISTS sos_alerts (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    rider_id uuid REFERENCES riders(id) ON DELETE SET NULL,
-    lat double precision,
-    lng double precision,
-    status text NOT NULL DEFAULT 'open',
-    created_at timestamptz NOT NULL DEFAULT now()
-  )`);
-  await q('CREATE INDEX IF NOT EXISTS idx_sos_rider_created ON sos_alerts(rider_id, created_at)');
-
-  await migrateDataUrlPhotos();
-}
-
-// One-time: move data-URL photos already stored in text columns into the
-// image store and rewrite the columns to /img/<hash>. Idempotent — only rows
-// still holding a data:image/... value are touched.
-async function migrateDataUrlPhotos() {
-  const crypto = require('crypto');
-  const { parseDataUrl, imgUrl } = require('./lib/images');
-  const targets = [
-    ['restaurants', 'image_url'],
-    ['restaurants', 'chef_photo'],
-    ['menu_items', 'image_url'],
-  ];
-  for (const [table, col] of targets) {
-    const { rows } = await pool.query(
-      `SELECT id, ${col} AS v FROM ${table} WHERE ${col} LIKE 'data:image/%'`
-    );
-    for (const r of rows) {
-      const p = parseDataUrl(r.v);
-      if (!p || !p.buffer.length) continue;
-      const hash = crypto.createHash('sha256').update(p.buffer).digest('hex');
-      await pool.query(
-        'INSERT INTO images (hash, data, mime) VALUES ($1, $2, $3) ON CONFLICT (hash) DO NOTHING',
-        [hash, p.buffer, p.mime]
-      );
-      await pool.query(`UPDATE ${table} SET ${col} = $1 WHERE id = $2`, [imgUrl(hash), r.id]);
-      console.log(`migrated photo ${table}.${col} ${r.id} -> ${imgUrl(hash).slice(0, 60)}...`);
-    }
-    // Fix up rows migrated while the URL was still relative: /img/<hash> ->
-    // absolute. Idempotent.
-    await pool.query(
-      `UPDATE ${table} SET ${col} = $1 || substring(${col} from 5)
-       WHERE ${col} LIKE '/img/%'`,
-      [imgUrl('').slice(0, -1)]
-    );
-  }
 }
 
 // Default pricing rules (paise). Admin can edit these live via /api/admin/pricing.
@@ -397,11 +210,6 @@ function defaultPricingRows() {
     },
     eta_minutes: 30,              // Honest ETA estimate shown to customers (not a guarantee)
     call_to_order_phone: ''       // support / phone-order line shown in the customer app
-    ,
-    // GST rates (%) charged on the customer bill. Editable from the admin
-    // Pricing screen; the customer app fetches them via GET /api/config so
-    // rate changes apply without an app rebuild.
-    tax_rates: { food_gst_pct: 5, delivery_gst_pct: 18, platform_gst_pct: 18 }
   };
 }
 

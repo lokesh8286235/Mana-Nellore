@@ -2,10 +2,8 @@
 // action writes an audit log entry.
 const express = require('express');
 const { seedSuggestedCats } = require('../lib/suggested-cats');
-const { storeImageUrl } = require('../lib/images');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
-const { idempotency } = require('../lib/idempotency');
 
 const router = express.Router();
 router.use(authenticate, requireRole('admin'));
@@ -153,30 +151,7 @@ router.get(
       [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    res.json({ restaurant: { ...rows[0], rating_avg: Number(rows[0].rating_avg), rating_count: Number(rows[0].rating_count) || 0 } });
-  })
-);
-
-// DELETE /api/admin/restaurants/:id — permanently deletes a restaurant and all its
-// menu items, categories, etc. (via ON DELETE CASCADE). Refuses if the restaurant
-// has any orders, to protect real order history.
-router.delete(
-  '/restaurants/:id',
-  ah(async (req, res) => {
-    const id = req.params.id;
-    const { rows: existing } = await db.query(
-      'SELECT id, name FROM restaurants WHERE id = $1', [id]
-    );
-    if (!existing[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    const { rows: orderCheck } = await db.query(
-      'SELECT COUNT(*)::int AS c FROM orders WHERE restaurant_id = $1', [id]
-    );
-    if (orderCheck[0].c > 0) {
-      return res.status(400).json({ error: 'Cannot delete: restaurant has ' + orderCheck[0].c + ' order(s). Suspend it instead.' });
-    }
-    await db.query('DELETE FROM restaurants WHERE id = $1', [id]);
-    await audit(req, 'restaurant_delete', 'restaurant', id, { name: existing[0].name });
-    res.json({ deleted: id, name: existing[0].name });
+    res.json({ restaurant: { ...rows[0], rating_avg: Number(rows[0].rating_avg) } });
   })
 );
 
@@ -189,11 +164,7 @@ router.put(
       return res.status(400).json({ error: 'Invalid status' });
     }
     const { rows } = await db.query(
-      `UPDATE restaurants
-       SET status = $1,
-           verified = CASE WHEN $1 = 'approved' THEN true ELSE verified END,
-           is_coming_soon = CASE WHEN $1 = 'approved' THEN false ELSE is_coming_soon END
-       WHERE id = $2 RETURNING *`, [status, req.params.id]
+      'UPDATE restaurants SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, `restaurant_${status}`, 'restaurant', req.params.id, {});
@@ -374,7 +345,7 @@ router.put(
   '/pricing',
   ah(async (req, res) => {
     const { key, value } = req.body;
-    const allowed = ['delivery_tiers', 'rider_payout_tiers', 'platform_fee_paise', 'default_commission_pct', 'free_delivery_rules', 'eta_minutes', 'call_to_order_phone', 'tax_rates'];
+    const allowed = ['delivery_tiers', 'rider_payout_tiers', 'platform_fee_paise', 'default_commission_pct', 'free_delivery_rules', 'eta_minutes', 'call_to_order_phone'];
     if (!allowed.includes(key)) return res.status(400).json({ error: 'Unknown pricing key' });
     const { rows } = await db.query(
       'UPDATE pricing_config SET value = $1::jsonb WHERE key = $2 RETURNING *',
@@ -382,26 +353,6 @@ router.put(
     );
     await audit(req, 'pricing_update', 'pricing_config', key, { value });
     res.json({ pricing: rows[0] });
-  })
-);
-
-// GET /api/admin/otw-audit — on-the-way anti-scam audit trail: every
-// secondary-discount decision at placement (granted / stripped / rejected)
-// plus service-area determinations. Newest first.
-router.get(
-  '/otw-audit',
-  ah(async (req, res) => {
-    const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
-    const { rows } = await db.query(
-      `SELECT l.*, r1.name AS primary_restaurant_name, r2.name AS secondary_restaurant_name
-       FROM otw_audit_log l
-       LEFT JOIN restaurants r1 ON r1.id = l.primary_restaurant_id
-       LEFT JOIN restaurants r2 ON r2.id = l.secondary_restaurant_id
-       ORDER BY l.created_at DESC
-       LIMIT $1`,
-      [limit]
-    );
-    res.json({ events: rows });
   })
 );
 
@@ -424,26 +375,11 @@ router.post(
     if (!['flat', 'percent'].includes(discount_type)) {
       return res.status(400).json({ error: 'discount_type must be flat or percent' });
     }
-    // Validate numerics up front: NaN would hit the int columns and surface
-    // as a raw 500 (or a misleading 404 via the 22P02 handler).
-    const valueInt = Math.round(Number(value));
-    const minOrder = min_order_paise == null || min_order_paise === '' ? 0 : Math.round(Number(min_order_paise));
-    const maxDisc = max_discount_paise == null || max_discount_paise === '' ? null : Math.round(Number(max_discount_paise));
-    if (!Number.isFinite(valueInt) || valueInt < 0) {
-      return res.status(400).json({ error: 'value must be a non-negative number' });
-    }
-    if (!Number.isFinite(minOrder) || minOrder < 0 ||
-        (maxDisc != null && (!Number.isFinite(maxDisc) || maxDisc < 0))) {
-      return res.status(400).json({ error: 'min_order_paise and max_discount_paise must be non-negative numbers' });
-    }
-    const codeUp = String(code).toUpperCase();
-    const dupe = await db.query('SELECT id FROM coupons WHERE code = $1', [codeUp]);
-    if (dupe.rows[0]) return res.status(409).json({ error: 'A coupon with this code already exists' });
     const { rows } = await db.query(
       `INSERT INTO coupons (code, discount_type, value, min_order_paise, max_discount_paise, valid_from, valid_to, active, requires_student)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [codeUp, discount_type, valueInt,
-       minOrder, maxDisc,
+      [String(code).toUpperCase(), discount_type, Math.round(Number(value)),
+       min_order_paise || 0, max_discount_paise != null ? Math.round(Number(max_discount_paise)) : null,
        valid_from || null, valid_to || null, active !== false, !!requires_student]
     );
     await audit(req, 'coupon_create', 'coupon', rows[0].id, { code });
@@ -459,19 +395,7 @@ router.put(
     const params = [];
     for (const f of fields) {
       if (req.body[f] !== undefined) {
-        let v = req.body[f];
-        // Validate up front: bad values would otherwise surface as raw DB
-        // 500s (or a misleading 404 via the 22P02 handler).
-        if (f === 'discount_type' && !['flat', 'percent'].includes(v)) {
-          return res.status(400).json({ error: 'discount_type must be flat or percent' });
-        }
-        if (['value', 'min_order_paise', 'max_discount_paise'].includes(f) && v !== null && v !== '') {
-          v = Math.round(Number(v));
-          if (!Number.isFinite(v) || v < 0) {
-            return res.status(400).json({ error: `${f} must be a non-negative number` });
-          }
-        }
-        params.push(v);
+        params.push(req.body[f]);
         sets.push(`${f} = $${params.length}`);
       }
     }
@@ -517,24 +441,10 @@ router.get(
 // POST /api/admin/settlements { restaurant_id, period_start, period_end }
 router.post(
   '/settlements',
-  idempotency('admin:settlements:create'),
   ah(async (req, res) => {
     const { restaurant_id, period_start, period_end } = req.body;
     if (!restaurant_id || !period_start || !period_end) {
       return res.status(400).json({ error: 'restaurant_id, period_start and period_end are required' });
-    }
-    // Natural dedupe: an identical settlement already exists (e.g. double
-    // submitted with two different idempotency keys) — return it instead of
-    // creating an overlapping duplicate.
-    const dup = await db.query(
-      `SELECT s.*, r.name AS restaurant_name FROM settlements s
-       JOIN restaurants r ON r.id = s.restaurant_id
-       WHERE s.restaurant_id = $1 AND s.period_start = $2 AND s.period_end = $3
-       ORDER BY s.created_at DESC LIMIT 1`,
-      [restaurant_id, period_start, period_end]
-    );
-    if (dup.rows[0]) {
-      return res.json({ settlement: dup.rows[0], duplicate: true });
     }
     const agg = await db.query(
       `SELECT COALESCE(SUM(total_paise),0) AS gross,
@@ -561,15 +471,7 @@ router.post(
 
 router.post(
   '/settlements/:id/pay',
-  idempotency('admin:settlements:pay'),
   ah(async (req, res) => {
-    const cur = await db.query('SELECT status FROM settlements WHERE id = $1', [req.params.id]);
-    if (!cur.rows[0]) return res.status(404).json({ error: 'Settlement not found' });
-    // Already paid (e.g. double submitted): return it without re-auditing.
-    if (cur.rows[0].status === 'paid') {
-      const { rows } = await db.query('SELECT * FROM settlements WHERE id = $1', [req.params.id]);
-      return res.json({ settlement: rows[0], already_paid: true });
-    }
     const { rows } = await db.query(
       "UPDATE settlements SET status = 'paid', paid_at = now() WHERE id = $1 RETURNING *",
       [req.params.id]
@@ -600,7 +502,6 @@ router.get(
 
 router.post(
   '/refunds',
-  idempotency('admin:refunds:create'),
   ah(async (req, res) => {
     const { order_id, reason } = req.body;
     const oRes = await db.query('SELECT * FROM orders WHERE id = $1', [order_id]);
@@ -609,7 +510,7 @@ router.post(
     if (order.payment_status !== 'paid') {
       return res.status(409).json({ error: `Cannot refund an order with payment status ${order.payment_status}` });
     }
-    await db.query("UPDATE orders SET payment_status = 'refunded', refunded_at = COALESCE(refunded_at, now()) WHERE id = $1", [order.id]);
+    await db.query("UPDATE orders SET payment_status = 'refunded' WHERE id = $1", [order.id]);
     const tl = (await db.query('SELECT timeline FROM orders WHERE id = $1', [order.id])).rows[0].timeline || [];
     tl.push({ status: 'refunded', at: new Date().toISOString(), by: 'admin' });
     await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [JSON.stringify(tl), order.id]);
@@ -678,7 +579,6 @@ router.put(
 // Resolution note is required (same rule as closing a ticket).
 router.post(
   '/tickets/:id/resolve-action',
-  idempotency('admin:tickets:resolve-action'),
   ah(async (req, res) => {
     const { action, resolution_note } = req.body;
     if (!['refund', 'reorder'].includes(action)) {
@@ -700,7 +600,7 @@ router.post(
       if (!['paid', 'collected'].includes(order.payment_status)) {
         return res.status(409).json({ error: `Order payment is '${order.payment_status}' — nothing to refund` });
       }
-      await db.query("UPDATE orders SET payment_status = 'refunded', refunded_at = COALESCE(refunded_at, now()) WHERE id = $1", [order.id]);
+      await db.query("UPDATE orders SET payment_status = 'refunded' WHERE id = $1", [order.id]);
       note = `Refunded Rs ${(order.total_paise / 100).toFixed(2)}. ${note}`;
       await notify(order.customer_id, 'Refund issued 💸',
         `Rs ${(order.total_paise / 100).toFixed(2)} has been refunded for your order. ${note}`);
@@ -959,84 +859,64 @@ router.get(
   })
 );
 
-// PUT /api/admin/applications/:id { status: approved|rejected, admin_note?, coming_soon? }
+// PUT /api/admin/applications/:id { status: approved|rejected, admin_note? }
 // Approving creates the owner profile (separate role profile), the restaurant
-// (verified=true, live) and notifies the applicant — unless coming_soon is true,
-// in which case the restaurant is created pending+unverified under Coming soon.
+// (verified=true), and notifies the applicant.
 router.put(
   '/applications/:id',
   ah(async (req, res) => {
     const { status, admin_note } = req.body;
-    const launchComingSoon = req.body && req.body.coming_soon === true;
     if (!['approved', 'rejected'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
-    // Atomically claim the application: two admins acting on the same pending
-    // application can no longer both approve it and create duplicate restaurants.
-    const { rows } = await db.query(
-      `UPDATE restaurant_applications SET status = $1, admin_note = $2
-       WHERE id = $3 AND status = 'pending' RETURNING *`,
-      [status, admin_note || null, req.params.id]
-    );
-    const app = rows[0];
-    if (!app) {
-      const exists = await db.query(
-        'SELECT status FROM restaurant_applications WHERE id = $1', [req.params.id]
-      );
-      if (!exists.rows[0]) return res.status(404).json({ error: 'Application not found' });
-      return res.status(409).json({ error: `Application already ${exists.rows[0].status}` });
-    }
+    const aRes = await db.query('SELECT * FROM restaurant_applications WHERE id = $1', [req.params.id]);
+    const app = aRes.rows[0];
+    if (!app) return res.status(404).json({ error: 'Application not found' });
+    if (app.status !== 'pending') return res.status(409).json({ error: `Application already ${app.status}` });
 
-    let restaurantId = null;
+    await db.query('UPDATE restaurant_applications SET status = $1, admin_note = $2 WHERE id = $3',
+      [status, admin_note || null, app.id]);
+
     if (status === 'approved') {
-      // Find or create the owner's restaurant_owner profile (same phone, own profile).
-      // INSERT-first with ON CONFLICT: concurrent approvals collapse onto one row.
-      await db.query(
-        `INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner')
-         ON CONFLICT (phone, role) DO NOTHING`,
-        [app.phone, app.owner_name]
-      );
-      const uRes = await db.query(
+      // Find or create the owner's restaurant_owner profile (same phone, own profile)
+      let uRes = await db.query(
         "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner'", [app.phone]
       );
-      const owner = uRes.rows[0];
+      let owner = uRes.rows[0];
+      if (!owner) {
+        const c = await db.query(
+          "INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner') RETURNING *",
+          [app.phone, app.owner_name]
+        );
+        owner = c.rows[0];
+      }
       const rRes = await db.query(
-        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, verified, status, is_coming_soon)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, await storeImageUrl(db, app.photo_url), app.fssai, app.aadhar || null,
-         !launchComingSoon, launchComingSoon ? 'pending' : 'approved', launchComingSoon]
+        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, verified, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,'approved') RETURNING *`,
+        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai, app.aadhar || null]
       );
       await seedSuggestedCats(db, rRes.rows[0].id);
-      if (launchComingSoon) {
-        await notify(owner.id, '🏗️ Your restaurant is coming soon!',
-          `"${app.restaurant_name}" is listed under Coming soon on Mana Nellore. We will approve and launch it when it is ready!`);
-      } else {
-        await notify(owner.id, '🎉 Your restaurant is live!',
-          `"${app.restaurant_name}" is verified and open for business on Mana Nellore!`);
-      }
-      await audit(req, 'application_approved', 'restaurant', rRes.rows[0].id,
-        { application_id: app.id, coming_soon: launchComingSoon });
-      restaurantId = rRes.rows[0].id;
+      await notify(owner.id, '🎉 Your restaurant is live!',
+        `"${app.restaurant_name}" is verified and open for business on Mana Nellore!`);
+      await audit(req, 'application_approved', 'restaurant', rRes.rows[0].id, { application_id: app.id });
     } else {
       await audit(req, 'application_rejected', 'restaurant_application', app.id, { admin_note });
     }
-    res.json({ ok: true, status, restaurant_id: restaurantId });
+    res.json({ ok: true, status });
   })
 );
 
 // POST /api/admin/restaurants/onboard — admin onboards a restaurant directly
 // (for busy owners who can't fill the application themselves).
-// Creates the owner profile + restaurant in one step: live & verified by default,
-// or listed as Coming soon (pending, unverified) when body.coming_soon is true.
+// Creates the owner profile + a live, verified restaurant in one step.
 router.post(
   '/restaurants/onboard',
   ah(async (req, res) => {
     const { restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url } = req.body || {};
-    const launchComingSoon = req.body && req.body.coming_soon === true;
-    if (!restaurant_name || !String(restaurant_name).trim()) {
-      return res.status(400).json({ error: 'Restaurant name is required' });
+    if (!restaurant_name || !String(restaurant_name).trim() ||
+        !owner_name || !String(owner_name).trim()) {
+      return res.status(400).json({ error: 'Restaurant name and owner name are required' });
     }
-    // owner_name + fssai are optional at onboard time — admin fills them later via Edit details
     const cleanPhone = String(phone || '').replace(/\D/g, '').slice(-10);
     if (!/^[6-9]\d{9}$/.test(cleanPhone)) {
       return res.status(400).json({ error: 'A valid 10-digit mobile number is required' });
@@ -1044,40 +924,37 @@ router.post(
     if (!address || !String(address).trim()) {
       return res.status(400).json({ error: 'Restaurant address is required' });
     }
+    if (!fssai || !String(fssai).trim()) {
+      return res.status(400).json({ error: 'FSSAI license number is required' });
+    }
     const cleanAadhar = String(aadhar || '').replace(/\D/g, '');
     if (cleanAadhar && !/^\d{12}$/.test(cleanAadhar)) {
       return res.status(400).json({ error: 'Aadhar must be 12 digits' });
     }
-    // Find or create the owner's restaurant_owner profile (same phone, own profile).
-    // INSERT-first with ON CONFLICT: a double-submit collapses onto one row
-    // instead of 500ing on UNIQUE(phone, role).
-    await db.query(
-      `INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner')
-       ON CONFLICT (phone, role) DO NOTHING`,
-      [cleanPhone, String(owner_name || '').trim() || null]
-    );
-    const uRes = await db.query(
+    // Find or create the owner's restaurant_owner profile (same phone, own profile)
+    let uRes = await db.query(
       "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner'", [cleanPhone]
     );
-    const owner = uRes.rows[0];
+    let owner = uRes.rows[0];
+    if (!owner) {
+      const c = await db.query(
+        "INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner') RETURNING *",
+        [cleanPhone, String(owner_name).trim()]
+      );
+      owner = c.rows[0];
+    }
     const rRes = await db.query(
-      `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, verified, status, is_coming_soon)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, verified, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true,'approved') RETURNING *`,
       [owner.id, String(restaurant_name).trim(), String(address).trim(),
        lat || null, lng || null, cleanPhone,
-       await storeImageUrl(db, photo_url), String(fssai || '').trim() || null, cleanAadhar || null,
-       !launchComingSoon, launchComingSoon ? 'pending' : 'approved', launchComingSoon]
+       photo_url || null, String(fssai).trim(), cleanAadhar || null]
     );
     await seedSuggestedCats(db, rRes.rows[0].id);
-    if (launchComingSoon) {
-      await notify(owner.id, '🏗️ Your restaurant is coming soon!',
-        `"${String(restaurant_name).trim()}" is listed under Coming soon on Mana Nellore. We will approve and launch it when it is ready!`);
-    } else {
-      await notify(owner.id, '🎉 Your restaurant is live!',
-        `"${String(restaurant_name).trim()}" is verified and open for business on Mana Nellore!`);
-    }
+    await notify(owner.id, '🎉 Your restaurant is live!',
+      `"${String(restaurant_name).trim()}" is verified and open for business on Mana Nellore!`);
     await audit(req, 'restaurant_onboarded_by_admin', 'restaurant', rRes.rows[0].id,
-      { restaurant_name: String(restaurant_name).trim(), phone: cleanPhone, coming_soon: launchComingSoon });
+      { restaurant_name: String(restaurant_name).trim(), phone: cleanPhone });
     res.status(201).json({ restaurant: rRes.rows[0] });
   })
 );
@@ -1156,7 +1033,6 @@ router.get(
 // POST /api/admin/rider-cod/:riderId/settle — mark all unsettled COD as settled (cash received)
 router.post(
   '/rider-cod/:riderId/settle',
-  idempotency('admin:rider-cod:settle'),
   ah(async (req, res) => {
     const r = await db.query(
       `UPDATE rider_cod_ledger SET settled = true, settled_at = now()
@@ -1292,353 +1168,4 @@ router.put(
   })
 );
 
-// ---- Coming soon / Finalize onboarding ----
-// Coming soon means NOT approved yet: marking coming soon un-approves
-// (pending + unverified, suspended stays suspended); finalizing approves
-// (approved + verified, from any non-rejected state) and opens ordering.
-router.put(
-  '/restaurants/:id/coming-soon',
-  ah(async (req, res) => {
-    const toComingSoon = req.body.is_coming_soon !== false;
-    const { rows } = await db.query(
-      `UPDATE restaurants
-       SET is_coming_soon = $1,
-           verified = CASE WHEN $1 THEN false ELSE true END,
-           status = CASE
-             WHEN $1 AND status = 'approved' THEN 'pending'
-             WHEN NOT $1 AND status <> 'rejected' THEN 'approved'
-             ELSE status END
-       WHERE id = $2
-       RETURNING id, is_coming_soon, verified, status`,
-      [toComingSoon, req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    await audit(req, toComingSoon ? 'restaurant_coming_soon' : 'restaurant_finalized',
-      'restaurant', req.params.id,
-      { is_coming_soon: rows[0].is_coming_soon, verified: rows[0].verified, status: rows[0].status });
-    res.json({ ok: true, is_coming_soon: rows[0].is_coming_soon, verified: rows[0].verified, status: rows[0].status });
-  })
-);
-
-// ---- Correct a restaurant's owner login number ----
-// PUT /api/admin/restaurants/:id/owner-phone { phone }
-// Reuses the existing restaurant_owner profile for that phone (same find-or-create
-// semantics as the onboard endpoint), then points the restaurant at it and updates
-// the public contact number. Audited.
-router.put(
-  '/restaurants/:id/owner-phone',
-  ah(async (req, res) => {
-    const cleanPhone = String(req.body.phone || '').replace(/\D/g, '').slice(-10);
-    if (!/^[6-9]\d{9}$/.test(cleanPhone)) {
-      return res.status(400).json({ error: 'A valid 10-digit mobile number is required' });
-    }
-    const { rows: rRows } = await db.query('SELECT * FROM restaurants WHERE id = $1', [req.params.id]);
-    const rest = rRows[0];
-    if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
-    // INSERT-first with ON CONFLICT: concurrent updates collapse onto one row.
-    await db.query(
-      `INSERT INTO users (phone, name, role) VALUES ($1, $2, 'restaurant_owner')
-       ON CONFLICT (phone, role) DO NOTHING`,
-      [cleanPhone, rest.name]
-    );
-    const uRes = await db.query(
-      "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner' ORDER BY created_at DESC",
-      [cleanPhone]
-    );
-    const owner = uRes.rows[0];
-    const prevOwnerId = rest.owner_id;
-    const prevPhone = rest.phone;
-    await db.query('UPDATE restaurants SET owner_id = $1, phone = $2 WHERE id = $3', [owner.id, cleanPhone, rest.id]);
-    await audit(req, 'restaurant_owner_phone', 'restaurant', rest.id,
-      { from_phone: prevPhone, to_phone: cleanPhone, from_owner: prevOwnerId, to_owner: owner.id });
-    res.json({ ok: true, phone: cleanPhone, owner_id: owner.id });
-  })
-);
-
-// ---- Edit a restaurant's details ----
-// PUT /api/admin/restaurants/:id/details { name, address, fssai, owner_name,
-//   opens_at, closes_at, opens_at_we, closes_at_we }
-// Updates the restaurant's editable details. All fields optional; only the
-// fields present in the body are changed. owner_name updates the linked
-// owner's user record. Empty strings clear the field (name cannot be emptied).
-// Timing fields accept 'HH:MM' or 'HH:MM:SS' (24h); empty string clears.
-// Audited.
-const TIME_RE = /^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
-router.put(
-  '/restaurants/:id/details',
-  ah(async (req, res) => {
-    const { rows: rRows } = await db.query('SELECT * FROM restaurants WHERE id = $1', [req.params.id]);
-    const rest = rRows[0];
-    if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
-    const { name, address, fssai, owner_name, lat, lng,
-      opens_at, closes_at, opens_at_we, closes_at_we, scheduling_suspended } = req.body || {};
-    const updates = [];
-    const vals = [];
-    let i = 1;
-    const changes = {};
-    if (name !== undefined) {
-      const v = String(name).trim();
-      if (!v) return res.status(400).json({ error: 'Restaurant name cannot be empty' });
-      updates.push('name = $' + (i++)); vals.push(v); changes.name = { from: rest.name, to: v };
-    }
-    if (address !== undefined) {
-      const v = String(address).trim() || null;
-      updates.push('address = $' + (i++)); vals.push(v); changes.address = { from: rest.address, to: v };
-    }
-    if (fssai !== undefined) {
-      const v = String(fssai).trim() || null;
-      updates.push('fssai = $' + (i++)); vals.push(v); changes.fssai = { from: rest.fssai, to: v };
-    }
-    if (lat !== undefined) {
-      const v = lat === null || lat === '' ? null : Number(lat);
-      if (v !== null && !Number.isFinite(v)) return res.status(400).json({ error: 'lat must be a number' });
-      updates.push('lat = $' + (i++)); vals.push(v); changes.lat = { from: rest.lat, to: v };
-    }
-    if (lng !== undefined) {
-      const v = lng === null || lng === '' ? null : Number(lng);
-      if (v !== null && !Number.isFinite(v)) return res.status(400).json({ error: 'lng must be a number' });
-      updates.push('lng = $' + (i++)); vals.push(v); changes.lng = { from: rest.lng, to: v };
-    }
-    if (scheduling_suspended !== undefined) {
-      const v = !!scheduling_suspended;
-      updates.push('scheduling_suspended = $' + (i++)); vals.push(v);
-      changes.scheduling_suspended = { from: rest.scheduling_suspended, to: v };
-    }
-    for (const tf of ['opens_at', 'closes_at', 'opens_at_we', 'closes_at_we']) {
-      const raw = { opens_at, closes_at, opens_at_we, closes_at_we }[tf];
-      if (raw !== undefined) {
-        const t = String(raw).trim();
-        if (t && !TIME_RE.test(t)) {
-          return res.status(400).json({ error: tf + " must be 'HH:MM' (24h)" });
-        }
-        const v = t || null;
-        updates.push(tf + ' = $' + (i++)); vals.push(v); changes[tf] = { from: rest[tf], to: v };
-      }
-    }
-    if (!updates.length && owner_name === undefined) {
-      return res.status(400).json({ error: 'Nothing to update' });
-    }
-    if (updates.length) {
-      vals.push(rest.id);
-      await db.query('UPDATE restaurants SET ' + updates.join(', ') + ' WHERE id = $' + i, vals);
-    }
-    if (owner_name !== undefined && rest.owner_id) {
-      const v = String(owner_name).trim() || null;
-      await db.query('UPDATE users SET name = $1 WHERE id = $2', [v, rest.owner_id]);
-      changes.owner_name = { to: v };
-    }
-    await audit(req, 'restaurant_details_updated', 'restaurant', rest.id, changes);
-    const { rows: out } = await db.query('SELECT * FROM restaurants WHERE id = $1', [rest.id]);
-    res.json({ ok: true, restaurant: out[0] });
-  })
-);
-
-// ---- Change a restaurant's photo ----
-// PUT /api/admin/restaurants/:id/photo { image_url }
-// Accepts a data-URL (stored once as a file, served at /img/<hash>) or an
-// https URL. Audited.
-router.put(
-  '/restaurants/:id/photo',
-  ah(async (req, res) => {
-    const imageUrl = String(req.body.image_url || '').trim();
-    if (!imageUrl) return res.status(400).json({ error: 'image_url is required' });
-    let stored;
-    try {
-      stored = await storeImageUrl(db, imageUrl);
-    } catch (e) {
-      return res.status(400).json({ error: e.message });
-    }
-    const { rows } = await db.query(
-      'UPDATE restaurants SET image_url = $1 WHERE id = $2 RETURNING id, name',
-      [stored, req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    await audit(req, 'restaurant_photo_changed', 'restaurant', rows[0].id, { name: rows[0].name });
-    res.json({ ok: true, image_url: stored });
-  })
-);
-
-// ---- Bulk menu import (audited) ----
-// POST /api/admin/restaurants/:id/menu/import
-// { categories: ["IDLI", ...], items: [{ category, name, price_paise, veg, is_combo }] }
-// For owners who can't add items themselves. Creates missing categories by name,
-// skips exact duplicates, preserves input order. Every import is audit-logged.
-router.post(
-  '/restaurants/:id/menu/import',
-  ah(async (req, res) => {
-    const { rows: rRows } = await db.query('SELECT id FROM restaurants WHERE id = $1', [req.params.id]);
-    if (!rRows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    const rid = rRows[0].id;
-    const body = req.body || {};
-    const items = Array.isArray(body.items) ? body.items : [];
-    if (!items.length) return res.status(400).json({ error: 'No items to import' });
-    if (items.length > 500) return res.status(400).json({ error: 'Too many items (max 500)' });
-
-    const catIdByName = {};
-    const maxSort = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM categories WHERE restaurant_id = $1', [rid]);
-    let catSort = Number(maxSort.rows[0].s) || 0;
-    async function catIdFor(rawName) {
-      const name = String(rawName || '').trim();
-      if (!name) return null;
-      if (catIdByName[name]) return catIdByName[name];
-      const ex = await db.query('SELECT id FROM categories WHERE restaurant_id = $1 AND name = $2', [rid, name]);
-      if (ex.rows[0]) { catIdByName[name] = ex.rows[0].id; return ex.rows[0].id; }
-      const c = await db.query(
-        'INSERT INTO categories (restaurant_id, name, sort_order) VALUES ($1, $2, $3) RETURNING id',
-        [rid, name, catSort++]
-      );
-      catIdByName[name] = c.rows[0].id;
-      return c.rows[0].id;
-    }
-    // Pre-create in the given order so tabs sort correctly
-    for (const n of (Array.isArray(body.categories) ? body.categories : [])) await catIdFor(n);
-
-    const maxItemSort = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM menu_items WHERE restaurant_id = $1', [rid]);
-    let itemSort = Number(maxItemSort.rows[0].s) || 0;
-    let created = 0, skipped = 0;
-    for (const it of items) {
-      const name = String(it.name || '').trim();
-      const price = Math.round(Number(it.price_paise));
-      if (!name || !Number.isFinite(price) || price < 0) { skipped++; continue; }
-      const catId = await catIdFor(it.category);
-      const dup = await db.query(
-        `SELECT id FROM menu_items WHERE restaurant_id = $1 AND name = $2
-         AND COALESCE(category_id::text, '') = COALESCE($3::text, '')`,
-        [rid, name, catId]
-      );
-      if (dup.rows[0]) { skipped++; continue; }
-      await db.query(
-        `INSERT INTO menu_items (restaurant_id, category_id, name, price_paise, veg, available, is_combo, sort_order)
-         VALUES ($1, $2, $3, $4, $5, true, $6, $7)`,
-        [rid, catId, name, price, it.veg !== false, !!it.is_combo, itemSort++]
-      );
-      created++;
-    }
-    await audit(req, 'menu_bulk_import', 'restaurant', rid, { created, skipped });
-    res.json({ ok: true, created, skipped });
-  })
-);
-
-
-// ---- Admin menu item management (audited) ----
-// POST /api/admin/restaurants/:id/menu/items
-// { category, name, description, price_paise, veg, available, image_url, is_combo }
-// image_url accepts a data-URL (stored via images lib) or https URL.
-router.post(
-  '/restaurants/:id/menu/items',
-  ah(async (req, res) => {
-    const { rows: rRows } = await db.query('SELECT id, name FROM restaurants WHERE id = $1', [req.params.id]);
-    if (!rRows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    const rid = rRows[0].id;
-    const b = req.body || {};
-    const name = String(b.name || '').trim();
-    const price = Math.round(Number(b.price_paise));
-    if (!name) return res.status(400).json({ error: 'name is required' });
-    if (!Number.isFinite(price) || price < 0) return res.status(400).json({ error: 'valid price_paise is required' });
-    // Resolve or create category by name
-    let catId = null;
-    const catName = String(b.category || '').trim();
-    if (catName) {
-      const ex = await db.query('SELECT id FROM categories WHERE restaurant_id = $1 AND name = $2', [rid, catName]);
-      if (ex.rows[0]) catId = ex.rows[0].id;
-      else {
-        const ms = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM categories WHERE restaurant_id = $1', [rid]);
-        const c = await db.query('INSERT INTO categories (restaurant_id, name, sort_order) VALUES ($1, $2, $3) RETURNING id',
-          [rid, catName, Number(ms.rows[0].s) || 0]);
-        catId = c.rows[0].id;
-      }
-    }
-    let imageUrl = null;
-    if (b.image_url) {
-      try { imageUrl = await storeImageUrl(db, String(b.image_url)); }
-      catch (e) { return res.status(400).json({ error: e.message }); }
-    }
-    const ms2 = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM menu_items WHERE restaurant_id = $1', [rid]);
-    const { rows } = await db.query(
-      `INSERT INTO menu_items (restaurant_id, category_id, name, description, image_url, price_paise, veg, available, is_combo, sort_order)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [rid, catId, name, String(b.description || '').trim() || null, imageUrl,
-       price, b.veg !== false, b.available !== false, !!b.is_combo, Number(ms2.rows[0].s) || 0]
-    );
-    await audit(req, 'menu_item_created', 'restaurant', rid, { item_id: rows[0].id, name });
-    res.status(201).json({ ok: true, item: rows[0] });
-  })
-);
-
-// PUT /api/admin/restaurants/:id/menu/items/:itemId
-// Partial update. image_url accepts data-URL or https URL. Audited.
-router.put(
-  '/restaurants/:id/menu/items/:itemId',
-  ah(async (req, res) => {
-    const { rows: rRows } = await db.query('SELECT id FROM restaurants WHERE id = $1', [req.params.id]);
-    if (!rRows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    const rid = rRows[0].id;
-    const { rows: iRows } = await db.query('SELECT * FROM menu_items WHERE id = $1 AND restaurant_id = $2', [req.params.itemId, rid]);
-    if (!iRows[0]) return res.status(404).json({ error: 'Menu item not found' });
-    const b = req.body || {};
-    const sets = [], vals = [];
-    let vi = 1;
-    function set(col, val) { sets.push(col + ' = $' + (vi++)); vals.push(val); }
-    if (b.name !== undefined) {
-      const n = String(b.name).trim();
-      if (!n) return res.status(400).json({ error: 'name cannot be empty' });
-      set('name', n);
-    }
-    if (b.price_paise !== undefined) {
-      const p = Math.round(Number(b.price_paise));
-      if (!Number.isFinite(p) || p < 0) return res.status(400).json({ error: 'valid price_paise is required' });
-      set('price_paise', p);
-    }
-    if (b.description !== undefined) set('description', String(b.description).trim() || null);
-    if (b.veg !== undefined) set('veg', !!b.veg);
-    if (b.available !== undefined) set('available', !!b.available);
-    if (b.is_combo !== undefined) set('is_combo', !!b.is_combo);
-    if (b.category !== undefined) {
-      const catName = String(b.category || '').trim();
-      let catId = null;
-      if (catName) {
-        const ex = await db.query('SELECT id FROM categories WHERE restaurant_id = $1 AND name = $2', [rid, catName]);
-        if (ex.rows[0]) catId = ex.rows[0].id;
-        else {
-          const ms = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS s FROM categories WHERE restaurant_id = $1', [rid]);
-          const c = await db.query('INSERT INTO categories (restaurant_id, name, sort_order) VALUES ($1, $2, $3) RETURNING id',
-            [rid, catName, Number(ms.rows[0].s) || 0]);
-          catId = c.rows[0].id;
-        }
-      }
-      set('category_id', catId);
-    }
-    if (b.image_url !== undefined) {
-      let stored = null;
-      if (b.image_url) {
-        try { stored = await storeImageUrl(db, String(b.image_url)); }
-        catch (e) { return res.status(400).json({ error: e.message }); }
-      }
-      set('image_url', stored);
-    }
-    if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
-    vals.push(req.params.itemId, rid);
-    const { rows } = await db.query(
-      'UPDATE menu_items SET ' + sets.join(', ') + ' WHERE id = $' + vi + ' AND restaurant_id = $' + (vi + 1) + ' RETURNING *',
-      vals
-    );
-    await audit(req, 'menu_item_updated', 'restaurant', rid, { item_id: rows[0].id, name: rows[0].name });
-    res.json({ ok: true, item: rows[0] });
-  })
-);
-
-// DELETE /api/admin/restaurants/:id/menu/items/:itemId — audited.
-router.delete(
-  '/restaurants/:id/menu/items/:itemId',
-  ah(async (req, res) => {
-    const { rows: rRows } = await db.query('SELECT id FROM restaurants WHERE id = $1', [req.params.id]);
-    if (!rRows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    const rid = rRows[0].id;
-    const { rows } = await db.query('DELETE FROM menu_items WHERE id = $1 AND restaurant_id = $2 RETURNING id, name', [req.params.itemId, rid]);
-    if (!rows[0]) return res.status(404).json({ error: 'Menu item not found' });
-    await audit(req, 'menu_item_deleted', 'restaurant', rid, { item_id: rows[0].id, name: rows[0].name });
-    res.json({ ok: true, deleted: rows[0].id });
-  })
-);
-
-module.exports = router;
+module.exports = router;module.exports = router;

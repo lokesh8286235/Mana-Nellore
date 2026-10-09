@@ -135,20 +135,12 @@ router.get(
   '/config',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'tax_rates')"
-    );
-    const byKey = Object.fromEntries(rows.map((r) => [r.key, r.value]));
-    // GST rates the customer app applies to the bill. Served from the DB so
-    // they can change without an app rebuild; defaults match db.js seeding.
-    const taxRates = Object.assign(
-      { food_gst_pct: 5, delivery_gst_pct: 18, platform_gst_pct: 18 },
-      byKey.tax_rates || {}
+      "SELECT value FROM pricing_config WHERE key = 'call_to_order_phone'"
     );
     res.json({
-      call_to_order_phone: (byKey.call_to_order_phone) || '',
+      call_to_order_phone: (rows[0] && rows[0].value) || '',
       maps_key: process.env.GOOGLE_MAPS_KEY || '',
-      razorpay_key: process.env.RAZORPAY_KEY_ID || '',
-      tax_rates: taxRates
+      razorpay_key: process.env.RAZORPAY_KEY_ID || ''
     });
   })
 );

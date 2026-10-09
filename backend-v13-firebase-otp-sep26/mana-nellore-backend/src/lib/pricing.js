@@ -13,21 +13,10 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-// Pricing config changes rarely (admin edits). Cache in memory for 60s to
-// avoid a DB round trip on every quote and placement. Admin changes apply
-// within a minute — acceptable for pricing.
-let _pricingCache = null;
-let _pricingCacheAt = 0;
-const PRICING_CACHE_TTL_MS = 60000;
-
 async function loadPricingConfig(db) {
-  const now = Date.now();
-  if (_pricingCache && now - _pricingCacheAt < PRICING_CACHE_TTL_MS) {
-    return _pricingCache;
-  }
   const { rows } = await db.query('SELECT key, value FROM pricing_config');
   const m = Object.fromEntries(rows.map((r) => [r.key, r.value]));
-  const cfg = {
+  return {
     deliveryTiers:
       (m.delivery_tiers && m.delivery_tiers.tiers) || [
         { up_to_km: 3, rate_paise_per_km: 1000 },
@@ -51,49 +40,7 @@ async function loadPricingConfig(db) {
       (m.free_delivery_rules && m.free_delivery_rules.rules) || [],
     // Honest ETA estimate shown to customers ("Usually ~X min") — NOT a delivery promise.
     etaMinutes: Number(m.eta_minutes != null ? m.eta_minutes : 30),
-    // GST rates (%) charged on the customer bill. Backend-driven: the admin
-    // Pricing screen edits these, the customer app fetches them via /api/config.
-    taxRates: normalizeTaxRates(m.tax_rates),
-    // Flat rider bonus per extra on-the-way pickup stop (beyond the primary).
-    // Falls back to ₹15 when the key is absent — no migration needed.
-    riderPayoutExtraStopPaise: Number(
-      m.rider_payout_extra_stop_paise != null ? m.rider_payout_extra_stop_paise : 1500
-    ),
-    // Fallback distance (km) used for delivery-fee calculation when restaurant
-    // or address coordinates are missing. The fee is still computed via the
-    // admin-configurable delivery tiers — never a hardcoded rupee value.
-    // Default 5km is a sensible Nellore average; admin can tune via pricing_config.
-    fallbackDistanceKm: Number(
-      m.fallback_distance_km != null ? m.fallback_distance_km : 5
-    ),
   };
-  _pricingCache = cfg;
-  _pricingCacheAt = Date.now();
-  return cfg;
-}
-
-// Defensive normalization for the tax_rates pricing_config value.
-// Never throws; falls back to the founder's rates on bad data.
-function normalizeTaxRates(v) {
-  const d = { food_gst_pct: 5, delivery_gst_pct: 18, platform_gst_pct: 18 };
-  if (!v || typeof v !== 'object' || Array.isArray(v)) return { ...d };
-  const out = {};
-  for (const k of Object.keys(d)) {
-    const n = Number(v[k]);
-    out[k] = v[k] == null || !Number.isFinite(n) || n < 0 ? d[k] : n;
-  }
-  return out;
-}
-
-// Component-wise GST, each component rounded to paise then summed.
-// Matches the customer app's bill math so displayed and charged totals agree.
-function computeGstPaise(taxRates, { foodPaise, deliveryPaise, platformPaise }) {
-  const r = normalizeTaxRates(taxRates);
-  const g = (base, pct) => Math.round((Number(base) || 0) * pct / 100);
-  const food = g(foodPaise, r.food_gst_pct);
-  const delivery = g(deliveryPaise, r.delivery_gst_pct);
-  const platform = g(platformPaise, r.platform_gst_pct);
-  return { food, delivery, platform, total: food + delivery + platform, rates: r };
 }
 
 // Marginal tiers: 0-3 km @ Rs 10/km, 3-8 km @ Rs 9/km, 8+ km @ Rs 8/km.
@@ -138,44 +85,30 @@ function riderPayoutPaise(cfg, distanceKm) {
   );
 }
 
-function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct, taxRates, gstFoodBasePaise }) {
+function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct }) {
   const net = subtotalPaise - discountPaise;
-  // When locations are unknown, estimate via the tier engine at the
-  // admin-configurable fallback distance — never a hardcoded rupee value.
-  const effDist = distanceKm == null ? (Number(config.fallbackDistanceKm) || 5) : distanceKm;
-  const deliveryFee = deliveryFeePaise(config.deliveryTiers, effDist, net, config.freeDeliveryRules);
+  const deliveryFee =
+    distanceKm == null
+      ? 2500 // fallback Rs 25 when locations are unknown
+      : deliveryFeePaise(config.deliveryTiers, distanceKm, net, config.freeDeliveryRules);
   const platformFeePaise = config.platformFeePaise;
   const pct = commissionPct != null ? Number(commissionPct) : config.defaultCommissionPct;
   const commissionPaise = Math.round((net * pct) / 100);
   const payout =
     distanceKm == null ? null : riderPayoutPaise(config.riderPayout, distanceKm);
-  // GST is charged on the customer bill at backend-driven rates. The food base
-  // is the pre-discount subtotal, matching the customer app's bill math so the
-  // displayed total and the charged total agree to the paise.
-  const gst = computeGstPaise(
-    taxRates || config.taxRates,
-    {
-      foodPaise: gstFoodBasePaise != null ? gstFoodBasePaise : subtotalPaise,
-      deliveryPaise: deliveryFee,
-      platformPaise: platformFeePaise
-    }
-  );
   return {
     deliveryFeePaise: deliveryFee,
     platformFeePaise,
-    taxPaise: gst.total,
-    gstBreakdown: gst,
+    taxPaise: 0,
     commissionPaise,
     riderPayoutPaise: payout,
-    totalPaise: net + deliveryFee + platformFeePaise + gst.total
+    totalPaise: net + deliveryFee + platformFeePaise
   };
 }
 
 module.exports = {
   haversineKm,
   loadPricingConfig,
-  normalizeTaxRates,
-  computeGstPaise,
   deliveryFeePaise,
   riderPayoutPaise,
   computeQuote

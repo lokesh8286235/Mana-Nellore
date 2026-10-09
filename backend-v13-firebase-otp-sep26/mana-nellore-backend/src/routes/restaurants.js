@@ -3,7 +3,6 @@ const express = require('express');
 const db = require('../db');
 const { ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, deliveryFeePaise } = require('../lib/pricing');
-const { getBatchDurations, durationToEtaMinutes } = require('../lib/routesApi');
 
 const router = express.Router();
 
@@ -36,10 +35,7 @@ router.get(
     const cached = cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
-    // Live (approved) restaurants plus Coming-soon ones (pending, not approved yet).
-    // Coming soon is a visibility state, not an approval: customers see the full
-    // menu but the apps + order guard block ordering until finalized.
-    const conditions = ["(r.status = 'approved' OR r.is_coming_soon = true)"];
+    const conditions = ["r.status = 'approved'"];
     const params = [];
 
     if (q) {
@@ -56,39 +52,26 @@ router.get(
       ))`);
     }
     if (veg === 'true') {
-      // Perf: reuse the hv JOIN (already computed for has_veg) instead of a
-      // correlated EXISTS per restaurant.
-      conditions.push(`hv.rid IS NOT NULL`);
+      conditions.push(
+        `EXISTS (SELECT 1 FROM menu_items mi WHERE mi.restaurant_id = r.id AND mi.veg = true AND mi.available = true)`
+      );
     }
     if (open === 'true') {
       conditions.push('r.is_open = true');
     }
 
-    // Perf: the three per-restaurant aggregates are pre-computed once via LEFT
-    // JOINs instead of correlated subqueries (was ~300ms per cache miss).
     const { rows } = await db.query(
       `SELECT r.*,
-              COALESCE(ao.cnt, 0) AS active_orders,
-              ap.avg_mins AS avg_pack_minutes,
-              (hv.rid IS NOT NULL) AS has_veg
-       FROM restaurants r
-       LEFT JOIN (
-         SELECT restaurant_id, COUNT(*) AS cnt FROM orders
-         WHERE status IN ('placed','accepted','preparing','ready')
-         GROUP BY restaurant_id
-       ) ao ON ao.restaurant_id = r.id
-       LEFT JOIN (
-         SELECT restaurant_id,
-                ROUND(AVG(EXTRACT(EPOCH FROM (packed_at - placed_at)) / 60)) AS avg_mins
-         FROM orders
-         WHERE packed_at IS NOT NULL AND placed_at > now() - interval '30 days'
-         GROUP BY restaurant_id
-       ) ap ON ap.restaurant_id = r.id
-       LEFT JOIN (
-         SELECT DISTINCT restaurant_id AS rid FROM menu_items
-         WHERE veg = true AND available = true
-       ) hv ON hv.rid = r.id
-       WHERE ${conditions.join(' AND ')} ORDER BY r.rating_avg DESC, r.name ASC`,
+              (SELECT COUNT(*) FROM orders o
+               WHERE o.restaurant_id = r.id
+                 AND o.status IN ('placed','accepted','preparing','ready')) AS active_orders,
+              (SELECT ROUND(AVG(EXTRACT(EPOCH FROM (o.packed_at - o.placed_at)) / 60))
+               FROM orders o
+               WHERE o.restaurant_id = r.id AND o.packed_at IS NOT NULL
+                 AND o.placed_at > now() - interval '30 days') AS avg_pack_minutes,
+              (SELECT EXISTS (SELECT 1 FROM menu_items mi
+               WHERE mi.restaurant_id = r.id AND mi.veg = true AND mi.available = true)) AS has_veg
+       FROM restaurants r WHERE ${conditions.join(' AND ')} ORDER BY r.rating_avg DESC, r.name ASC`,
       params
     );
 
@@ -112,7 +95,6 @@ router.get(
         description: r.description,
         image_url: r.image_url,
         rating_avg: Number(r.rating_avg),
-        rating_count: Number(r.rating_count) || 0,
         verified: !!r.verified,
         is_open: isOpenNow(r),
         opens_at: r.opens_at,
@@ -124,52 +106,12 @@ router.get(
         birthday_dessert: !!r.birthday_dessert,
         chef_name: r.chef_name,
         chef_photo: r.chef_photo,
-        distance_km: distanceKm == null || distanceKm > 200 ? null : Math.round(distanceKm * 10) / 10,
+        distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
         delivery_fee_paise: fee,
         has_veg: !!r.has_veg,
-        is_coming_soon: !!r.is_coming_soon,
-        // Fallback ETA (haversine-based); replaced with Routes API below if available
-        eta_minutes: distanceKm == null ? 30 : Math.round(20 + distanceKm * 3),
-        _lat: r.lat,
-        _lng: r.lng,
+        eta_minutes: distanceKm == null ? 30 : Math.round(20 + distanceKm * 3)
       };
     });
-
-    // Accurate ETAs via Google Routes API (one batch call for all restaurants).
-    // Falls back to haversine estimates if the API is unavailable.
-    if (hasLoc) {
-      try {
-        const withCoords = [];
-        const idxMap = [];
-        list.forEach((item, i) => {
-          if (item._lat != null && item._lng != null) {
-            withCoords.push({ lat: Number(item._lat), lng: Number(item._lng) });
-            idxMap.push(i);
-          }
-        });
-        if (withCoords.length > 0) {
-          const durations = await getBatchDurations(custLat, custLng, withCoords);
-          durations.forEach((route, validIdx) => {
-            const listIdx = idxMap[validIdx];
-            if (listIdx != null && route.durationSec != null) {
-              // Real travel time + 15 min prep buffer (replaces 20 + dist*3 heuristic)
-              const eta = durationToEtaMinutes(route.durationSec, 15);
-              if (eta != null) list[listIdx].eta_minutes = eta;
-              // Update distance to real road distance if available
-              if (route.distanceMeters != null) {
-                list[listIdx].distance_km = Math.round(route.distanceMeters / 100) / 10;
-              }
-            }
-          });
-        }
-      } catch (e) {
-        console.error('Routes API batch ETA failed, using fallback:', e.message);
-      }
-      // Remove internal coords before sending
-      list.forEach(item => { delete item._lat; delete item._lng; });
-    } else {
-      list.forEach(item => { delete item._lat; delete item._lng; });
-    }
     // Nearest first when we know where the customer is
     if (hasLoc) {
       list.sort((a, b) => (a.distance_km == null ? 9999 : a.distance_km) - (b.distance_km == null ? 9999 : b.distance_km));
@@ -194,7 +136,7 @@ router.get(
          WHERE cr.collection_id = $1 AND r.status = 'approved'`,
         [c.id]
       );
-      c.restaurants = rs.rows.map((r) => ({ ...r, rating_avg: Number(r.rating_avg), rating_count: Number(r.rating_count) || 0 }));
+      c.restaurants = rs.rows.map((r) => ({ ...r, rating_avg: Number(r.rating_avg) }));
     }
     res.json({ collections: rows });
   })
@@ -249,127 +191,6 @@ router.get(
 );
 
 // GET /api/restaurants/:id -> restaurant + categories + available menu items
-// GET /api/restaurants/dishes/search?q=biryani&max_price_paise=50000&veg=true
-// Cross-restaurant dish search for the "Ask Mana" conversational ordering.
-// Must sit BEFORE /:id so Express doesn't treat "dishes" as an id.
-// q is optional: without it, browses every dish under the price cap
-// ("for 10 under 1000" with no dish named).
-router.get(
-  '/dishes/search',
-  ah(async (req, res) => {
-    const q = (req.query.q || '').trim();
-    const maxPrice = req.query.max_price_paise != null ? Number(req.query.max_price_paise) : null;
-    const vegOnly = req.query.veg === 'true';
-    const clauses = [];
-    const params = [];
-    if (q) {
-      params.push('%' + q + '%');
-      /* spelling-tolerant: menu spellings vary (Idly vs Idli, Biriyani vs Biryani).
-         Normalising y->i on both sides merges that whole class of typos. */
-      clauses.push(`REPLACE(LOWER(m.name), 'y', 'i') LIKE REPLACE(LOWER($${params.length}), 'y', 'i')`);
-    }
-    if (Number.isFinite(maxPrice) && maxPrice >= 0) {
-      params.push(Math.floor(maxPrice));
-      clauses.push(`m.price_paise <= $${params.length}`);
-    }
-    if (vegOnly) clauses.push('m.veg = true');
-    /* Smart ranking: exact name matches first for specific queries (e.g. "ghee dosa"),
-       recommended (high-rated) first for general queries (e.g. "dosa"). */
-    const qWords = q.toLowerCase().split(/\s+/).filter(Boolean);
-    const isSpecific = qWords.length > 1;
-    let orderBy = 'm.price_paise ASC';
-    if (q) {
-      if (isSpecific) {
-        /* Specific: exact prefix matches first, then contains, then by rating */
-        params.push(q.toLowerCase() + '%');
-        const exactParam = params.length;
-        orderBy = `CASE WHEN LOWER(m.name) LIKE $${exactParam} THEN 0 ELSE 1 END, r.rating_avg DESC NULLS LAST, m.price_paise ASC`;
-      } else {
-        /* General: highest-rated first (recommended) */
-        orderBy = 'r.rating_avg DESC NULLS LAST, m.price_paise ASC';
-      }
-    }
-    const { rows } = await db.query(
-      `SELECT m.id, m.name, m.price_paise, m.veg, m.image_url,
-              r.id AS restaurant_id, r.name AS restaurant_name,
-              r.rating_avg, r.is_coming_soon
-       FROM menu_items m
-       JOIN restaurants r ON r.id = m.restaurant_id
-       WHERE m.available = true
-         AND r.status = 'approved' AND r.is_coming_soon = false
-         ${clauses.map((c) => 'AND ' + c).join(' ')}
-       ORDER BY ${orderBy}
-       LIMIT 30`,
-      params
-    );
-    res.json({
-      dishes: rows.map((d) => ({
-        id: d.id,
-        name: d.name,
-        price_paise: d.price_paise,
-        veg: !!d.veg,
-        image_url: d.image_url,
-        restaurant_id: d.restaurant_id,
-        restaurant_name: d.restaurant_name,
-        rating_avg: Number(d.rating_avg) || 0,
-        rating_count: Number(d.rating_count) || 0,
-      })),
-    });
-  })
-);
-
-// GET /api/restaurants/dishes/:id/pairings — "pairs well with" from the SAME restaurant.
-// Uses real co-order data when available, falls back to restaurant bestsellers.
-router.get(
-  '/dishes/:id/pairings',
-  ah(async (req, res) => {
-    const dishId = req.params.id;
-    // Find the dish's restaurant
-    const dishRes = await db.query('SELECT id, restaurant_id FROM menu_items WHERE id = $1', [dishId]);
-    if (!dishRes.rows.length) return res.status(404).json({ error: 'Dish not found' });
-    const restId = dishRes.rows[0].restaurant_id;
-
-    // Co-ordered dishes from the same restaurant (real order data)
-    const { rows: paired } = await db.query(
-      `SELECT oi2.menu_item_id AS id, oi2.name_snapshot AS name, mi.price_paise, mi.veg, mi.image_url,
-              COUNT(*) AS together
-       FROM order_items oi1
-       JOIN order_items oi2 ON oi2.order_id = oi1.order_id AND oi2.menu_item_id != oi1.menu_item_id
-       JOIN orders o ON o.id = oi1.order_id
-       LEFT JOIN menu_items mi ON mi.id = oi2.menu_item_id
-       WHERE oi1.menu_item_id = $1 AND o.restaurant_id = $2 AND o.status = 'delivered'
-         AND mi.available = true
-       GROUP BY oi2.menu_item_id, oi2.name_snapshot, mi.price_paise, mi.veg, mi.image_url
-       ORDER BY together DESC LIMIT 6`,
-      [dishId, restId]
-    );
-
-    let pairings = paired.map((p) => ({ ...p, together: Number(p.together) }));
-
-    // Fallback: restaurant bestsellers (excluding this dish) if not enough co-order data
-    if (pairings.length < 4) {
-      const exclude = pairings.map((p) => p.id);
-      const { rows: best } = await db.query(
-        `SELECT mi.id, mi.name, mi.price_paise, mi.veg, mi.image_url, COUNT(oi.id) AS orders
-         FROM menu_items mi
-         LEFT JOIN order_items oi ON oi.menu_item_id = mi.id
-         LEFT JOIN orders o ON o.id = oi.order_id AND o.status = 'delivered'
-         WHERE mi.restaurant_id = $1 AND mi.available = true AND mi.id != $2
-           ${exclude.length ? `AND mi.id != ALL($3)` : ''}
-         GROUP BY mi.id, mi.name, mi.price_paise, mi.veg, mi.image_url
-         ORDER BY orders DESC, mi.id LIMIT ${6 - pairings.length}`,
-        exclude.length ? [restId, dishId, exclude] : [restId, dishId]
-      );
-      const seen = new Set(pairings.map((p) => String(p.id)));
-      for (const b of best) {
-        if (!seen.has(String(b.id))) pairings.push({ ...b, orders: Number(b.orders) });
-      }
-    }
-
-    res.json({ pairings: pairings.slice(0, 6) });
-  })
-);
-
 router.get(
   '/:id',
   ah(async (req, res) => {
@@ -378,7 +199,7 @@ router.get(
       return res.status(404).json({ error: 'Restaurant not found' });
     }
     const { rows } = await db.query(
-      "SELECT * FROM restaurants WHERE id = $1 AND (status = 'approved' OR is_coming_soon = true)",
+      "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'",
       [req.params.id]
     );
     const restaurant = rows[0];
@@ -430,53 +251,24 @@ router.get(
       const key = it.category_id || 'uncategorized';
       (byCat[key] = byCat[key] || []).push(it);
     }
-    const gallery = await db.query(
-      `SELECT photo_url, caption FROM restaurant_photos
-       WHERE restaurant_id = $1 ORDER BY sort_order ASC, created_at DESC`,
-      [restaurant.id]
-    );
     const photos = await db.query(
-      `SELECT photo_url, food_rating, comment, created_at FROM ratings
-       WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND (photo_url IS NOT NULL OR comment IS NOT NULL)
-       ORDER BY created_at DESC LIMIT 20`,
+      `SELECT photo_url, food_rating, created_at FROM ratings
+       WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND photo_url IS NOT NULL
+       ORDER BY created_at DESC LIMIT 12`,
       [restaurant.id]
     );
     const dLat = parseFloat(req.query.lat);
     const dLng = parseFloat(req.query.lng);
     let detailDist = null;
     if (Number.isFinite(dLat) && Number.isFinite(dLng) && restaurant.lat != null && restaurant.lng != null) {
-      const _dd = haversineKm(dLat, dLng, Number(restaurant.lat), Number(restaurant.lng));
-      detailDist = _dd > 200 ? null : Math.round(_dd * 10) / 10;
+      detailDist = Math.round(haversineKm(dLat, dLng, Number(restaurant.lat), Number(restaurant.lng)) * 10) / 10;
     }
     res.json({
-      // Whitelisted public fields only: the raw row carries owner PII
-      // (aadhar, fssai, owner_id, gstin) that must never reach clients.
-      restaurant: {
-        id: restaurant.id,
-        name: restaurant.name,
-        description: restaurant.description,
-        address: restaurant.address,
-        phone: restaurant.phone,
-        image_url: restaurant.image_url,
-        rating_avg: Number(restaurant.rating_avg),
-        rating_count: Number(restaurant.rating_count) || 0,
-        is_open: isOpenNow(restaurant),
-        verified: !!restaurant.verified,
-        opens_at: restaurant.opens_at,
-        closes_at: restaurant.closes_at,
-        opens_at_we: restaurant.opens_at_we,
-        closes_at_we: restaurant.closes_at_we,
-        birthday_dessert: !!restaurant.birthday_dessert,
-        chef_name: restaurant.chef_name,
-        chef_photo: restaurant.chef_photo,
-        chef_story: restaurant.chef_story,
-        is_coming_soon: !!restaurant.is_coming_soon,
-        distance_km: detailDist
-      },
+      restaurant: { ...restaurant, rating_avg: Number(restaurant.rating_avg), is_open: isOpenNow(restaurant),
+        verified: !!restaurant.verified, distance_km: detailDist },
       categories: cats.rows.map((c) => ({ ...c, items: byCat[c.id] || [] })),
       uncategorized: byCat.uncategorized || [],
-      review_photos: photos.rows,
-      gallery: gallery.rows
+      review_photos: photos.rows
     });
   })
 );
