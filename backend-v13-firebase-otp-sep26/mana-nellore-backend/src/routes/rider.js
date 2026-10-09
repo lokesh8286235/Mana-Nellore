@@ -387,9 +387,10 @@ router.get(
          AND (o.otw_role IS NULL OR o.otw_role = 'primary')`,
       [rider.id]
     );
+    /* TEMP-DISABLED for testing
     if (activeGroups.rows.some((g) => Number(g.secondary_count) > 0)) {
       return res.json({ deliveries: [], multi_delivery_active: true, on_the_way_filter: false });
-    }
+    } */
     const anchors = [];
     const onWayFilter = false; /* TEMP-DISABLED for testing — every order pops up */
     const { rows } = await db.query(
