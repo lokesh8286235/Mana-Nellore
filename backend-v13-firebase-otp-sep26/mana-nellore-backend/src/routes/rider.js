@@ -185,11 +185,15 @@ router.get(
   })
 );
 
-// PUT /api/rider/profile { name, vehicle_type, vehicle_number, licence_no, aadhaar_no, aadhaar_photo, profile_photo }
+// PUT /api/rider/profile { name, vehicle_type, vehicle_number, licence_no, aadhaar_no, aadhaar_photo, profile_photo, upi_id, bank_account, ifsc }
 router.put(
   '/profile',
   ah(async (req, res) => {
-    const { name, vehicle_type, vehicle_number, licence_no, aadhaar_no, aadhaar_photo, profile_photo } = req.body;
+    const { name, vehicle_type, vehicle_number, licence_no, aadhaar_no, aadhaar_photo, profile_photo, upi_id, bank_account, ifsc } = req.body;
+    /* Ensure bank detail columns exist (safe if already present) */
+    await db.query(`ALTER TABLE riders ADD COLUMN IF NOT EXISTS upi_id TEXT`).catch(() => {});
+    await db.query(`ALTER TABLE riders ADD COLUMN IF NOT EXISTS bank_account TEXT`).catch(() => {});
+    await db.query(`ALTER TABLE riders ADD COLUMN IF NOT EXISTS ifsc TEXT`).catch(() => {});
     // Update user name if provided
     if (name && String(name).trim()) {
       await db.query('UPDATE users SET name = $1 WHERE id = $2', [String(name).trim().slice(0, 60), req.user.id]);
@@ -212,8 +216,11 @@ router.put(
                          aadhaar_no = COALESCE($4, aadhaar_no),
                          aadhaar_photo = COALESCE($5, aadhaar_photo),
                          profile_photo = COALESCE($6, profile_photo),
+                         upi_id = COALESCE($7, upi_id),
+                         bank_account = COALESCE($8, bank_account),
+                         ifsc = COALESCE($9, ifsc),
                          status = CASE WHEN status IN ('rejected','suspended') THEN 'pending' ELSE status END
-       WHERE user_id = $7 RETURNING *`,
+       WHERE user_id = $10 RETURNING *`,
       [
         vehicle_type || null,
         vehicle_number || null,
@@ -221,6 +228,9 @@ router.put(
         aadhaar_no || null,
         checkPhoto(aadhaar_photo),
         checkPhoto(profile_photo),
+        upi_id ? String(upi_id).trim().slice(0, 60) : null,
+        bank_account ? String(bank_account).trim().slice(0, 34) : null,
+        ifsc ? String(ifsc).trim().toUpperCase().slice(0, 11) : null,
         req.user.id,
       ]
     );
