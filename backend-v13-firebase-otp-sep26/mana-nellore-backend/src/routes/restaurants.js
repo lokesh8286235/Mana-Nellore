@@ -225,7 +225,7 @@ router.get(
     }
 
     const { rows } = await db.query(
-      `SELECT id, name, photo_url, image_url, lat, lng, is_open, rating, delivery_time_min
+      `SELECT id, name, image_url, lat, lng, is_open, rating_avg AS rating
        FROM restaurants
        WHERE status = 'approved' AND lat IS NOT NULL AND lng IS NOT NULL`
     );
@@ -237,11 +237,11 @@ router.get(
         out.push({
           id: r.id,
           name: r.name,
-          photo_url: r.photo_url,
+          photo_url: r.image_url,
           image_url: r.image_url,
           is_open: !!r.is_open,
           rating: r.rating,
-          delivery_time_min: r.delivery_time_min,
+          
           route_dist_km: Math.round(pr.dist * 100) / 100,
           route_pos: Math.round(pr.t * 1000) / 1000
         });
