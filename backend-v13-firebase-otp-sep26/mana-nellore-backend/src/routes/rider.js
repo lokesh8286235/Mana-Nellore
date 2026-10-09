@@ -306,13 +306,13 @@ router.post(
     if (Number(active.rows[0].n) >= 3) {
       return res.status(409).json({ error: 'You already have 3 active deliveries — complete one first' });
     }
+    // Atomic: only assign if still unassigned (prevents double-accept race)
     const { rows } = await db.query(
-      "SELECT * FROM orders WHERE id = $1 AND status = 'ready' AND rider_id IS NULL",
-      [req.params.id]
+      "UPDATE orders SET rider_id = $1 WHERE id = $2 AND status = 'ready' AND rider_id IS NULL RETURNING *",
+      [rider.id, req.params.id]
     );
     const order = rows[0];
     if (!order) return res.status(409).json({ error: 'Delivery no longer available' });
-    await db.query('UPDATE orders SET rider_id = $1 WHERE id = $2', [rider.id, order.id]);
     const timeline = order.timeline || [];
     timeline.push({ status: 'rider_assigned', at: new Date().toISOString(), by: 'rider' });
     await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
