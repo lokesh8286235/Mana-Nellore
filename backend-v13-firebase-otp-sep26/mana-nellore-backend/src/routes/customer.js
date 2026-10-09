@@ -461,4 +461,49 @@ router.get(
   })
 );
 
+// GET /api/customer/vouchers — user's coupons in voucher format
+router.get(
+  '/vouchers',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT ci.coupon_code AS code, ci.source, ci.issued_at,
+              c.discount_type, c.value, c.min_order_paise, c.max_discount_paise,
+              c.active, c.valid_from, c.valid_to
+       FROM coupon_issuances ci
+       LEFT JOIN coupons c ON c.code = ci.coupon_code
+       WHERE ci.user_id = $1
+       ORDER BY ci.issued_at DESC`,
+      [req.user.id]
+    );
+    const now = new Date();
+    const vouchers = rows.map((r) => {
+      let desc = '';
+      if (r.discount_type === 'percent') desc = r.value + '% off';
+      else if (r.discount_type === 'flat') desc = '₹' + (r.value/100) + ' off';
+      if (r.min_order_paise) desc += ' on orders above ₹' + (r.min_order_paise/100);
+      if (r.valid_to && new Date(r.valid_to) < now) desc += ' (expired)';
+      return { code: r.code, title: r.code, description: desc, issued_at: r.issued_at, source: r.source };
+    });
+    res.json({ vouchers });
+  })
+);
+
+// GET /api/customer/refunds — user's refunded orders
+router.get(
+  '/refunds',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT o.id, o.total_paise, o.payment_status, o.refunded_at, o.created_at,
+              r.name AS restaurant_name
+       FROM orders o
+       LEFT JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.user_id = $1 AND o.payment_status = 'refunded'
+       ORDER BY o.refunded_at DESC NULLS LAST, o.created_at DESC
+       LIMIT 50`,
+      [req.user.id]
+    );
+    res.json({ refunds: rows });
+  })
+);
+
 module.exports = router;
