@@ -311,6 +311,201 @@ router.post(
   })
 );
 
+// GET /api/rider/route/optimized?lat=&lng= — optimal stop sequence for active deliveries.
+// Groups same-restaurant pickups, orders stops to minimize travel (nearest-neighbor
+// with pickup-before-dropoff), factors prep waits and delivery deadlines.
+// Uses Google Distance Matrix for ETAs when GOOGLE_MAPS_KEY is set, else haversine.
+router.get(
+  '/route/optimized',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    let rlat = Number(req.query.lat), rlng = Number(req.query.lng);
+    if (!Number.isFinite(rlat) || !Number.isFinite(rlng)) {
+      rlat = rider.lat != null ? Number(rider.lat) : null;
+      rlng = rider.lng != null ? Number(rider.lng) : null;
+    }
+
+    const { rows } = await db.query(
+      `SELECT o.id, o.status, o.restaurant_id, o.placed_at, o.eta_at, o.total_paise,
+              r.name AS restaurant_name, r.address AS restaurant_address,
+              r.lat AS rest_lat, r.lng AS rest_lng, r.phone AS restaurant_phone,
+              a.label AS addr_label, a.line1, a.line2, a.city,
+              a.lat AS addr_lat, a.lng AS addr_lng,
+              u.name AS customer_name, u.phone AS customer_phone
+       FROM orders o
+       JOIN restaurants r ON r.id = o.restaurant_id
+       LEFT JOIN addresses a ON a.id = o.address_id
+       JOIN users u ON u.id = o.customer_id
+       WHERE o.rider_id = $1 AND o.status NOT IN ('delivered','cancelled')
+       ORDER BY o.placed_at ASC LIMIT 3`,
+      [rider.id]
+    );
+    if (!rows.length) {
+      return res.json({ stops: [], total_km: 0, total_minutes: 0, optimized_at: new Date().toISOString() });
+    }
+
+    const { haversineKm } = require('../lib/pricing');
+    const AVG_KMH = 25;   // city riding speed for ETA estimates
+    const STOP_MIN = 3;   // per-stop handling time
+    const now = Date.now();
+
+    // Build candidate stops. Pickup needed while status is 'ready' (not yet picked up).
+    // Same-restaurant pickups are merged into one stop covering several orders.
+    const pickupByRest = new Map();
+    const candidates = [];
+    for (const o of rows) {
+      const pickedUp = o.status === 'picked_up' || o.status === 'on_way';
+      const addr = [o.addr_label, o.line1, o.line2, o.city].filter(Boolean).join(', ');
+      if (!pickedUp && o.rest_lat != null && o.rest_lng != null) {
+        const key = String(o.restaurant_id);
+        if (!pickupByRest.has(key)) {
+          const p = {
+            type: 'pickup', restaurant_id: key,
+            name: o.restaurant_name || 'Restaurant',
+            address: o.restaurant_address || '',
+            lat: Number(o.rest_lat), lng: Number(o.rest_lng),
+            phone: o.restaurant_phone || '', order_ids: [],
+            // prep wait: recently-assigned orders may still be packing
+            wait_minutes: 0
+          };
+          pickupByRest.set(key, p);
+          candidates.push(p);
+        }
+        const p = pickupByRest.get(key);
+        p.order_ids.push(o.id);
+        const assignedAt = Array.isArray(o.timeline)
+          ? o.timeline.filter(t => String(t.status || '').toLowerCase() === 'rider_assigned').map(t => new Date(t.at).getTime())
+          : [];
+        const latestAssign = assignedAt.length ? Math.max.apply(null, assignedAt) : null;
+        if (latestAssign && now - latestAssign < 5 * 60 * 1000) {
+          p.wait_minutes = Math.max(p.wait_minutes, 5); // give kitchen a few minutes
+        }
+      }
+      if (o.addr_lat != null && o.addr_lng != null) {
+        const deadline = o.eta_at ? new Date(o.eta_at).getTime()
+          : (o.placed_at ? new Date(o.placed_at).getTime() + 45 * 60 * 1000 : null);
+        candidates.push({
+          type: 'dropoff', order_ids: [o.id],
+          name: o.customer_name || 'Customer',
+          address: addr, lat: Number(o.addr_lat), lng: Number(o.addr_lng),
+          phone: o.customer_phone || '',
+          deadline_at: deadline ? new Date(deadline).toISOString() : null,
+          total_paise: o.total_paise
+        });
+      }
+    }
+
+    // Nearest-neighbor sequencing with pickup-before-dropoff constraint.
+    const distKm = (a, b) => haversineKm(a.lat, a.lng, b.lat, b.lng);
+    const seq = [];
+    const remaining = candidates.slice();
+    // dropoff is eligible only when its order's pickup is done (picked up already or sequenced)
+    const pickedRestIds = new Set();
+    rows.forEach(o => {
+      if (o.status === 'picked_up' || o.status === 'on_way') pickedRestIds.add(String(o.restaurant_id));
+    });
+    let cur = (rlat != null && rlng != null) ? { lat: rlat, lng: rlng } : null;
+    // If rider location unknown, start from the oldest order's restaurant
+    if (!cur && candidates.length) cur = { lat: candidates[0].lat, lng: candidates[0].lng };
+    while (remaining.length) {
+      let best = -1, bestD = Infinity;
+      remaining.forEach((s, i) => {
+        if (s.type === 'dropoff') {
+          // pickup must come first: order's restaurant pickup sequenced or already picked up
+          const oid = s.order_ids[0];
+          const o = rows.find(r => String(r.id) === String(oid));
+          const restKey = o ? String(o.restaurant_id) : null;
+          const pickupSeq = seq.some(x => x.type === 'pickup' && x.restaurant_id === restKey);
+          if (restKey && !pickedRestIds.has(restKey) && !pickupSeq) return; // not eligible yet
+        }
+        const d = cur ? distKm(cur, s) : 0;
+        // urgency boost: dropoffs nearing deadline jump the queue slightly
+        let score = d;
+        if (s.type === 'dropoff' && s.deadline_at) {
+          const minsLeft = (new Date(s.deadline_at).getTime() - now) / 60000;
+          if (minsLeft < 20) score = d * 0.7;
+        }
+        if (score < bestD) { bestD = score; best = i; }
+      });
+      if (best < 0) break; // safety: no eligible stop (should not happen)
+      const next = remaining.splice(best, 1)[0];
+      next.leg_km = cur ? Math.round(distKm(cur, next) * 10) / 10 : 0;
+      seq.push(next);
+      cur = { lat: next.lat, lng: next.lng };
+      if (next.type === 'pickup') pickedRestIds.add(next.restaurant_id);
+    }
+
+    // ETAs: prefer Google Distance Matrix drive times when key is available.
+    let legMinutes = seq.map(s => (s.leg_km / AVG_KMH) * 60 + STOP_MIN);
+    const gkey = process.env.GOOGLE_MAPS_KEY;
+    if (gkey && seq.length > 1 && rlat != null && rlng != null) {
+      try {
+        const pts = [{ lat: rlat, lng: rlng }].concat(seq.map(s => ({ lat: s.lat, lng: s.lng })));
+        const origins = pts.map(p => p.lat + ',' + p.lng).join('|');
+        const url = 'https://maps.googleapis.com/maps/api/distancematrix/json?units=metric&mode=driving'
+          + '&origins=' + encodeURIComponent(origins)
+          + '&destinations=' + encodeURIComponent(origins)
+          + '&key=' + encodeURIComponent(gkey);
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 4000);
+        const r = await fetch(url, { signal: ctrl.signal });
+        clearTimeout(t);
+        const dm = await r.json();
+        if (dm.status === 'OK' && Array.isArray(dm.rows)) {
+          const dmLegs = [];
+          for (let i = 0; i < seq.length; i++) {
+            const el = dm.rows[i] && dm.rows[i].elements && dm.rows[i].elements[i + 1];
+            if (el && el.status === 'OK' && el.duration && el.distance) {
+              dmLegs.push({
+                minutes: Math.round(el.duration.value / 60) + STOP_MIN,
+                km: Math.round(el.distance.value / 100) / 10
+              });
+            } else { dmLegs.push(null); }
+          }
+          if (dmLegs.every(Boolean)) {
+            legMinutes = dmLegs.map(l => l.minutes);
+            dmLegs.forEach((l, i) => { seq[i].leg_km = l.km; });
+          }
+        }
+      } catch (e) { /* fall back to haversine ETAs */ }
+    }
+
+    // Assemble response with cumulative ETAs
+    let cumMin = 0, totalKm = 0;
+    const stops = seq.map((s, i) => {
+      cumMin += legMinutes[i] || 0;
+      totalKm += s.leg_km || 0;
+      const stop = {
+        sequence: i + 1,
+        type: s.type,
+        order_ids: s.order_ids,
+        name: s.name,
+        address: s.address,
+        phone: s.phone,
+        lat: s.lat, lng: s.lng,
+        leg_km: s.leg_km,
+        eta_minutes: Math.round(cumMin),
+        wait_minutes: s.wait_minutes || 0
+      };
+      if (s.type === 'dropoff') {
+        stop.deadline_at = s.deadline_at;
+        stop.at_risk = !!(s.deadline_at && (now + cumMin * 60000) > new Date(s.deadline_at).getTime());
+      }
+      return stop;
+    });
+
+    res.json({
+      stops,
+      total_km: Math.round(totalKm * 10) / 10,
+      total_minutes: Math.round(cumMin),
+      optimized_at: new Date().toISOString(),
+      traffic_aware: !!gkey
+    });
+  })
+);
+
+
 // POST /api/rider/deliveries/:id/accept
 router.post(
   '/deliveries/:id/accept',
