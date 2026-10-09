@@ -98,6 +98,7 @@ app.use('/api/auth', require('./routes/auth'));
 app.use('/api/restaurants', require('./routes/restaurants'));
 app.use('/api/owner', require('./routes/owner'));
 app.use('/api/customer', require('./routes/customer'));
+app.use('/api/ai', require('./routes/ai'));
 app.use('/api/orders', require('./routes/orders'));
 app.use('/api/rider', require('./routes/rider'));
 app.use('/api/admin', require('./routes/admin'));
