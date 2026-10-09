@@ -318,6 +318,58 @@ router.get(
   })
 );
 
+// GET /api/restaurants/dishes/:id/pairings — "pairs well with" from the SAME restaurant.
+// Uses real co-order data when available, falls back to restaurant bestsellers.
+router.get(
+  '/dishes/:id/pairings',
+  ah(async (req, res) => {
+    const dishId = req.params.id;
+    // Find the dish's restaurant
+    const dishRes = await db.query('SELECT id, restaurant_id FROM menu_items WHERE id = $1', [dishId]);
+    if (!dishRes.rows.length) return res.status(404).json({ error: 'Dish not found' });
+    const restId = dishRes.rows[0].restaurant_id;
+
+    // Co-ordered dishes from the same restaurant (real order data)
+    const { rows: paired } = await db.query(
+      `SELECT oi2.menu_item_id AS id, oi2.name_snapshot AS name, mi.price_paise, mi.veg, mi.image_url,
+              COUNT(*) AS together
+       FROM order_items oi1
+       JOIN order_items oi2 ON oi2.order_id = oi1.order_id AND oi2.menu_item_id != oi1.menu_item_id
+       JOIN orders o ON o.id = oi1.order_id
+       LEFT JOIN menu_items mi ON mi.id = oi2.menu_item_id
+       WHERE oi1.menu_item_id = $1 AND o.restaurant_id = $2 AND o.status = 'delivered'
+         AND mi.available = true
+       GROUP BY oi2.menu_item_id, oi2.name_snapshot, mi.price_paise, mi.veg, mi.image_url
+       ORDER BY together DESC LIMIT 6`,
+      [dishId, restId]
+    );
+
+    let pairings = paired.map((p) => ({ ...p, together: Number(p.together) }));
+
+    // Fallback: restaurant bestsellers (excluding this dish) if not enough co-order data
+    if (pairings.length < 4) {
+      const exclude = pairings.map((p) => p.id);
+      const { rows: best } = await db.query(
+        `SELECT mi.id, mi.name, mi.price_paise, mi.veg, mi.image_url, COUNT(oi.id) AS orders
+         FROM menu_items mi
+         LEFT JOIN order_items oi ON oi.menu_item_id = mi.id
+         LEFT JOIN orders o ON o.id = oi.order_id AND o.status = 'delivered'
+         WHERE mi.restaurant_id = $1 AND mi.available = true AND mi.id != $2
+           ${exclude.length ? `AND mi.id != ALL($3)` : ''}
+         GROUP BY mi.id, mi.name, mi.price_paise, mi.veg, mi.image_url
+         ORDER BY orders DESC, mi.id LIMIT ${6 - pairings.length}`,
+        exclude.length ? [restId, dishId, exclude] : [restId, dishId]
+      );
+      const seen = new Set(pairings.map((p) => String(p.id)));
+      for (const b of best) {
+        if (!seen.has(String(b.id))) pairings.push({ ...b, orders: Number(b.orders) });
+      }
+    }
+
+    res.json({ pairings: pairings.slice(0, 6) });
+  })
+);
+
 router.get(
   '/:id',
   ah(async (req, res) => {
