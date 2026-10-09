@@ -220,7 +220,12 @@ router.get(
        LEFT JOIN addresses a ON a.id = o.address_id
        WHERE o.status = 'ready' AND o.rider_id IS NULL
          AND o.order_type = 'delivery'
-       ORDER BY o.placed_at ASC LIMIT 20`
+         AND NOT EXISTS (
+           SELECT 1 FROM rider_declines rd
+           WHERE rd.order_id = o.id AND rd.rider_id = $1
+         )
+       ORDER BY o.placed_at ASC LIMIT 20`,
+      [rider.id]
     );
     const config = await loadPricingConfig(db);
     const list = rows.map((o) => {
@@ -288,6 +293,21 @@ router.get(
     const detail = await deliveryDetail(req.params.id, rider.id);
     if (!detail) return res.status(404).json({ error: 'Delivery not found' });
     res.json({ delivery: detail });
+  })
+);
+
+// POST /api/rider/deliveries/:id/decline — rider declines, never shown again to this rider
+router.post(
+  '/deliveries/:id/decline',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    await db.query(
+      `INSERT INTO rider_declines (rider_id, order_id, reason) VALUES ($1, $2, $3)
+       ON CONFLICT (rider_id, order_id) DO NOTHING`,
+      [rider.id, req.params.id, req.body.reason || null]
+    );
+    res.json({ ok: true });
   })
 );
 
