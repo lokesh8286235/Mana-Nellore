@@ -273,6 +273,22 @@ router.get(
       clauses.push(`m.price_paise <= $${params.length}`);
     }
     if (vegOnly) clauses.push('m.veg = true');
+    /* Smart ranking: exact name matches first for specific queries (e.g. "ghee dosa"),
+       recommended (high-rated) first for general queries (e.g. "dosa"). */
+    const qWords = q.toLowerCase().split(/\s+/).filter(Boolean);
+    const isSpecific = qWords.length > 1;
+    let orderBy = 'm.price_paise ASC';
+    if (q) {
+      if (isSpecific) {
+        /* Specific: exact prefix matches first, then contains, then by rating */
+        params.push(q.toLowerCase() + '%');
+        const exactParam = params.length;
+        orderBy = `CASE WHEN LOWER(m.name) LIKE $${exactParam} THEN 0 ELSE 1 END, r.rating_avg DESC NULLS LAST, m.price_paise ASC`;
+      } else {
+        /* General: highest-rated first (recommended) */
+        orderBy = 'r.rating_avg DESC NULLS LAST, m.price_paise ASC';
+      }
+    }
     const { rows } = await db.query(
       `SELECT m.id, m.name, m.price_paise, m.veg, m.image_url,
               r.id AS restaurant_id, r.name AS restaurant_name,
@@ -282,7 +298,7 @@ router.get(
        WHERE m.available = true
          AND r.status = 'approved' AND r.is_coming_soon = false
          ${clauses.map((c) => 'AND ' + c).join(' ')}
-       ORDER BY m.price_paise ASC
+       ORDER BY ${orderBy}
        LIMIT 30`,
       params
     );
