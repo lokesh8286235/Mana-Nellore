@@ -40,14 +40,45 @@ async function notify(dbConn, userId, title, body) {
 }
 
 async function transition(orderId, status, by) {
-  const { rows } = await db.query('SELECT timeline FROM orders WHERE id = $1', [orderId]);
-  const timeline = rows[0].timeline || [];
+  const { rows } = await db.query('SELECT timeline, restaurant_id FROM orders WHERE id = $1', [orderId]);
+  const timeline = (rows[0] && rows[0].timeline) || [];
+  const restaurantId = rows[0] && rows[0].restaurant_id;
   timeline.push({ status, at: new Date().toISOString(), by });
   // "Packed fresh" stamp: the moment the kitchen taps Ready for pickup
   const packed = status === 'ready' ? ', packed_at = now()' : '';
   await db.query(`UPDATE orders SET status = $1, timeline = $2::jsonb${packed} WHERE id = $3`, [
     status, JSON.stringify(timeline), orderId
   ]);
+  // Log prep time for restaurant readiness predictions (Phase 5)
+  if (status === 'ready' && restaurantId) {
+    try {
+      await db.query(`CREATE TABLE IF NOT EXISTS restaurant_prep_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        order_id UUID NOT NULL,
+        restaurant_id UUID NOT NULL,
+        accepted_at TIMESTAMPTZ,
+        ready_at TIMESTAMPTZ DEFAULT now(),
+        prep_minutes NUMERIC,
+        created_at TIMESTAMPTZ DEFAULT now()
+      )`);
+      // Find when the restaurant accepted/started preparing (from timeline)
+      let acceptedAt = null;
+      for (const t of timeline) {
+        const s = String(t.status || '').toLowerCase();
+        if ((s === 'accepted' || s === 'preparing') && !acceptedAt) acceptedAt = t.at;
+      }
+      let prepMinutes = null;
+      if (acceptedAt) {
+        prepMinutes = (Date.now() - new Date(acceptedAt).getTime()) / 60000;
+        if (prepMinutes < 0 || prepMinutes > 180) prepMinutes = null; // sanity
+      }
+      await db.query(
+        `INSERT INTO restaurant_prep_history (order_id, restaurant_id, accepted_at, prep_minutes)
+         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+        [orderId, restaurantId, acceptedAt, prepMinutes]
+      );
+    } catch (e) { /* prep logging must never break the order flow */ }
+  }
 }
 
 // ---- Restaurant profile ----

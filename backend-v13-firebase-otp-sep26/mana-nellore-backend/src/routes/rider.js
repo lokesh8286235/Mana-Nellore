@@ -591,6 +591,120 @@ router.get(
   })
 );
 
+// GET /api/rider/readiness/:orderId — predict when the food will be ready.
+// Uses real prep history for this restaurant; never invents data.
+// Confidence: high (20+ samples), medium (5-19), low (<5 → 15 min default).
+router.get(
+  '/readiness/:orderId',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    await db.query(
+      `CREATE TABLE IF NOT EXISTS restaurant_prep_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        order_id UUID NOT NULL,
+        restaurant_id UUID NOT NULL,
+        accepted_at TIMESTAMPTZ,
+        ready_at TIMESTAMPTZ DEFAULT now(),
+        prep_minutes NUMERIC,
+        created_at TIMESTAMPTZ DEFAULT now()
+      )`
+    );
+    const { rows: orows } = await db.query(
+      `SELECT o.id, o.restaurant_id, o.status, o.placed_at, o.timeline, r.name AS restaurant_name
+       FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.id = $1 AND o.rider_id = $2`,
+      [req.params.orderId, rider.id]
+    );
+    const order = orows[0];
+    if (!order) return res.status(404).json({ error: 'Delivery not found' });
+    if (order.status !== 'ready') {
+      return res.json({ status: order.status, prediction: null });
+    }
+    // When did the kitchen accept this order? (prep clock start)
+    let acceptedAt = null;
+    const tl = Array.isArray(order.timeline) ? order.timeline : [];
+    for (const t of tl) {
+      const s = String(t.status || '').toLowerCase();
+      if ((s === 'accepted' || s === 'preparing') && !acceptedAt) acceptedAt = t.at;
+    }
+    // Historical prep times for this restaurant (last 30, valid only)
+    const { rows: hist } = await db.query(
+      `SELECT prep_minutes FROM restaurant_prep_history
+       WHERE restaurant_id = $1 AND prep_minutes IS NOT NULL
+       ORDER BY created_at DESC LIMIT 30`,
+      [order.restaurant_id]
+    );
+    const samples = hist.map(r => Number(r.prep_minutes)).filter(n => n > 0 && n < 180);
+    const n = samples.length;
+    // Current kitchen load: other active orders at this restaurant
+    const { rows: loadRows } = await db.query(
+      `SELECT COUNT(*) AS n FROM orders
+       WHERE restaurant_id = $1 AND status IN ('accepted','preparing')
+         AND id <> $2`,
+      [order.restaurant_id, order.id]
+    );
+    const load = Number(loadRows[0].n) || 0;
+    let confidence, avgPrep;
+    if (n >= 20) { confidence = 'high'; }
+    else if (n >= 5) { confidence = 'medium'; }
+    else { confidence = 'low'; }
+    if (n > 0) {
+      avgPrep = samples.reduce((a, b) => a + b, 0) / n;
+      // Busy kitchen: +2 min per concurrent order beyond the first 2
+      if (load > 2) avgPrep += (load - 2) * 2;
+    } else {
+      avgPrep = 15; // default when no history — labeled low confidence
+    }
+    // Elapsed prep time so far for THIS order
+    const startMs = acceptedAt ? new Date(acceptedAt).getTime() : new Date(order.placed_at).getTime();
+    const elapsedMin = Math.max(0, (Date.now() - startMs) / 60000);
+    const expectedWait = Math.max(0, Math.round(avgPrep - elapsedMin));
+    const predictedReadyAt = new Date(Date.now() + expectedWait * 60000).toISOString();
+    res.json({
+      status: 'ready',
+      restaurant_name: order.restaurant_name,
+      predicted_ready_at: predictedReadyAt,
+      expected_wait_minutes: expectedWait,
+      confidence,
+      sample_count: n,
+      kitchen_load: load,
+      avg_prep_minutes: Math.round(avgPrep)
+    });
+  })
+);
+
+// Voice interaction logging table (created lazily on first voice log call)
+async function logVoice(riderId, query, intent, response) {
+  try {
+    await db.query(
+      `CREATE TABLE IF NOT EXISTS voice_interactions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        rider_id UUID NOT NULL,
+        query TEXT,
+        intent TEXT,
+        response TEXT,
+        created_at TIMESTAMPTZ DEFAULT now()
+      )`
+    );
+    await db.query(
+      `INSERT INTO voice_interactions (rider_id, query, intent, response) VALUES ($1,$2,$3,$4)`,
+      [riderId, query || null, intent || null, response || null]
+    );
+  } catch (e) { /* analytics must never break the app */ }
+}
+
+// POST /api/rider/voice/log { query, intent, response } — analytics only
+router.post(
+  '/voice/log',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    await logVoice(rider.id, req.body.query, req.body.intent, req.body.response);
+    res.json({ ok: true });
+  })
+);
+
 // POST /api/rider/deliveries/evaluate { order_ids: [] } — batch efficiency scoring.
 // Answers: would accepting these orders improve Rs/hr without risking deadlines?
 router.post(
