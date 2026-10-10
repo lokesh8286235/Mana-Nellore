@@ -123,6 +123,21 @@ router.put(
   ah(async (req, res) => {
     const id = await requireRestaurant(req, res);
     if (!id) return;
+    // Reject obviously-invalid image URLs (e.g. "Bhavya.com" with no scheme)
+    if (req.body.image_url !== undefined && req.body.image_url) {
+      const u = String(req.body.image_url).trim();
+      if (!/^https?:\/\//i.test(u) && !u.startsWith('/img/') && !u.startsWith('/')) {
+        return res.status(400).json({ error: 'image_url must be a valid http(s) URL or /img/ path' });
+      }
+      req.body.image_url = u;
+    }
+    if (req.body.chef_photo !== undefined && req.body.chef_photo) {
+      const u = String(req.body.chef_photo).trim();
+      if (!/^https?:\/\//i.test(u) && !u.startsWith('/img/') && !u.startsWith('/')) {
+        return res.status(400).json({ error: 'chef_photo must be a valid http(s) URL or /img/ path' });
+      }
+      req.body.chef_photo = u;
+    }
     const fields = ['name', 'description', 'address', 'lat', 'lng', 'phone', 'image_url', 'fssai',
       'chef_name', 'chef_photo', 'chef_story', 'gstin', 'birthday_dessert',
       'opens_at', 'closes_at', 'opens_at_we', 'closes_at_we'];
@@ -282,6 +297,12 @@ router.post(
       meal_slot, is_combo, allergens } = req.body;
     if (!name || price_paise == null) {
       return res.status(400).json({ error: 'Name and price_paise are required' });
+    }
+    if (image_url) {
+      const u = String(image_url).trim();
+      if (!/^https?:\/\//i.test(u) && !u.startsWith('/img/') && !u.startsWith('/')) {
+        return res.status(400).json({ error: 'image_url must be a valid http(s) URL or /img/ path' });
+      }
     }
     if (category_id) {
       const c = await db.query('SELECT id FROM categories WHERE id = $1 AND restaurant_id = $2', [

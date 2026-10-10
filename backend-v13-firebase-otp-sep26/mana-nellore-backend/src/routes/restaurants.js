@@ -161,6 +161,59 @@ router.get(
   })
 );
 
+// GET /api/restaurants/dishes/search?q=&max_price_paise=&veg= — Ask Mana dish search.
+// Spelling-tolerant: matches if every query word appears in the dish name.
+router.get(
+  '/dishes/search',
+  ah(async (req, res) => {
+    const q = String(req.query.q || '').trim();
+    const maxPrice = req.query.max_price_paise ? Number(req.query.max_price_paise) : null;
+    const vegOnly = req.query.veg === '1' || req.query.veg === 'true';
+
+    const conditions = [
+      "r.status = 'approved'",
+      'r.is_coming_soon = false',
+      'mi.available = true',
+    ];
+    const params = [];
+
+    if (q) {
+      // Split into words; every word must appear in the name (ILIKE).
+      const words = q.split(/\s+/).filter(Boolean).slice(0, 6);
+      for (const w of words) {
+        params.push(`%${w}%`);
+        conditions.push(`mi.name ILIKE $${params.length}`);
+      }
+    }
+    if (maxPrice && maxPrice > 0) {
+      params.push(Math.floor(maxPrice));
+      conditions.push(`mi.price_paise <= $${params.length}`);
+    }
+    if (vegOnly) {
+      conditions.push('mi.veg = true');
+    }
+
+    const { rows } = await db.query(
+      `SELECT mi.id, mi.name, mi.description, mi.image_url, mi.price_paise,
+              mi.veg, mi.restaurant_id, r.name AS restaurant_name,
+              r.is_open AS restaurant_open
+       FROM menu_items mi
+       JOIN restaurants r ON r.id = mi.restaurant_id
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY r.is_open DESC, mi.name
+       LIMIT 60`,
+      params
+    );
+    res.json({
+      dishes: rows.map((d) => ({
+        ...d,
+        price_paise: Number(d.price_paise),
+        veg: !!d.veg,
+      })),
+    });
+  })
+);
+
 // GET /api/restaurants/:id/rating-summary -> public rating distribution
 router.get(
   '/:id/rating-summary',
