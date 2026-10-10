@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS orders (
   eta_at timestamptz,
   packed_at timestamptz,
   pickup_photo text,
+  pickup_otp text,
   delivery_photo text,
   share_token text UNIQUE,
   order_type text NOT NULL DEFAULT 'delivery'

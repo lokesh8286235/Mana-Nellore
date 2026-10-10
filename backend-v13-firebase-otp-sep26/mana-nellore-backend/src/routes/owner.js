@@ -488,6 +488,17 @@ router.put(
 
     await transition(order.id, rule.to, 'restaurant_owner');
 
+    // Double-OTP flow: when the kitchen marks an order ready, mint a short-lived
+    // pickup OTP. Restaurant staff read it back from the order and tell the rider
+    // verbally; the rider must enter it to confirm pickup. Cleared on pickup.
+    let pickupOtp = null;
+    if (rule.to === 'ready') {
+      pickupOtp = String(Math.floor(1000 + Math.random() * 9000));
+      await db.query('UPDATE orders SET pickup_otp = $1 WHERE id = $2', [pickupOtp, order.id]);
+    } else if (rule.to === 'delivered') {
+      await db.query('UPDATE orders SET pickup_otp = NULL WHERE id = $1', [order.id]);
+    }
+
     if (rule.to === 'rejected') {
       const reason = req.body.reason || 'Restaurant rejected the order';
       const refunded = order.payment_status === 'paid';
@@ -509,7 +520,7 @@ router.put(
       }[rule.to];
       await notify(db, order.customer_id, copy[0], `${(await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name} ${copy[1]}`);
     }
-    res.json({ ok: true, status: rule.to });
+    res.json({ ok: true, status: rule.to, ...(pickupOtp ? { pickup_otp: pickupOtp } : {}) });
   })
 );
 

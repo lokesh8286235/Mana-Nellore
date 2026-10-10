@@ -724,6 +724,7 @@ router.get(
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params
     );
+    for (const o of rows) { delete o.pickup_photo; delete o.pickup_otp; } // never expose to customers
     res.json({ orders: rows });
   })
 );
@@ -752,6 +753,8 @@ router.get(
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
     delete order.delivery_otp_hash; // never expose to clients
+    delete order.pickup_photo; // no photos anywhere in the customer flow
+    delete order.pickup_otp; // never expose to clients
     const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
     // Queue transparency: orders at this restaurant placed before mine, still active
     let queueAhead = 0;

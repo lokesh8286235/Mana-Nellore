@@ -96,6 +96,7 @@ async function migrate() {
   END $$`);
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS eta_at timestamptz');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_photo text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_otp text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS packed_at timestamptz');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_photo text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS share_token text');

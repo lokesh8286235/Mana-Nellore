@@ -199,6 +199,7 @@ async function deliveryDetail(orderId, riderId) {
   const order = rows[0];
   if (!order) return null;
   delete order.delivery_otp_hash;
+  delete order.pickup_otp; // never expose to the rider app — staff tell the rider verbally
   const items = await db.query('SELECT name_snapshot, qty, unit_price_paise FROM order_items WHERE order_id = $1', [order.id]);
   return { ...order, items: items.rows };
 }
@@ -916,10 +917,11 @@ router.put(
   })
 );
 
-// PUT /api/rider/deliveries/:id/picked-up { photo } — generates the delivery OTP
-// for the customer. Pickup photo (image data URL, max ~1.5MB) is OPTIONAL:
-// single-restaurant pickups send it (shown to the customer on live tracking
-// as proof of packed-food pickup); grouped on-the-way pickups skip it.
+// PUT /api/rider/deliveries/:id/picked-up { otp } — validates the restaurant
+// pickup OTP (minted when the kitchen marked the order ready; restaurant staff
+// read it from the order and tell the rider verbally). No photos anywhere in
+// the rider flow — delivery is confirmed by OTP only. On success, generates the
+// customer delivery OTP.
 router.put(
   '/deliveries/:id/picked-up',
   ah(async (req, res) => {
@@ -929,20 +931,20 @@ router.put(
     if (!detail) return res.status(404).json({ error: 'Delivery not found' });
     if (detail.status !== 'ready') return res.status(409).json({ error: `Invalid status ${detail.status}` });
 
-    let photo = null;
-    if (req.body.photo != null) {
-      photo = String(req.body.photo);
-      const okPrefix = photo.startsWith('data:image/') || photo.startsWith('http');
-      if (!okPrefix || photo.length > 1500000) {
-        return res.status(400).json({ error: 'Photo must be an image under ~1.5MB' });
-      }
+    const otp = String(req.body.otp || '').trim();
+    if (!otp) return res.status(400).json({ error: 'Pickup OTP is required' });
+    const { rows: otpRows } = await db.query(
+      'SELECT pickup_otp FROM orders WHERE id = $1', [detail.id]
+    );
+    const expected = otpRows[0] && otpRows[0].pickup_otp;
+    if (!expected || otp !== String(expected)) {
+      return res.status(400).json({ error: 'Invalid pickup OTP' });
     }
 
-    // Photo is optional: grouped on-the-way pickups confirm without one.
     const code = newDeliveryOtp();
     const hash = await bcrypt.hash(code, 8);
-    await db.query('UPDATE orders SET delivery_otp_hash = $1, pickup_photo = COALESCE($2, pickup_photo) WHERE id = $3',
-      [hash, photo, detail.id]);
+    await db.query('UPDATE orders SET delivery_otp_hash = $1, pickup_otp = NULL WHERE id = $2',
+      [hash, detail.id]);
     await transition(detail.id, 'picked_up', 'rider');
     await notify(detail.customer_id, 'Your delivery OTP',
       `Your rider has picked up the order. Share this OTP to receive it: ${code}`);
