@@ -176,6 +176,19 @@ async function migrate() {
   )`);
   await q('CREATE INDEX IF NOT EXISTS idx_coupon_issuances_user ON coupon_issuances(user_id)');
 
+  // Rider declined offers (declined/expired offers never return to that rider).
+  // Referenced by rider.js but the table was never created — every call to
+  // /api/rider/deliveries/available threw `relation "rider_declines" does not exist`.
+  await q(`CREATE TABLE IF NOT EXISTS rider_declines (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    rider_id uuid NOT NULL REFERENCES riders(id) ON DELETE CASCADE,
+    order_id uuid NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    reason text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (rider_id, order_id)
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_rider_declines_rider ON rider_declines(rider_id)');
+
   // Backfill share tokens for old orders
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
            WHERE share_token IS NULL`);
