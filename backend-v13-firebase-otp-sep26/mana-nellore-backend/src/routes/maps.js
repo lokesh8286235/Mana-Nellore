@@ -4,6 +4,9 @@
 // (REQUEST_DENIED). Proxying server-side bypasses browser key restrictions:
 // the server key is used here, never exposed to clients.
 //
+// Uses the Routes API (v2:computeRoutes) — the legacy Directions API is not
+// enabled for this project ("LegacyApiNotActivatedMapError").
+//
 // Only numeric coordinates are accepted (no free-text queries) so callers
 // cannot burn Google quota on arbitrary searches.
 const express = require('express');
@@ -24,7 +27,14 @@ function parseLatLng(s) {
   const lng = Number(m[2]);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
   if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
-  return { lat, lng, text: `${lat},${lng}` };
+  return { lat, lng };
+}
+
+function parseDuration(s) {
+  // Routes API returns durations like "374s".
+  if (typeof s !== 'string') return null;
+  const m = s.match(/^(\d+)s$/);
+  return m ? Number(m[1]) : null;
 }
 
 function cacheKey(origin, destination, waypoints) {
@@ -69,24 +79,36 @@ router.get(
       return res.json(hit.body);
     }
 
-    const params = new URLSearchParams({
-      origin: origin.text,
-      destination: destination.text,
-      mode: 'driving',
-      units: 'metric',
-      key: gkey,
-    });
+    const latLng = (p) => ({ latitude: p.lat, longitude: p.lng });
+    const body = {
+      origin: { location: { latLng: latLng(origin) } },
+      destination: { location: { latLng: latLng(destination) } },
+      travelMode: 'DRIVE',
+      routingPreference: 'TRAFFIC_UNAWARE',
+      computeAlternativeRoutes: false,
+    };
     if (waypoints.length) {
-      params.set('waypoints', waypoints.map((w) => w.text).join('|'));
+      body.intermediates = waypoints.map((w) => ({ location: { latLng: latLng(w) } }));
     }
 
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 12000);
+    const timer = setTimeout(() => ctrl.abort(), 15000);
     let g;
+    let httpStatus = 200;
     try {
-      const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params}`, {
+      const r = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
+        method: 'POST',
         signal: ctrl.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': gkey,
+          'X-Goog-FieldMask':
+            'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,' +
+            'routes.legs.distanceMeters,routes.legs.duration',
+        },
+        body: JSON.stringify(body),
       });
+      httpStatus = r.status;
       g = await r.json();
     } catch (e) {
       return res.status(502).json({ status: 'ERROR', error: 'Upstream request failed' });
@@ -94,39 +116,38 @@ router.get(
       clearTimeout(timer);
     }
 
-    if (!g || g.status !== 'OK' || !g.routes || !g.routes.length) {
-      const gstatus = (g && g.status) || 'UNKNOWN_ERROR';
-      // Quota / key problems on our side -> 502 so clients can fall back.
-      // ZERO_RESULTS / NOT_FOUND are legitimate answers -> 200 with ERROR body.
-      const httpCode =
-        gstatus === 'ZERO_RESULTS' || gstatus === 'NOT_FOUND' ? 200 : 502;
+    const route = g && g.routes && g.routes[0];
+    if (httpStatus !== 200 || !route) {
+      const gstatus =
+        (g && g.error && g.error.status) || `HTTP_${httpStatus}`;
+      // Client errors from bad input are unlikely (we validate), but pass
+      // through 400s honestly; key/quota problems -> 502 so clients fall back.
+      const httpCode = httpStatus === 400 ? 400 : 502;
       return res.status(httpCode).json({ status: 'ERROR', error: gstatus });
     }
 
-    const route = g.routes[0];
     const legs = (route.legs || []).map((l) => ({
-      distance_m: l.distance && l.distance.value,
-      duration_s: l.duration && l.duration.value,
-      start_address: l.start_address,
-      end_address: l.end_address,
+      distance_m: l.distanceMeters ?? null,
+      duration_s: parseDuration(l.duration),
+      start_address: null,
+      end_address: null,
     }));
-    const distance_m = legs.reduce((a, l) => a + (l.distance_m || 0), 0);
-    const duration_s = legs.reduce((a, l) => a + (l.duration_s || 0), 0);
+    const distance_m = route.distanceMeters ?? legs.reduce((a, l) => a + (l.distance_m || 0), 0);
+    const duration_s =
+      parseDuration(route.duration) ?? legs.reduce((a, l) => a + (l.duration_s || 0), 0);
 
-    const body = {
+    const out = {
       status: 'OK',
-      polyline: route.overview_polyline && route.overview_polyline.points,
+      polyline: route.polyline && route.polyline.encodedPolyline,
       legs,
       distance_m,
       duration_s,
     };
-    cache.set(key, { at: Date.now(), body });
-    // Keep the cache small.
+    cache.set(key, { at: Date.now(), body: out });
     if (cache.size > 500) {
-      const oldest = cache.keys().next().value;
-      cache.delete(oldest);
+      cache.delete(cache.keys().next().value);
     }
-    res.json(body);
+    res.json(out);
   })
 );
 
