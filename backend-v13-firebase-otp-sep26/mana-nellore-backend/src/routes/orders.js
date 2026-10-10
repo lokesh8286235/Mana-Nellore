@@ -422,10 +422,56 @@ async function placeMultiGroupOrder(req, res) {
       }
     }
 
+    // Link the sub-orders as ONE delivery group (the "on the way" trip).
+    // Only when 2+ orders were actually created — a lone survivor stays a
+    // normal single order and all single-order flows are untouched.
+    let deliveryGroupId = null;
+    if (orders.length >= 2) {
+      // Pickup order: farthest-from-customer first (the product rule; the
+      // rider's next-stop uses this same sequence as the source of truth).
+      const withDist = orders.map((o) => {
+        const rest = restById[String(o.order.restaurant_id)];
+        let km = null;
+        if (rest && rest.lat != null && rest.lng != null &&
+            address.lat != null && address.lng != null) {
+          km = haversineKm(Number(rest.lat), Number(rest.lng),
+                            Number(address.lat), Number(address.lng));
+        }
+        return { id: o.order.id, km, placed_at: o.order.placed_at };
+      });
+      withDist.sort((a, b) => {
+        if (a.km != null && b.km != null) return b.km - a.km; // farthest first
+        if (a.km != null) return -1;
+        if (b.km != null) return 1;
+        return new Date(a.placed_at) - new Date(b.placed_at); // oldest first
+      });
+      const pickupOrderIds = withDist.map((w) => w.id);
+      const feeBreakdown = orders.map((o) => ({
+        order_id: o.order.id,
+        restaurant_id: o.order.restaurant_id,
+        is_primary: o.is_primary,
+        normal_fee_paise: o.normal_fee_paise,
+        delivery_fee_paise: o.delivery_fee_paise,
+        platform_fee_paise: o.platform_fee_paise
+      }));
+      const gRes = await client.query(
+        `INSERT INTO delivery_groups
+           (customer_id, address_id, primary_order_id, order_ids, pickup_order_ids, fee_breakdown)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb) RETURNING id`,
+        [req.user.id, address_id, orders[0].order.id,
+         orders.map((o) => o.order.id), pickupOrderIds, JSON.stringify(feeBreakdown)]
+      );
+      deliveryGroupId = gRes.rows[0].id;
+      await client.query('UPDATE orders SET delivery_group_id = $1 WHERE id = ANY($2)',
+        [deliveryGroupId, orders.map((o) => o.order.id)]);
+      for (const o of orders) o.delivery_group_id = deliveryGroupId;
+    }
+
     await client.query('COMMIT');
     await notify(req.user.id, 'Order placed ✅', 'Your restaurants got the orders and kitchens are firing up! 🔥');
 
     res.status(201).json({
+      delivery_group_id: deliveryGroupId,
       orders,
       removed_off_route,
       off_route_message: removed_off_route.length ? OFF_ROUTE_MSG : null
@@ -858,6 +904,14 @@ router.post(
     const code = newDeliveryOtp();
     const hash = await bcrypt.hash(code, 8);
     await db.query('UPDATE orders SET delivery_otp_hash = $1 WHERE id = $2', [hash, order.id]);
+    // Grouped trip: the OTP is shared — re-issuing updates the group and
+    // mirrors to every sub-order so the rider's complete check keeps working.
+    if (order.delivery_group_id) {
+      await db.query('UPDATE delivery_groups SET delivery_otp_hash = $1 WHERE id = $2',
+        [hash, order.delivery_group_id]);
+      await db.query('UPDATE orders SET delivery_otp_hash = $1 WHERE delivery_group_id = $2',
+        [hash, order.delivery_group_id]);
+    }
     await notify(req.user.id, 'Your delivery OTP', `Share this OTP with your rider to receive the order: ${code}`);
     res.json({ ok: true, message: 'OTP re-sent to your notifications' });
   })

@@ -406,3 +406,23 @@ CREATE TABLE IF NOT EXISTS rider_declines (
   UNIQUE (rider_id, order_id)
 );
 CREATE INDEX IF NOT EXISTS idx_rider_declines_rider ON rider_declines(rider_id);
+
+-- Delivery groups: multi-restaurant "on the way" orders linked as ONE trip.
+CREATE TABLE IF NOT EXISTS delivery_groups (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  customer_id uuid NOT NULL REFERENCES users(id),
+  address_id uuid REFERENCES addresses(id) ON DELETE SET NULL,
+  primary_order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
+  order_ids uuid[] NOT NULL,
+  pickup_order_ids uuid[] NOT NULL,
+  status text NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open','assigned','in_progress','delivered','cancelled')),
+  rider_id uuid REFERENCES riders(id) ON DELETE SET NULL,
+  delivery_otp_hash text,
+  fee_breakdown jsonb NOT NULL DEFAULT '[]',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_groups_rider ON delivery_groups(rider_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_groups_status ON delivery_groups(status);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_group_id uuid REFERENCES delivery_groups(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_delivery_group ON orders(delivery_group_id);
