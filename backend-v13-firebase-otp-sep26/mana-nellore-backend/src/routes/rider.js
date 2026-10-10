@@ -917,8 +917,9 @@ router.put(
 );
 
 // PUT /api/rider/deliveries/:id/picked-up { photo } — generates the delivery OTP
-// for the customer. Pickup photo (image data URL, max ~1.5MB) is REQUIRED and
-// is shown to the customer on live tracking as proof of packed-food pickup.
+// for the customer. Pickup photo (image data URL, max ~1.5MB) is OPTIONAL:
+// single-restaurant pickups send it (shown to the customer on live tracking
+// as proof of packed-food pickup); grouped on-the-way pickups skip it.
 router.put(
   '/deliveries/:id/picked-up',
   ah(async (req, res) => {
@@ -937,10 +938,7 @@ router.put(
       }
     }
 
-    if (!photo) {
-      return res.status(400).json({ error: 'A pickup photo is required to confirm pickup' });
-    }
-
+    // Photo is optional: grouped on-the-way pickups confirm without one.
     const code = newDeliveryOtp();
     const hash = await bcrypt.hash(code, 8);
     await db.query('UPDATE orders SET delivery_otp_hash = $1, pickup_photo = COALESCE($2, pickup_photo) WHERE id = $3',
