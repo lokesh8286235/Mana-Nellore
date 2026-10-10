@@ -28,6 +28,30 @@ function newDeliveryOtp() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
+// Subtotal for a list of items against a menu lookup, including customization extras.
+async function itemsSubtotal(db, menuById, items) {
+  let sub = 0;
+  for (const it of items) {
+    const m = menuById[it.menu_item_id];
+    if (!m || !m.available) continue;
+    let custExtra = 0;
+    if (Array.isArray(it.customizations) && it.customizations.length) {
+      const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
+      if (optIds.length) {
+        const oRes = await db.query(
+          `SELECT o.id, o.price_paise FROM customization_options o
+           JOIN customization_groups g ON g.id = o.group_id
+           WHERE o.id = ANY($1) AND g.menu_item_id = $2`,
+          [optIds, m.id]
+        );
+        for (const o of oRes.rows) custExtra += Number(o.price_paise) || 0;
+      }
+    }
+    sub += (m.price_paise + custExtra) * (Number(it.qty) || 1);
+  }
+  return sub;
+}
+
 // POST /api/orders/quote { restaurant_id, address_id?, items, coupon_code?, order_type?, table_id?, tip_paise? }
 // Read-only bill preview: returns the exact fee breakdown the customer will
 // pay, computed with the same pricing engine as order placement. No order created.
@@ -70,25 +94,7 @@ router.post(
       [ids, restaurant_id]
     );
     const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
-    let subtotal = 0;
-    for (const it of items) {
-      const m = menuById[it.menu_item_id];
-      if (!m || !m.available) continue;
-      let custExtra = 0;
-      if (Array.isArray(it.customizations) && it.customizations.length) {
-        const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
-        if (optIds.length) {
-          const oRes = await db.query(
-            `SELECT o.id, o.price_paise FROM customization_options o
-             JOIN customization_groups g ON g.id = o.group_id
-             WHERE o.id = ANY($1) AND g.menu_item_id = $2`,
-            [optIds, m.id]
-          );
-          for (const o of oRes.rows) custExtra += Number(o.price_paise) || 0;
-        }
-      }
-      subtotal += (m.price_paise + custExtra) * (Number(it.qty) || 1);
-    }
+    const subtotal = await itemsSubtotal(db, menuById, items);
 
     // Coupon
     let discount = 0;
@@ -168,12 +174,7 @@ router.post(
             [gIds, rid]
           );
           const gmById = Object.fromEntries(gmRes.rows.map((m) => [m.id, m]));
-          let gSub = 0;
-          for (const it of gItems) {
-            const m = gmById[it.menu_item_id];
-            if (!m || !m.available) continue;
-            gSub += m.price_paise * (Number(it.qty) || 1);
-          }
+          const gSub = await itemsSubtotal(db, gmById, gItems);
           let gDist = null;
           if (rr.lat != null && rr.lng != null && address.lat != null && address.lng != null) {
             gDist = haversineKm(Number(rr.lat), Number(rr.lng), Number(address.lat), Number(address.lng));
@@ -200,22 +201,23 @@ router.post(
 
     const billDelivery = dineIn ? 0 : quote.deliveryFeePaise;
     const billPlatform = quote.platformFeePaise;
-    // When groups exist, bill reflects summed per-group fees
-    let totalDelivery = billDelivery, totalPlatform = billPlatform;
+    // When groups exist, the bill sums across ALL groups (not just the primary)
+    let billSubtotal = subtotal, totalDelivery = billDelivery, totalPlatform = billPlatform;
     if (groupsOut) {
+      billSubtotal = groupsOut.reduce((s, g) => s + g.subtotal_paise, 0);
       totalDelivery = groupsOut.reduce((s, g) => s + g.delivery_fee_paise, 0);
       totalPlatform = groupsOut.reduce((s, g) => s + g.platform_fee_paise, 0);
     }
 
     res.json({
       bill: {
-        subtotal_paise: subtotal,
+        subtotal_paise: billSubtotal,
         discount_paise: discount,
         delivery_fee_paise: dineIn ? 0 : totalDelivery,
         platform_fee_paise: totalPlatform,
         tax_paise: quote.taxPaise,
         tip_paise: tipPaise,
-        total_paise: (dineIn ? 0 : totalDelivery) + totalPlatform + tipPaise + (subtotal - discount)
+        total_paise: (dineIn ? 0 : totalDelivery) + totalPlatform + tipPaise + (billSubtotal - discount)
       },
       groups: groupsOut,
       coupon_error: couponError,
