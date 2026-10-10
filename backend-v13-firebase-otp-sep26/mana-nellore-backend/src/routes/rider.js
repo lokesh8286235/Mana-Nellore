@@ -204,6 +204,117 @@ async function deliveryDetail(orderId, riderId) {
   return { ...order, items: items.rows };
 }
 
+// Next-stop routing: the backend tells the rider app where to go next, so the
+// client never has to guess. Rule: remaining restaurant pickups first, then
+// customer deliveries.
+//  - Pickups ('ready'): farthest-from-own-customer first when coordinates
+//    exist (the "start at the farthest pickup" product rule), oldest first
+//    as fallback.
+//  - Deliveries: an in-progress handover ('on_way') wins, otherwise
+//    nearest-to-rider first when the rider's position is known, oldest
+//    first as fallback.
+// Returns null when the rider has no active deliveries.
+async function computeNextStop(riderId) {
+  const { rows: actives } = await db.query(
+    `SELECT o.id, o.status, o.placed_at,
+            r.name AS restaurant_name, r.address AS restaurant_address,
+            r.lat AS rest_lat, r.lng AS rest_lng, r.phone AS restaurant_phone,
+            a.label AS addr_label, a.line1, a.line2, a.city,
+            a.lat AS addr_lat, a.lng AS addr_lng,
+            u.name AS customer_name, u.phone AS customer_phone
+     FROM orders o
+     JOIN restaurants r ON r.id = o.restaurant_id
+     LEFT JOIN addresses a ON a.id = o.address_id
+     JOIN users u ON u.id = o.customer_id
+     WHERE o.rider_id = $1 AND o.status NOT IN ('delivered','cancelled')
+     ORDER BY o.placed_at ASC`,
+    [riderId]
+  );
+  if (!actives.length) return null;
+
+  const validCoord = (lat, lng) =>
+    lat != null && lng != null && Number.isFinite(Number(lat)) && Number.isFinite(Number(lng))
+      ? { lat: Number(lat), lng: Number(lng) } : null;
+
+  const fmtAddr = (o) => [o.addr_label, o.line1, o.line2, o.city].filter(Boolean).join(', ');
+
+  const remainingPickups = actives.filter(o => o.status === 'ready').length;
+  const remainingDeliveries = actives.length - remainingPickups;
+  const counts = { remaining_pickups: remainingPickups, remaining_deliveries: remainingDeliveries };
+
+  // 1. Remaining pickups.
+  const pickups = actives.filter(o => o.status === 'ready');
+  if (pickups.length) {
+    const tripKm = (o) => {
+      const r = validCoord(o.rest_lat, o.rest_lng);
+      const c = validCoord(o.addr_lat, o.addr_lng);
+      return r && c ? haversineKm(r.lat, r.lng, c.lat, c.lng) : null;
+    };
+    pickups.sort((a, b) => {
+      const da = tripKm(a), db = tripKm(b);
+      if (da != null && db != null) return db - da; // farthest first
+      if (da != null) return -1;
+      if (db != null) return 1;
+      return new Date(a.placed_at) - new Date(b.placed_at); // oldest first
+    });
+    const o = pickups[0];
+    const rc = validCoord(o.rest_lat, o.rest_lng);
+    return {
+      type: 'restaurant',
+      order_id: o.id,
+      name: o.restaurant_name || 'Restaurant',
+      address: o.restaurant_address || '',
+      phone: o.restaurant_phone || null,
+      lat: rc ? rc.lat : null,
+      lng: rc ? rc.lng : null,
+      ...counts,
+    };
+  }
+
+  const asCustomerStop = (o) => {
+    const cc = validCoord(o.addr_lat, o.addr_lng);
+    return {
+      type: 'customer',
+      order_id: o.id,
+      name: o.customer_name || 'Customer',
+      address: fmtAddr(o),
+      phone: o.customer_phone || null,
+      lat: cc ? cc.lat : null,
+      lng: cc ? cc.lng : null,
+      ...counts,
+    };
+  };
+
+  // 2. In-progress handover wins (rider is already at that customer's door).
+  const handover = actives.find(o => o.status === 'on_way');
+  if (handover) return asCustomerStop(handover);
+
+  // 3. Remaining deliveries: nearest-to-rider first when the rider's position
+  //    is known, oldest first as fallback.
+  const drops = actives.filter(o => o.status === 'picked_up');
+  if (drops.length) {
+    let rl = null;
+    try {
+      const { rows: rr } = await db.query('SELECT lat, lng FROM riders WHERE id = $1', [riderId]);
+      rl = rr[0] ? validCoord(rr[0].lat, rr[0].lng) : null;
+    } catch (e) { /* riders.lat/lng are best-effort */ }
+    const toRiderKm = (o) => {
+      const c = validCoord(o.addr_lat, o.addr_lng);
+      return rl && c ? haversineKm(rl.lat, rl.lng, c.lat, c.lng) : null;
+    };
+    drops.sort((a, b) => {
+      const da = toRiderKm(a), db = toRiderKm(b);
+      if (da != null && db != null) return da - db; // nearest first
+      if (da != null) return -1;
+      if (db != null) return 1;
+      return new Date(a.placed_at) - new Date(b.placed_at);
+    });
+    return asCustomerStop(drops[0]);
+  }
+
+  return null;
+}
+
 // GET /api/rider/deliveries/available — ready orders with no rider yet.
 // Sorted nearest-first by rider-to-restaurant distance when the rider's
 // location is known (proximity dispatch); oldest first as fallback.
@@ -281,7 +392,10 @@ router.get(
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params
     );
-    res.json({ deliveries: rows });
+    // Trip-level next stop: the backend decides where the rider goes next
+    // (remaining pickups first, then deliveries) so the client just follows.
+    const next_stop = req.query.status === 'active' ? await computeNextStop(rider.id) : null;
+    res.json({ deliveries: rows, next_stop });
   })
 );
 
@@ -293,6 +407,9 @@ router.get(
     if (!rider) return;
     const detail = await deliveryDetail(req.params.id, rider.id);
     if (!detail) return res.status(404).json({ error: 'Delivery not found' });
+    // Next stop computed from the rider's full active set, not just this
+    // delivery — after a pickup the rider goes wherever the trip needs next.
+    detail.next_stop = await computeNextStop(rider.id);
     res.json({ delivery: detail });
   })
 );
