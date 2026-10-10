@@ -104,7 +104,9 @@ router.get(
           'X-Goog-Api-Key': gkey,
           'X-Goog-FieldMask':
             'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,' +
-            'routes.legs.distanceMeters,routes.legs.duration',
+            'routes.legs.distanceMeters,routes.legs.duration,' +
+            'routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,' +
+            'routes.legs.steps.navigationInstruction,routes.legs.steps.polyline',
         },
         body: JSON.stringify(body),
       });
@@ -132,6 +134,25 @@ router.get(
       start_address: null,
       end_address: null,
     }));
+
+    // Flatten per-step turn-by-turn data across all legs.
+    // Routes API step shape: { distanceMeters, staticDuration: "120s",
+    //   polyline: { encodedPolyline }, navigationInstruction: { maneuver, instructions } }.
+    // Simplified to keep response size small; capped at 100 steps.
+    const steps = [];
+    for (const leg of route.legs || []) {
+      for (const s of leg.steps || []) {
+        if (steps.length >= 100) break;
+        const nav = s.navigationInstruction || {};
+        steps.push({
+          instruction: nav.instructions || null,
+          maneuver: nav.maneuver || null,
+          distance_m: s.distanceMeters ?? null,
+          duration_s: parseDuration(s.staticDuration),
+          polyline: (s.polyline && s.polyline.encodedPolyline) || null,
+        });
+      }
+    }
     const distance_m = route.distanceMeters ?? legs.reduce((a, l) => a + (l.distance_m || 0), 0);
     const duration_s =
       parseDuration(route.duration) ?? legs.reduce((a, l) => a + (l.duration_s || 0), 0);
@@ -142,6 +163,7 @@ router.get(
       legs,
       distance_m,
       duration_s,
+      steps,
     };
     cache.set(key, { at: Date.now(), body: out });
     if (cache.size > 500) {
