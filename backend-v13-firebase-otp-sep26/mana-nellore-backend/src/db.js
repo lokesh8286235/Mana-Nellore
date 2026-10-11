@@ -105,6 +105,7 @@ async function migrate() {
     END IF;
   END $$`);
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_otp_hash text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_otp text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number text');
   await q(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_order_number_key') THEN

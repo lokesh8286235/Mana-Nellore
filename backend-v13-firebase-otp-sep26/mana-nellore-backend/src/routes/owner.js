@@ -45,10 +45,17 @@ async function transition(orderId, status, by) {
   const restaurantId = rows[0] && rows[0].restaurant_id;
   timeline.push({ status, at: new Date().toISOString(), by });
   // "Packed fresh" stamp: the moment the kitchen taps Ready for pickup
+  // Also generate pickup OTP for the rider
+  let pickupOtp = null;
+  if (status === 'ready') {
+    pickupOtp = String(Math.floor(1000 + Math.random() * 9000)); // 4-digit OTP
+  }
   const packed = status === 'ready' ? ', packed_at = now()' : '';
-  await db.query(`UPDATE orders SET status = $1, timeline = $2::jsonb${packed} WHERE id = $3`, [
-    status, JSON.stringify(timeline), orderId
-  ]);
+  const otpSet = status === 'ready' ? ', pickup_otp = $4' : '';
+  const params = status === 'ready' 
+    ? [status, JSON.stringify(timeline), orderId, pickupOtp]
+    : [status, JSON.stringify(timeline), orderId];
+  await db.query(`UPDATE orders SET status = $1, timeline = $2::jsonb${packed}${otpSet} WHERE id = $3`, params);
   // Log prep time for restaurant readiness predictions (Phase 5)
   if (status === 'ready' && restaurantId) {
     try {
