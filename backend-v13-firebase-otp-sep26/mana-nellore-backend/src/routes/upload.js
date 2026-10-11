@@ -1,18 +1,14 @@
-// Image upload — accepts base64-encoded images, saves to disk, serves via /img/.
-// NOTE: Railway's filesystem is ephemeral; uploads are lost on redeploy.
-// For production persistence, move to S3/cloud storage.
+// Image upload — uploads to Cloudinary for persistent storage.
+// Photos survive Railway redeploys.
 const express = require('express');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 const { ah, authenticate } = require('../middleware/auth');
 
 const router = express.Router();
 
-const UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads');
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
+const CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
+const API_KEY = process.env.CLOUDINARY_API_KEY;
+const API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
 const ALLOWED_MIME = {
   'image/jpeg': 'jpg',
@@ -20,8 +16,37 @@ const ALLOWED_MIME = {
   'image/webp': 'webp',
 };
 
+// Upload a base64 data URL to Cloudinary, return the secure URL
+async function uploadToCloudinary(dataUrl, folder) {
+  if (!CLOUD_NAME || !API_KEY || !API_SECRET) {
+    throw new Error('Cloudinary not configured');
+  }
+  const timestamp = Math.floor(Date.now() / 1000);
+  const safeFolder = String(folder || 'misc').replace(/[^a-z0-9_-]/gi, '').slice(0, 20) || 'misc';
+  // Signature: sha1 of sorted params + api_secret
+  const toSign = `folder=mana-nellore/${safeFolder}&timestamp=${timestamp}${API_SECRET}`;
+  const signature = crypto.createHash('sha1').update(toSign).digest('hex');
+
+  const form = new URLSearchParams();
+  form.append('file', dataUrl);
+  form.append('api_key', API_KEY);
+  form.append('timestamp', String(timestamp));
+  form.append('folder', `mana-nellore/${safeFolder}`);
+  form.append('signature', signature);
+
+  const resp = await fetch(`https://api.cloudinary.com/v1_1/${CLOUD_NAME}/image/upload`, {
+    method: 'POST',
+    body: form,
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data.secure_url) {
+    throw new Error(data.error?.message || 'Cloudinary upload failed');
+  }
+  return data.secure_url;
+}
+
 // POST /api/upload/image — { image: "data:image/jpeg;base64,...", folder: "restaurants" }
-// Returns { url: "/img/<filename>" }. Requires auth (admin/owner).
+// Returns { url: "https://res.cloudinary.com/..." }. Requires auth (admin/owner).
 router.post(
   '/image',
   authenticate,
@@ -36,8 +61,6 @@ router.post(
       return res.status(400).json({ error: 'Invalid image format. Use data:image/jpeg|png|webp;base64,...' });
     }
 
-    const mime = match[1];
-    const ext = ALLOWED_MIME[mime];
     const data = Buffer.from(match[3], 'base64');
 
     // 5MB max
@@ -48,10 +71,6 @@ router.post(
       return res.status(400).json({ error: 'Invalid image data' });
     }
 
-    const safeFolder = String(folder || 'misc').replace(/[^a-z0-9_-]/gi, '').slice(0, 20) || 'misc';
-    const filename = `${safeFolder}-${crypto.randomBytes(16).toString('hex')}.${ext}`;
-    const filepath = path.join(UPLOAD_DIR, filename);
-
     // Basic magic-byte check
     const header = data.slice(0, 4);
     const isJpeg = header[0] === 0xff && header[1] === 0xd8;
@@ -61,14 +80,12 @@ router.post(
       return res.status(400).json({ error: 'File is not a valid image' });
     }
 
-    fs.writeFileSync(filepath, data);
-
-    // Return absolute URL if we can determine the host, else relative
-    const host = req.get('host');
-    const proto = req.get('x-forwarded-proto') || req.protocol;
-    const url = host ? `${proto}://${host}/img/${filename}` : `/img/${filename}`;
+    const url = await uploadToCloudinary(image, folder);
     res.json({ url });
   })
 );
+
+// Export for reuse in admin routes
+router.uploadToCloudinary = uploadToCloudinary;
 
 module.exports = router;

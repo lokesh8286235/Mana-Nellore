@@ -1266,21 +1266,9 @@ router.post(
       if (c.rows[0]) categoryId = c.rows[0].id;
     }
     let imageUrl = b.image_url || null;
-    // If base64 data URL, upload it first
+    // If base64 data URL, upload to Cloudinary
     if (imageUrl && imageUrl.startsWith('data:image/')) {
-      const match = imageUrl.match(/^data:(image\/(jpeg|png|webp));base64,(.+)$/);
-      if (match) {
-        const ext = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }[match[1]];
-        const data = Buffer.from(match[3], 'base64');
-        const crypto = require('crypto');
-        const path = require('path');
-        const fs = require('fs');
-        const filename = `menu-${crypto.randomBytes(16).toString('hex')}.${ext}`;
-        const uploadDir = path.join(__dirname, '..', '..', 'uploads');
-        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-        fs.writeFileSync(path.join(uploadDir, filename), data);
-        imageUrl = '/img/' + filename;
-      }
+      imageUrl = await uploadToCloudinary(imageUrl, 'menu');
     }
     const { rows } = await db.query(
       `INSERT INTO menu_items (restaurant_id, name, price_paise, category_id, description, veg, available, image_url)
@@ -1312,21 +1300,9 @@ router.put(
       }
     }
     let imageUrl = b.image_url;
-    // If base64 data URL, upload it first
+    // If base64 data URL, upload to Cloudinary
     if (imageUrl && imageUrl.startsWith('data:image/')) {
-      const match = imageUrl.match(/^data:(image\/(jpeg|png|webp));base64,(.+)$/);
-      if (match) {
-        const ext = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }[match[1]];
-        const data = Buffer.from(match[3], 'base64');
-        const crypto = require('crypto');
-        const path = require('path');
-        const fs = require('fs');
-        const filename = `menu-${crypto.randomBytes(16).toString('hex')}.${ext}`;
-        const uploadDir = path.join(__dirname, '..', '..', 'uploads');
-        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-        fs.writeFileSync(path.join(uploadDir, filename), data);
-        imageUrl = '/img/' + filename;
-      }
+      imageUrl = await uploadToCloudinary(imageUrl, 'menu');
     }
     const fields = [], params = [];
     let i = 1;
