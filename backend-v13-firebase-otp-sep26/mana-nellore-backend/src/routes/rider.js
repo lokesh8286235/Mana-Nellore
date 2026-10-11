@@ -943,6 +943,17 @@ router.put(
     //   return res.status(400).json({ error: 'A pickup photo is required to confirm pickup' });
     // }
 
+    // Verify pickup OTP if provided (new rider app sends it; old app doesn't)
+    const providedOtp = req.body.pickup_otp || req.body.otp;
+    if (providedOtp) {
+      if (String(providedOtp) !== String(detail.pickup_otp)) {
+        return res.status(400).json({ error: 'Invalid pickup OTP. Ask the restaurant for the correct code.' });
+      }
+    } else {
+      // Old app version: log warning but allow (remove after rider app deployed)
+      console.warn(`[SECURITY] Pickup without OTP verification: order ${detail.id}, rider ${rider.id}`);
+    }
+
     const code = null; /* stable OTP: placement OTP reused, never regenerated */
     await db.query('UPDATE orders SET pickup_photo = COALESCE($1, pickup_photo) WHERE id = $2',
       [photo, detail.id]);
