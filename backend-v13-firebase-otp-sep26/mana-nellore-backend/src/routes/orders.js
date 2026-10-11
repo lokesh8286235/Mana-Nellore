@@ -630,9 +630,9 @@ router.post(
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash)
+            order_number, delivery_otp_hash, delivery_otp_plain)
          VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
-                 now() + ($20 || ' minutes')::interval, $21, $22, $23)
+                 now() + ($20 || ' minutes')::interval, $21, $22, $23, $24)
          RETURNING *`,
         [req.user.id, restaurant_id, dineIn ? null : address_id, dineIn ? 'dinein' : 'delivery',
          dineIn ? table_id : null,
