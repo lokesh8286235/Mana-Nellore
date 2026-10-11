@@ -5,6 +5,38 @@ const bcrypt = require('bcryptjs');
 const { seedSuggestedCats } = require('../lib/suggested-cats');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
+const crypto = require('crypto');
+
+// Upload a base64 data URL to Cloudinary, return the secure URL
+async function uploadToCloudinary(dataUrl, folder) {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const apiKey = process.env.CLOUDINARY_API_KEY;
+  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+  if (!cloudName || !apiKey || !apiSecret) {
+    throw new Error('Cloudinary not configured');
+  }
+  const timestamp = Math.floor(Date.now() / 1000);
+  const safeFolder = String(folder || 'misc').replace(/[^a-z0-9_-]/gi, '').slice(0, 20) || 'misc';
+  const toSign = `folder=mana-nellore/${safeFolder}&timestamp=${timestamp}${apiSecret}`;
+  const signature = crypto.createHash('sha1').update(toSign).digest('hex');
+
+  const form = new URLSearchParams();
+  form.append('file', dataUrl);
+  form.append('api_key', apiKey);
+  form.append('timestamp', String(timestamp));
+  form.append('folder', `mana-nellore/${safeFolder}`);
+  form.append('signature', signature);
+
+  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+    method: 'POST',
+    body: form,
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data.secure_url) {
+    throw new Error(data.error?.message || 'Cloudinary upload failed');
+  }
+  return data.secure_url;
+}
 
 const router = express.Router();
 router.use(authenticate, requireRole('admin'));
