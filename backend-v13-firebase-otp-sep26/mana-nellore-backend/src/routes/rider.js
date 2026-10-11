@@ -838,28 +838,39 @@ router.post(
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
     if (!rider.online) return res.status(409).json({ error: 'Go online to accept deliveries' });
-    // Max 3 concurrent active deliveries per rider.
+    // Max 3 concurrent active deliveries per rider. Trips count as 1 (not per-order).
     const active = await db.query(
-      "SELECT COUNT(*) AS n FROM orders WHERE rider_id = $1 AND status NOT IN ('delivered','cancelled')",
+      `SELECT COUNT(DISTINCT COALESCE(trip_id::text, id::text)) AS n
+       FROM orders WHERE rider_id = $1 AND status NOT IN ('delivered','cancelled')`,
       [rider.id]
     );
     if (Number(active.rows[0].n) >= 3) {
       return res.status(409).json({ error: 'You already have 3 active deliveries — complete one first' });
     }
     // Atomic: only assign if still unassigned (prevents double-accept race)
+    // For trips: assign ALL orders in the trip to this rider
     const { rows } = await db.query(
       "UPDATE orders SET rider_id = $1 WHERE id = $2 AND status = 'ready' AND rider_id IS NULL RETURNING *",
       [rider.id, req.params.id]
     );
     const order = rows[0];
     if (!order) return res.status(409).json({ error: 'Delivery no longer available' });
+
+    // If this order is part of a trip, assign all trip orders to this rider
+    if (order.trip_id) {
+      await db.query(
+        "UPDATE orders SET rider_id = $1 WHERE trip_id = $2 AND status = 'ready' AND rider_id IS NULL",
+        [rider.id, order.trip_id]
+      );
+    }
+
     const timeline = order.timeline || [];
     timeline.push({ status: 'rider_assigned', at: new Date().toISOString(), by: 'rider' });
     await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
       JSON.stringify(timeline), order.id
     ]);
     await notify(order.customer_id, 'Rider assigned', 'Your rider is on the way to the restaurant.');
-    res.json({ ok: true });
+    res.json({ ok: true, trip_id: order.trip_id || null });
   })
 );
 
