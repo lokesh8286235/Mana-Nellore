@@ -308,6 +308,11 @@ async function placeMultiGroupOrder(req, res) {
     const config = await loadPricingConfig(client);
     const orders = [];
 
+    // Trip grouping: one trip_id and ONE shared delivery OTP for all orders
+    const crypto = require('crypto');
+    const tripId = crypto.randomUUID();
+    const { code: sharedDeliveryOtp, hash: sharedDeliveryOtpHash } = await freshDeliveryOtp();
+
     for (let gi = 0; gi < validGroups.length; gi++) {
       const g = validGroups[gi];
       const isPrimary = gi === 0;
@@ -399,7 +404,7 @@ async function placeMultiGroupOrder(req, res) {
       const etaMinutes = Number(config.etaMinutes) || 30;
       const shareToken = require('crypto').randomBytes(6).toString('hex');
       const orderNumber = await newOrderNumber(client);
-      const { code: deliveryOtp, hash: deliveryOtpHash } = await freshDeliveryOtp();
+      // Use shared delivery OTP and trip_id for the trip (not per-order)
 
       const oRes = await client.query(
         `INSERT INTO orders
@@ -408,16 +413,16 @@ async function placeMultiGroupOrder(req, res) {
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash, delivery_otp_plain)
+            order_number, delivery_otp_hash, delivery_otp_plain, trip_id)
          VALUES ($1,$2,$3,'placed','delivery',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17::jsonb,
-                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22)
+                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22, $23)
          RETURNING *`,
         [req.user.id, restaurant.id, address_id,
          subtotal, discount, deliveryFee, platformFee,
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, deliveryOtpHash, deliveryOtp]
+         orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, tripId]
       );
       const order = oRes.rows[0];
       for (const s of snapshots) {
@@ -429,7 +434,7 @@ async function placeMultiGroupOrder(req, res) {
       }
       const { delivery_otp_hash: _h1, ...orderSafe } = order;
       orders.push({
-        order: { ...orderSafe, items: snapshots, delivery_otp: deliveryOtp },
+        order: { ...orderSafe, items: snapshots, delivery_otp: sharedDeliveryOtp },
         group_index: gi,
         is_primary: isPrimary,
         delivery_fee_paise: deliveryFee,

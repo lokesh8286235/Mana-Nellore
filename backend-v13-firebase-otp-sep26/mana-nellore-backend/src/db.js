@@ -163,6 +163,8 @@ async function migrate() {
   await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS cancelled_deliveries int NOT NULL DEFAULT 0');
   await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now()');
   await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS requires_student boolean NOT NULL DEFAULT false');
+  // Trip grouping for on-the-way multi-restaurant orders
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS trip_id uuid');
   await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS aadhar text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar text');
 
