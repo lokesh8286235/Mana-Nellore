@@ -1256,6 +1256,15 @@ router.post(
   '/restaurants/:id/menu/items',
   ah(async (req, res) => {
     const b = req.body || {};
+    // Resolve category name to category_id
+    let categoryId = b.category_id || null;
+    if (!categoryId && b.category) {
+      const c = await db.query(
+        'SELECT id FROM categories WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1',
+        [req.params.id, b.category.trim()]
+      );
+      if (c.rows[0]) categoryId = c.rows[0].id;
+    }
     let imageUrl = b.image_url || null;
     // If base64 data URL, upload it first
     if (imageUrl && imageUrl.startsWith('data:image/')) {
@@ -1274,9 +1283,9 @@ router.post(
       }
     }
     const { rows } = await db.query(
-      `INSERT INTO menu_items (restaurant_id, name, price_paise, category, description, veg, available, image_url)
+      `INSERT INTO menu_items (restaurant_id, name, price_paise, category_id, description, veg, available, image_url)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [req.params.id, b.name, b.price_paise, b.category || null, b.description || null, 
+      [req.params.id, b.name, b.price_paise, categoryId, b.description || null, 
        b.veg !== false, b.available !== false, imageUrl]
     );
     await audit(req, 'menu_item_create', 'menu_item', rows[0].id, { restaurant_id: req.params.id });
@@ -1289,6 +1298,19 @@ router.put(
   '/restaurants/:id/menu/items/:itemId',
   ah(async (req, res) => {
     const b = req.body || {};
+    // Resolve category name to category_id
+    let categoryId = b.category_id;
+    if (categoryId === undefined && b.category !== undefined) {
+      if (b.category) {
+        const c = await db.query(
+          'SELECT id FROM categories WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1',
+          [req.params.id, b.category.trim()]
+        );
+        categoryId = c.rows[0] ? c.rows[0].id : null;
+      } else {
+        categoryId = null;
+      }
+    }
     let imageUrl = b.image_url;
     // If base64 data URL, upload it first
     if (imageUrl && imageUrl.startsWith('data:image/')) {
@@ -1310,7 +1332,7 @@ router.put(
     let i = 1;
     if (b.name !== undefined) { fields.push(`name = $${i++}`); params.push(b.name); }
     if (b.price_paise !== undefined) { fields.push(`price_paise = $${i++}`); params.push(b.price_paise); }
-    if (b.category !== undefined) { fields.push(`category = $${i++}`); params.push(b.category); }
+    if (categoryId !== undefined) { fields.push(`category_id = $${i++}`); params.push(categoryId); }
     if (b.description !== undefined) { fields.push(`description = $${i++}`); params.push(b.description); }
     if (b.veg !== undefined) { fields.push(`veg = $${i++}`); params.push(b.veg); }
     if (b.available !== undefined) { fields.push(`available = $${i++}`); params.push(b.available); }
