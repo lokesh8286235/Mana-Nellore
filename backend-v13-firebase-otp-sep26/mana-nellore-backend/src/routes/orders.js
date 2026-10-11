@@ -408,16 +408,16 @@ async function placeMultiGroupOrder(req, res) {
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash)
+            order_number, delivery_otp_hash, delivery_otp_plain)
          VALUES ($1,$2,$3,'placed','delivery',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17::jsonb,
-                 now() + ($18 || ' minutes')::interval, $19, $20, $21)
+                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22)
          RETURNING *`,
         [req.user.id, restaurant.id, address_id,
          subtotal, discount, deliveryFee, platformFee,
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, deliveryOtpHash]
+         orderNumber, deliveryOtpHash, deliveryOtp]
       );
       const order = oRes.rows[0];
       for (const s of snapshots) {
@@ -640,7 +640,7 @@ router.post(
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, deliveryOtpHash]
+         orderNumber, deliveryOtpHash, deliveryOtp]
       );
       const order = oRes.rows[0];
 
@@ -784,6 +784,10 @@ router.get(
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
     delete order.delivery_otp_hash; // never expose to clients
+    if (order.delivery_otp_plain) {
+      order.delivery_otp = order.delivery_otp_plain;
+      delete order.delivery_otp_plain;
+    }
     const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
     // Queue transparency: orders at this restaurant placed before mine, still active
     let queueAhead = 0;
