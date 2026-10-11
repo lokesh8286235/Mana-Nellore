@@ -937,9 +937,11 @@ router.put(
       }
     }
 
-    if (!photo) {
-      return res.status(400).json({ error: 'A pickup photo is required to confirm pickup' });
-    }
+    // TEMP DISABLED 2026-10-11: rider app photo UI not deployed yet (Vercel limit)
+    // Re-enable once rider app with photo upload is live
+    // if (!photo) {
+    //   return res.status(400).json({ error: 'A pickup photo is required to confirm pickup' });
+    // }
 
     const code = null; /* stable OTP: placement OTP reused, never regenerated */
     await db.query('UPDATE orders SET pickup_photo = COALESCE($1, pickup_photo) WHERE id = $2',
