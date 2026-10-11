@@ -1238,4 +1238,107 @@ router.put(
   })
 );
 
-module.exports = router;module.exports = router;
+module.exports = router;// ---- Menu items (admin) ----
+// GET /api/admin/restaurants/:id/menu/items - list all menu items
+router.get(
+  '/restaurants/:id/menu/items',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      'SELECT * FROM menu_items WHERE restaurant_id = $1 ORDER BY sort_order, name',
+      [req.params.id]
+    );
+    res.json({ items: rows });
+  })
+);
+
+// POST /api/admin/restaurants/:id/menu/items - create menu item
+router.post(
+  '/restaurants/:id/menu/items',
+  ah(async (req, res) => {
+    const b = req.body || {};
+    let imageUrl = b.image_url || null;
+    // If base64 data URL, upload it first
+    if (imageUrl && imageUrl.startsWith('data:image/')) {
+      const match = imageUrl.match(/^data:(image\/(jpeg|png|webp));base64,(.+)$/);
+      if (match) {
+        const ext = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }[match[1]];
+        const data = Buffer.from(match[3], 'base64');
+        const crypto = require('crypto');
+        const path = require('path');
+        const fs = require('fs');
+        const filename = `menu-${crypto.randomBytes(16).toString('hex')}.${ext}`;
+        const uploadDir = path.join(__dirname, '..', '..', 'uploads');
+        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+        fs.writeFileSync(path.join(uploadDir, filename), data);
+        imageUrl = '/img/' + filename;
+      }
+    }
+    const { rows } = await db.query(
+      `INSERT INTO menu_items (restaurant_id, name, price_paise, category, description, veg, available, image_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [req.params.id, b.name, b.price_paise, b.category || null, b.description || null, 
+       b.veg !== false, b.available !== false, imageUrl]
+    );
+    await audit(req, 'menu_item_create', 'menu_item', rows[0].id, { restaurant_id: req.params.id });
+    res.json({ item: rows[0] });
+  })
+);
+
+// PUT /api/admin/restaurants/:id/menu/items/:itemId - update menu item
+router.put(
+  '/restaurants/:id/menu/items/:itemId',
+  ah(async (req, res) => {
+    const b = req.body || {};
+    let imageUrl = b.image_url;
+    // If base64 data URL, upload it first
+    if (imageUrl && imageUrl.startsWith('data:image/')) {
+      const match = imageUrl.match(/^data:(image\/(jpeg|png|webp));base64,(.+)$/);
+      if (match) {
+        const ext = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }[match[1]];
+        const data = Buffer.from(match[3], 'base64');
+        const crypto = require('crypto');
+        const path = require('path');
+        const fs = require('fs');
+        const filename = `menu-${crypto.randomBytes(16).toString('hex')}.${ext}`;
+        const uploadDir = path.join(__dirname, '..', '..', 'uploads');
+        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+        fs.writeFileSync(path.join(uploadDir, filename), data);
+        imageUrl = '/img/' + filename;
+      }
+    }
+    const fields = [], params = [];
+    let i = 1;
+    if (b.name !== undefined) { fields.push(`name = $${i++}`); params.push(b.name); }
+    if (b.price_paise !== undefined) { fields.push(`price_paise = $${i++}`); params.push(b.price_paise); }
+    if (b.category !== undefined) { fields.push(`category = $${i++}`); params.push(b.category); }
+    if (b.description !== undefined) { fields.push(`description = $${i++}`); params.push(b.description); }
+    if (b.veg !== undefined) { fields.push(`veg = $${i++}`); params.push(b.veg); }
+    if (b.available !== undefined) { fields.push(`available = $${i++}`); params.push(b.available); }
+    if (imageUrl !== undefined) { fields.push(`image_url = $${i++}`); params.push(imageUrl); }
+    if (!fields.length) return res.status(400).json({ error: 'No fields to update' });
+    params.push(req.params.itemId, req.params.id);
+    const { rows } = await db.query(
+      `UPDATE menu_items SET ${fields.join(', ')} WHERE id = $${i++} AND restaurant_id = $${i} RETURNING *`,
+      params
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Menu item not found' });
+    await audit(req, 'menu_item_update', 'menu_item', req.params.itemId, b);
+    res.json({ item: rows[0] });
+  })
+);
+
+// DELETE /api/admin/restaurants/:id/menu/items/:itemId - delete menu item
+router.delete(
+  '/restaurants/:id/menu/items/:itemId',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      'DELETE FROM menu_items WHERE id = $1 AND restaurant_id = $2 RETURNING id',
+      [req.params.itemId, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Menu item not found' });
+    await audit(req, 'menu_item_delete', 'menu_item', req.params.itemId, {});
+    res.json({ ok: true });
+  })
+);
+
+module.exports = router;
