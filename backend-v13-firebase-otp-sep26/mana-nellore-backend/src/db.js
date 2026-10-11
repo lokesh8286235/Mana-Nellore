@@ -107,6 +107,9 @@ async function migrate() {
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_otp_hash text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_otp text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS fssai_license text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS opens_at text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS closes_at text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number text');
   await q(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_order_number_key') THEN
