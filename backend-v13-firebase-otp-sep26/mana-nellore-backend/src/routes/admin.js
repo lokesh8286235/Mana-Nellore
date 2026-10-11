@@ -160,7 +160,12 @@ router.get(
 router.put(
   '/restaurants/:id/details',
   ah(async (req, res) => {
-    const { name, address, fssai_license, owner_name, opens_at, closes_at, opens_at_we, closes_at_we, lat, lng } = req.body;
+    const b = req.body || {};
+    // Empty strings -> null (so time columns don't get invalid "")
+    const clean = v => (v === '' || v === undefined ? null : v);
+    const name = clean(b.name), address = clean(b.address), fssai = clean(b.fssai_license);
+    const opens_at = clean(b.opens_at), closes_at = clean(b.closes_at);
+    const lat = clean(b.lat), lng = clean(b.lng);
     const { rows } = await db.query(
       `UPDATE restaurants SET 
         name = COALESCE($1, name),
@@ -172,7 +177,7 @@ router.put(
         lng = COALESCE($7, lng),
         updated_at = NOW()
        WHERE id = $8 RETURNING *`,
-      [name, address, fssai_license, opens_at, closes_at, lat, lng, req.params.id]
+      [name, address, fssai, opens_at, closes_at, lat, lng, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, 'restaurant_update', 'restaurant', req.params.id, req.body);
