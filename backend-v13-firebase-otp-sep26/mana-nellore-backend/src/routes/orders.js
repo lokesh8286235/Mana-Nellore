@@ -280,9 +280,10 @@ async function placeMultiGroupOrder(req, res) {
     if (!primary) throw { status: 404, message: 'Primary restaurant not available' };
     if (!primary.is_open) throw { status: 400, message: 'Primary restaurant is currently closed' };
 
-    // Route validation: secondary must be within 1km of segment primary->address
+    // Route validation: secondary on-route (within 1km) gets 20% fee; off-route gets 100% fee (two separate deliveries)
+    // User rule 2026-10-11: off-route is allowed, just charged full delivery fee, not removed
     const removed_off_route = [];
-    const validGroups = [groups[0]];
+    const validGroups = [{ ...groups[0], _onRoute: true }];
     for (let i = 1; i < groups.length; i++) {
       const g = groups[i];
       const r = restById[String(g.restaurant_id)];
@@ -298,11 +299,8 @@ async function placeMultiGroupOrder(req, res) {
           Number(address.lng), Number(address.lat));
         onRoute = d <= 1.0;
       }
-      if (!onRoute) {
-        removed_off_route.push({ restaurant_id: g.restaurant_id, name: r.name, reason: 'off_route' });
-      } else {
-        validGroups.push(g);
-      }
+      // Keep the group, mark onRoute status for fee calculation
+      validGroups.push({ ...g, _onRoute: onRoute });
     }
 
     const config = await loadPricingConfig(client);
@@ -395,7 +393,10 @@ async function placeMultiGroupOrder(req, res) {
         commissionPct: restaurant.commission_pct
       });
       const normalFee = quote.deliveryFeePaise;
-      const deliveryFee = isPrimary ? normalFee : Math.round(normalFee * 0.2);
+      // On-route secondary: 20% fee. Off-route secondary: 100% fee (separate delivery).
+      // Primary always 100%.
+      const onRoute = g._onRoute !== false;
+      const deliveryFee = isPrimary ? normalFee : (onRoute ? Math.round(normalFee * 0.2) : normalFee);
       const platformFee = isPrimary ? quote.platformFeePaise : 0;
       const tipPaise = isPrimary ? Math.max(0, Math.round(Number(tip_paise) || 0)) : 0;
       const finalTotal = (subtotal - discount) + deliveryFee + platformFee + tipPaise;
