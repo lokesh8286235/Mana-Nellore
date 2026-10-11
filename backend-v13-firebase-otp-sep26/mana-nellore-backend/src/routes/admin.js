@@ -156,6 +156,60 @@ router.get(
   })
 );
 
+// PUT /api/admin/restaurants/:id/details - update restaurant details
+router.put(
+  '/restaurants/:id/details',
+  ah(async (req, res) => {
+    const { name, address, fssai_license, owner_name, opens_at, closes_at, opens_at_we, closes_at_we, lat, lng } = req.body;
+    const { rows } = await db.query(
+      `UPDATE restaurants SET 
+        name = COALESCE($1, name),
+        address = COALESCE($2, address),
+        fssai_license = COALESCE($3, fssai_license),
+        opens_at = COALESCE($4, opens_at),
+        closes_at = COALESCE($5, closes_at),
+        lat = COALESCE($6, lat),
+        lng = COALESCE($7, lng),
+        updated_at = NOW()
+       WHERE id = $8 RETURNING *`,
+      [name, address, fssai_license, opens_at, closes_at, lat, lng, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    await audit(req, 'restaurant_update', 'restaurant', req.params.id, req.body);
+    res.json({ restaurant: rows[0] });
+  })
+);
+
+// PUT /api/admin/restaurants/:id/coming-soon - set coming soon status
+router.put(
+  '/restaurants/:id/coming-soon',
+  ah(async (req, res) => {
+    const { is_coming_soon } = req.body;
+    const { rows } = await db.query(
+      'UPDATE restaurants SET is_coming_soon = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+      [!!is_coming_soon, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    await audit(req, 'restaurant_coming_soon', 'restaurant', req.params.id, { is_coming_soon: !!is_coming_soon });
+    res.json({ restaurant: rows[0] });
+  })
+);
+
+// PUT /api/admin/restaurants/:id/photo - update restaurant photo
+router.put(
+  '/restaurants/:id/photo',
+  ah(async (req, res) => {
+    const { image_url } = req.body;
+    const { rows } = await db.query(
+      'UPDATE restaurants SET image_url = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+      [image_url, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    await audit(req, 'restaurant_photo', 'restaurant', req.params.id, { image_url });
+    res.json({ restaurant: rows[0] });
+  })
+);
+
 // PUT /api/admin/restaurants/:id/status { status: approved|suspended|rejected|pending }
 router.put(
   '/restaurants/:id/status',
