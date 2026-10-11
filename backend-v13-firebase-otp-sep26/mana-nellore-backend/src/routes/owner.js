@@ -123,21 +123,6 @@ router.put(
   ah(async (req, res) => {
     const id = await requireRestaurant(req, res);
     if (!id) return;
-    // Reject obviously-invalid image URLs (e.g. "Bhavya.com" with no scheme)
-    if (req.body.image_url !== undefined && req.body.image_url) {
-      const u = String(req.body.image_url).trim();
-      if (!/^https?:\/\//i.test(u) && !u.startsWith('/img/') && !u.startsWith('/')) {
-        return res.status(400).json({ error: 'image_url must be a valid http(s) URL or /img/ path' });
-      }
-      req.body.image_url = u;
-    }
-    if (req.body.chef_photo !== undefined && req.body.chef_photo) {
-      const u = String(req.body.chef_photo).trim();
-      if (!/^https?:\/\//i.test(u) && !u.startsWith('/img/') && !u.startsWith('/')) {
-        return res.status(400).json({ error: 'chef_photo must be a valid http(s) URL or /img/ path' });
-      }
-      req.body.chef_photo = u;
-    }
     const fields = ['name', 'description', 'address', 'lat', 'lng', 'phone', 'image_url', 'fssai',
       'chef_name', 'chef_photo', 'chef_story', 'gstin', 'birthday_dessert',
       'opens_at', 'closes_at', 'opens_at_we', 'closes_at_we'];
@@ -297,12 +282,6 @@ router.post(
       meal_slot, is_combo, allergens } = req.body;
     if (!name || price_paise == null) {
       return res.status(400).json({ error: 'Name and price_paise are required' });
-    }
-    if (image_url) {
-      const u = String(image_url).trim();
-      if (!/^https?:\/\//i.test(u) && !u.startsWith('/img/') && !u.startsWith('/')) {
-        return res.status(400).json({ error: 'image_url must be a valid http(s) URL or /img/ path' });
-      }
     }
     if (category_id) {
       const c = await db.query('SELECT id FROM categories WHERE id = $1 AND restaurant_id = $2', [
@@ -509,17 +488,6 @@ router.put(
 
     await transition(order.id, rule.to, 'restaurant_owner');
 
-    // Double-OTP flow: when the kitchen marks an order ready, mint a short-lived
-    // pickup OTP. Restaurant staff read it back from the order and tell the rider
-    // verbally; the rider must enter it to confirm pickup. Cleared on pickup.
-    let pickupOtp = null;
-    if (rule.to === 'ready') {
-      pickupOtp = String(Math.floor(1000 + Math.random() * 9000));
-      await db.query('UPDATE orders SET pickup_otp = $1 WHERE id = $2', [pickupOtp, order.id]);
-    } else if (rule.to === 'delivered') {
-      await db.query('UPDATE orders SET pickup_otp = NULL WHERE id = $1', [order.id]);
-    }
-
     if (rule.to === 'rejected') {
       const reason = req.body.reason || 'Restaurant rejected the order';
       const refunded = order.payment_status === 'paid';
@@ -541,7 +509,7 @@ router.put(
       }[rule.to];
       await notify(db, order.customer_id, copy[0], `${(await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name} ${copy[1]}`);
     }
-    res.json({ ok: true, status: rule.to, ...(pickupOtp ? { pickup_otp: pickupOtp } : {}) });
+    res.json({ ok: true, status: rule.to });
   })
 );
 

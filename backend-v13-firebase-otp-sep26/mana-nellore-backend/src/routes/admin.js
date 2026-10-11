@@ -1,6 +1,7 @@
 // Admin / operations portal. Full platform visibility; every mutating
 // action writes an audit log entry.
 const express = require('express');
+const bcrypt = require('bcryptjs');
 const { seedSuggestedCats } = require('../lib/suggested-cats');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
@@ -607,18 +608,28 @@ router.post(
     } else {
       // Reorder: clone the order fresh (no discount carried over) and let the
       // restaurant + rider flow pick it up as a new 'placed' order.
+      // Every order gets its own number + delivery OTP, same as customer placement.
+      let cloneNumber = null;
+      for (let i = 0; i < 12; i++) {
+        const num = 'MN-' + String(Math.floor(100000 + Math.random() * 900000));
+        const chk = await db.query('SELECT 1 FROM orders WHERE order_number = $1', [num]);
+        if (!chk.rows.length) { cloneNumber = num; break; }
+      }
+      if (!cloneNumber) cloneNumber = 'MN-' + String(Date.now()).slice(-6);
+      const cloneOtp = String(Math.floor(1000 + Math.random() * 9000));
+      const cloneOtpHash = await bcrypt.hash(cloneOtp, 8);
       const { rows } = await db.query(
         `INSERT INTO orders (customer_id, restaurant_id, address_id, order_type, table_id,
             subtotal_paise, delivery_fee_paise, platform_fee_paise, tax_paise, tip_paise,
             total_paise, payment_method, delivery_note, no_cutlery,
-            recipient_name, recipient_phone)
+            recipient_name, recipient_phone, order_number, delivery_otp_hash)
          SELECT customer_id, restaurant_id, address_id, order_type, table_id,
             subtotal_paise, delivery_fee_paise, platform_fee_paise, tax_paise, tip_paise,
             (subtotal_paise + delivery_fee_paise + platform_fee_paise + tax_paise + tip_paise),
             payment_method, delivery_note, no_cutlery,
-            recipient_name, recipient_phone
+            recipient_name, recipient_phone, $2, $3
          FROM orders WHERE id = $1 RETURNING id`,
-        [order.id]
+        [order.id, cloneNumber, cloneOtpHash]
       );
       const newId = rows[0].id;
       await db.query(
@@ -629,7 +640,7 @@ router.post(
       );
       note = `Fresh reorder placed for you. ${note}`;
       await notify(order.customer_id, 'Your reorder is on its way 🍱',
-        `We've placed a fresh order for you at no extra charge. ${note}`);
+        `We've placed a fresh order (${cloneNumber}) for you at no extra charge. Your delivery OTP is ${cloneOtp} — share it with your rider. ${note}`);
     }
     await db.query(
       `UPDATE support_tickets SET status = 'resolved', resolution_note = $1 WHERE id = $2`,

@@ -96,13 +96,19 @@ async function migrate() {
   END $$`);
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS eta_at timestamptz');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_photo text');
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_otp text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS packed_at timestamptz');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_photo text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS share_token text');
   await q(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_share_token_key') THEN
       ALTER TABLE orders ADD CONSTRAINT orders_share_token_key UNIQUE (share_token);
+    END IF;
+  END $$`);
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_otp_hash text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number text');
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_order_number_key') THEN
+      ALTER TABLE orders ADD CONSTRAINT orders_order_number_key UNIQUE (order_number);
     END IF;
   END $$`);
   await q("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_type text NOT NULL DEFAULT 'delivery'");
@@ -175,41 +181,6 @@ async function migrate() {
     UNIQUE (user_id, coupon_code)
   )`);
   await q('CREATE INDEX IF NOT EXISTS idx_coupon_issuances_user ON coupon_issuances(user_id)');
-
-  // Rider declined offers (declined/expired offers never return to that rider).
-  // Referenced by rider.js but the table was never created — every call to
-  // /api/rider/deliveries/available threw `relation "rider_declines" does not exist`.
-  await q(`CREATE TABLE IF NOT EXISTS rider_declines (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    rider_id uuid NOT NULL REFERENCES riders(id) ON DELETE CASCADE,
-    order_id uuid NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    reason text,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (rider_id, order_id)
-  )`);
-  await q('CREATE INDEX IF NOT EXISTS idx_rider_declines_rider ON rider_declines(rider_id)');
-
-  // Delivery groups: multi-restaurant "on the way" orders linked as ONE trip.
-  // The group is the unit the rider accepts, navigates, and completes —
-  // sub-orders are never offered or assigned individually.
-  await q(`CREATE TABLE IF NOT EXISTS delivery_groups (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    customer_id uuid NOT NULL REFERENCES users(id),
-    address_id uuid REFERENCES addresses(id) ON DELETE SET NULL,
-    primary_order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
-    order_ids uuid[] NOT NULL,
-    pickup_order_ids uuid[] NOT NULL,
-    status text NOT NULL DEFAULT 'open'
-      CHECK (status IN ('open','assigned','in_progress','delivered','cancelled')),
-    rider_id uuid REFERENCES riders(id) ON DELETE SET NULL,
-    delivery_otp_hash text,
-    fee_breakdown jsonb NOT NULL DEFAULT '[]',
-    created_at timestamptz NOT NULL DEFAULT now()
-  )`);
-  await q('CREATE INDEX IF NOT EXISTS idx_delivery_groups_rider ON delivery_groups(rider_id)');
-  await q('CREATE INDEX IF NOT EXISTS idx_delivery_groups_status ON delivery_groups(status)');
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_group_id uuid REFERENCES delivery_groups(id) ON DELETE SET NULL');
-  await q('CREATE INDEX IF NOT EXISTS idx_orders_delivery_group ON orders(delivery_group_id)');
 
   // Backfill share tokens for old orders
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)

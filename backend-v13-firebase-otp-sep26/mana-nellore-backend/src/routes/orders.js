@@ -28,6 +28,24 @@ function newDeliveryOtp() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
+// Order numbers: 6 random digits, collision-checked against the DB.
+async function newOrderNumber(dbClient) {
+  for (let i = 0; i < 12; i++) {
+    const num = String(Math.floor(100000 + Math.random() * 900000));
+    const { rows } = await dbClient.query('SELECT 1 FROM orders WHERE order_number = $1', [num]);
+    if (!rows.length) return num;
+  }
+  // Astronomically unlikely fallback: timestamp-derived, still 6 digits.
+  return String(Date.now()).slice(-6);
+}
+
+// Generate a fresh delivery OTP and its bcrypt hash (hash is stored, plain code is returned to caller).
+async function freshDeliveryOtp() {
+  const code = newDeliveryOtp();
+  const hash = await bcrypt.hash(code, 8);
+  return { code, hash };
+}
+
 // Subtotal for a list of items against a menu lookup, including customization extras.
 async function itemsSubtotal(db, menuById, items) {
   let sub = 0;
@@ -380,6 +398,8 @@ async function placeMultiGroupOrder(req, res) {
       const timeline = [{ status: 'placed', at: new Date().toISOString(), by: 'customer' }];
       const etaMinutes = Number(config.etaMinutes) || 30;
       const shareToken = require('crypto').randomBytes(6).toString('hex');
+      const orderNumber = await newOrderNumber(client);
+      const { code: deliveryOtp, hash: deliveryOtpHash } = await freshDeliveryOtp();
 
       const oRes = await client.query(
         `INSERT INTO orders
@@ -387,15 +407,17 @@ async function placeMultiGroupOrder(req, res) {
             subtotal_paise, discount_paise, delivery_fee_paise, platform_fee_paise,
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
-            payment_method, payment_status, timeline, eta_at, share_token)
+            payment_method, payment_status, timeline, eta_at, share_token,
+            order_number, delivery_otp_hash)
          VALUES ($1,$2,$3,'placed','delivery',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17::jsonb,
-                 now() + ($18 || ' minutes')::interval, $19)
+                 now() + ($18 || ' minutes')::interval, $19, $20, $21)
          RETURNING *`,
         [req.user.id, restaurant.id, address_id,
          subtotal, discount, deliveryFee, platformFee,
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
-         payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken]
+         payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
+         orderNumber, deliveryOtpHash]
       );
       const order = oRes.rows[0];
       for (const s of snapshots) {
@@ -405,8 +427,9 @@ async function placeMultiGroupOrder(req, res) {
           [order.id, s.menu_item_id, s.name_snapshot, s.unit_price_paise, s.qty, s.instructions]
         );
       }
+      const { delivery_otp_hash: _h1, ...orderSafe } = order;
       orders.push({
-        order: { ...order, items: snapshots },
+        order: { ...orderSafe, items: snapshots, delivery_otp: deliveryOtp },
         group_index: gi,
         is_primary: isPrimary,
         delivery_fee_paise: deliveryFee,
@@ -422,56 +445,14 @@ async function placeMultiGroupOrder(req, res) {
       }
     }
 
-    // Link the sub-orders as ONE delivery group (the "on the way" trip).
-    // Only when 2+ orders were actually created — a lone survivor stays a
-    // normal single order and all single-order flows are untouched.
-    let deliveryGroupId = null;
-    if (orders.length >= 2) {
-      // Pickup order: farthest-from-customer first (the product rule; the
-      // rider's next-stop uses this same sequence as the source of truth).
-      const withDist = orders.map((o) => {
-        const rest = restById[String(o.order.restaurant_id)];
-        let km = null;
-        if (rest && rest.lat != null && rest.lng != null &&
-            address.lat != null && address.lng != null) {
-          km = haversineKm(Number(rest.lat), Number(rest.lng),
-                            Number(address.lat), Number(address.lng));
-        }
-        return { id: o.order.id, km, placed_at: o.order.placed_at };
-      });
-      withDist.sort((a, b) => {
-        if (a.km != null && b.km != null) return b.km - a.km; // farthest first
-        if (a.km != null) return -1;
-        if (b.km != null) return 1;
-        return new Date(a.placed_at) - new Date(b.placed_at); // oldest first
-      });
-      const pickupOrderIds = withDist.map((w) => w.id);
-      const feeBreakdown = orders.map((o) => ({
-        order_id: o.order.id,
-        restaurant_id: o.order.restaurant_id,
-        is_primary: o.is_primary,
-        normal_fee_paise: o.normal_fee_paise,
-        delivery_fee_paise: o.delivery_fee_paise,
-        platform_fee_paise: o.platform_fee_paise
-      }));
-      const gRes = await client.query(
-        `INSERT INTO delivery_groups
-           (customer_id, address_id, primary_order_id, order_ids, pickup_order_ids, fee_breakdown)
-         VALUES ($1,$2,$3,$4,$5,$6::jsonb) RETURNING id`,
-        [req.user.id, address_id, orders[0].order.id,
-         orders.map((o) => o.order.id), pickupOrderIds, JSON.stringify(feeBreakdown)]
-      );
-      deliveryGroupId = gRes.rows[0].id;
-      await client.query('UPDATE orders SET delivery_group_id = $1 WHERE id = ANY($2)',
-        [deliveryGroupId, orders.map((o) => o.order.id)]);
-      for (const o of orders) o.delivery_group_id = deliveryGroupId;
-    }
-
     await client.query('COMMIT');
-    await notify(req.user.id, 'Order placed ✅', 'Your restaurants got the orders and kitchens are firing up! 🔥');
+    const otpLines = orders.map(function(o){
+      return `${o.order.order_number || 'order'} — OTP ${o.order.delivery_otp}`;
+    }).join(' · ');
+    await notify(req.user.id, 'Order placed ✅',
+      `Your restaurants got the orders and kitchens are firing up! 🔥 Delivery OTP${orders.length > 1 ? 's' : ''}: ${otpLines} — share with your rider at handover.`);
 
     res.status(201).json({
-      delivery_group_id: deliveryGroupId,
       orders,
       removed_off_route,
       off_route_message: removed_off_route.length ? OFF_ROUTE_MSG : null
@@ -639,6 +620,8 @@ router.post(
       const timeline = [{ status: 'placed', at: new Date().toISOString(), by: 'customer' }];
       const etaMinutes = Number(config.etaMinutes) || 30;
       const shareToken = require('crypto').randomBytes(6).toString('hex');
+      const orderNumber = await newOrderNumber(client);
+      const { code: deliveryOtp, hash: deliveryOtpHash } = await freshDeliveryOtp();
 
       const oRes = await client.query(
         `INSERT INTO orders
@@ -646,16 +629,18 @@ router.post(
             subtotal_paise, discount_paise, delivery_fee_paise, platform_fee_paise,
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
-            payment_method, payment_status, timeline, eta_at, share_token)
+            payment_method, payment_status, timeline, eta_at, share_token,
+            order_number, delivery_otp_hash)
          VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
-                 now() + ($20 || ' minutes')::interval, $21)
+                 now() + ($20 || ' minutes')::interval, $21, $22, $23)
          RETURNING *`,
         [req.user.id, restaurant_id, dineIn ? null : address_id, dineIn ? 'dinein' : 'delivery',
          dineIn ? table_id : null,
          subtotal, discount, deliveryFee, quote.platformFeePaise,
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
-         payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken]
+         payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
+         orderNumber, deliveryOtpHash]
       );
       const order = oRes.rows[0];
 
@@ -674,10 +659,11 @@ router.post(
           `${dineIn ? 'Dine-in table order' : 'Delivery order'} worth Rs ${(order.total_paise / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
       }
       await notify(req.user.id, 'Order placed ✅',
-        `${restaurant.name} got your order and the kitchen is firing up! 🔥`);
+        `${restaurant.name} (${orderNumber}) got your order and the kitchen is firing up! 🔥 Your delivery OTP is ${deliveryOtp} — share it with your rider at handover.`);
 
+      const { delivery_otp_hash: _h2, ...orderSafe2 } = order;
       res.status(201).json({
-        order: { ...order, items: snapshots },
+        order: { ...orderSafe2, items: snapshots, delivery_otp: deliveryOtp },
         breakdown: {
           subtotal_paise: subtotal,
           discount_paise: discount,
@@ -770,7 +756,6 @@ router.get(
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params
     );
-    for (const o of rows) { delete o.pickup_photo; delete o.pickup_otp; } // never expose to customers
     res.json({ orders: rows });
   })
 );
@@ -799,8 +784,6 @@ router.get(
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
     delete order.delivery_otp_hash; // never expose to clients
-    delete order.pickup_photo; // no photos anywhere in the customer flow
-    delete order.pickup_otp; // never expose to clients
     const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
     // Queue transparency: orders at this restaurant placed before mine, still active
     let queueAhead = 0;
@@ -904,14 +887,6 @@ router.post(
     const code = newDeliveryOtp();
     const hash = await bcrypt.hash(code, 8);
     await db.query('UPDATE orders SET delivery_otp_hash = $1 WHERE id = $2', [hash, order.id]);
-    // Grouped trip: the OTP is shared — re-issuing updates the group and
-    // mirrors to every sub-order so the rider's complete check keeps working.
-    if (order.delivery_group_id) {
-      await db.query('UPDATE delivery_groups SET delivery_otp_hash = $1 WHERE id = $2',
-        [hash, order.delivery_group_id]);
-      await db.query('UPDATE orders SET delivery_otp_hash = $1 WHERE delivery_group_id = $2',
-        [hash, order.delivery_group_id]);
-    }
     await notify(req.user.id, 'Your delivery OTP', `Share this OTP with your rider to receive the order: ${code}`);
     res.json({ ok: true, message: 'OTP re-sent to your notifications' });
   })

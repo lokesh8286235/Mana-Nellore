@@ -4,18 +4,14 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
 const rateLimit = require('express-rate-limit');
 const { initDb } = require('./db');
 
 const app = express();
 app.use(cors());
-// Serve uploaded images (see src/routes/upload.js)
-app.use('/img', express.static(path.join(__dirname, '..', 'uploads'), {
-  maxAge: '30d',
-  immutable: true,
-}));
-app.use(express.json({ limit: '10mb' }));
+const path = require('path');
+app.use('/img', express.static(path.join(__dirname, '../uploads')));
+app.use(express.json({ limit: '2mb' }));
 
 // Rate limiting: general API + strict OTP/auth
 const apiLimiter = rateLimit({
@@ -46,7 +42,6 @@ app.use('/api/customer', require('./routes/customer'));
 app.use('/api/orders', require('./routes/orders'));
 app.use('/api/rider', require('./routes/rider'));
 app.use('/api/admin', require('./routes/admin'));
-app.use('/api/maps', require('./routes/maps'));
 app.use('/api/upload', require('./routes/upload'));
 app.use('/api', require('./routes/public'));
 

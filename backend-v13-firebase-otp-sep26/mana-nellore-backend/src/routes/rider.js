@@ -199,132 +199,8 @@ async function deliveryDetail(orderId, riderId) {
   const order = rows[0];
   if (!order) return null;
   delete order.delivery_otp_hash;
-  delete order.pickup_otp; // never expose to the rider app — staff tell the rider verbally
   const items = await db.query('SELECT name_snapshot, qty, unit_price_paise FROM order_items WHERE order_id = $1', [order.id]);
   return { ...order, items: items.rows };
-}
-
-// Next-stop routing: the backend tells the rider app where to go next, so the
-// client never has to guess. Rule: remaining restaurant pickups first, then
-// customer deliveries.
-//  - Pickups ('ready'): farthest-from-own-customer first when coordinates
-//    exist (the "start at the farthest pickup" product rule), oldest first
-//    as fallback.
-//  - Deliveries: an in-progress handover ('on_way') wins, otherwise
-//    nearest-to-rider first when the rider's position is known, oldest
-//    first as fallback.
-// Returns null when the rider has no active deliveries.
-async function computeNextStop(riderId) {
-  const { rows: actives } = await db.query(
-    `SELECT o.id, o.status, o.placed_at, o.delivery_group_id,
-            r.name AS restaurant_name, r.address AS restaurant_address,
-            r.lat AS rest_lat, r.lng AS rest_lng, r.phone AS restaurant_phone,
-            a.label AS addr_label, a.line1, a.line2, a.city,
-            a.lat AS addr_lat, a.lng AS addr_lng,
-            u.name AS customer_name, u.phone AS customer_phone,
-            dg.pickup_order_ids
-     FROM orders o
-     JOIN restaurants r ON r.id = o.restaurant_id
-     LEFT JOIN addresses a ON a.id = o.address_id
-     JOIN users u ON u.id = o.customer_id
-     LEFT JOIN delivery_groups dg ON dg.id = o.delivery_group_id
-     WHERE o.rider_id = $1 AND o.status NOT IN ('delivered','cancelled')
-     ORDER BY o.placed_at ASC`,
-    [riderId]
-  );
-  if (!actives.length) return null;
-
-  const validCoord = (lat, lng) =>
-    lat != null && lng != null && Number.isFinite(Number(lat)) && Number.isFinite(Number(lng))
-      ? { lat: Number(lat), lng: Number(lng) } : null;
-
-  const fmtAddr = (o) => [o.addr_label, o.line1, o.line2, o.city].filter(Boolean).join(', ');
-
-  const remainingPickups = actives.filter(o => o.status === 'ready').length;
-  const remainingDeliveries = actives.length - remainingPickups;
-  const counts = { remaining_pickups: remainingPickups, remaining_deliveries: remainingDeliveries };
-
-  // 1. Remaining pickups.
-  const pickups = actives.filter(o => o.status === 'ready');
-  if (pickups.length) {
-    // When every remaining pickup belongs to ONE group, follow the group's
-    // canonical pickup sequence (the backend's source of truth).
-    const readyGroupIds = new Set(pickups.map((o) => o.delivery_group_id).filter(Boolean));
-    if (readyGroupIds.size === 1) {
-      const seq = pickups[0].pickup_order_ids || [];
-      const pos = {};
-      seq.forEach((id, i) => { pos[String(id)] = i; });
-      pickups.sort((a, b) => (pos[String(a.id)] ?? 999) - (pos[String(b.id)] ?? 999));
-    } else {
-      const tripKm = (o) => {
-        const r = validCoord(o.rest_lat, o.rest_lng);
-        const c = validCoord(o.addr_lat, o.addr_lng);
-        return r && c ? haversineKm(r.lat, r.lng, c.lat, c.lng) : null;
-      };
-      pickups.sort((a, b) => {
-        const da = tripKm(a), db = tripKm(b);
-        if (da != null && db != null) return db - da; // farthest first
-        if (da != null) return -1;
-        if (db != null) return 1;
-        return new Date(a.placed_at) - new Date(b.placed_at); // oldest first
-      });
-    }
-    const o = pickups[0];
-    const rc = validCoord(o.rest_lat, o.rest_lng);
-    return {
-      type: 'restaurant',
-      order_id: o.id,
-      name: o.restaurant_name || 'Restaurant',
-      address: o.restaurant_address || '',
-      phone: o.restaurant_phone || null,
-      lat: rc ? rc.lat : null,
-      lng: rc ? rc.lng : null,
-      ...counts,
-    };
-  }
-
-  const asCustomerStop = (o) => {
-    const cc = validCoord(o.addr_lat, o.addr_lng);
-    return {
-      type: 'customer',
-      order_id: o.id,
-      name: o.customer_name || 'Customer',
-      address: fmtAddr(o),
-      phone: o.customer_phone || null,
-      lat: cc ? cc.lat : null,
-      lng: cc ? cc.lng : null,
-      ...counts,
-    };
-  };
-
-  // 2. In-progress handover wins (rider is already at that customer's door).
-  const handover = actives.find(o => o.status === 'on_way');
-  if (handover) return asCustomerStop(handover);
-
-  // 3. Remaining deliveries: nearest-to-rider first when the rider's position
-  //    is known, oldest first as fallback.
-  const drops = actives.filter(o => o.status === 'picked_up');
-  if (drops.length) {
-    let rl = null;
-    try {
-      const { rows: rr } = await db.query('SELECT lat, lng FROM riders WHERE id = $1', [riderId]);
-      rl = rr[0] ? validCoord(rr[0].lat, rr[0].lng) : null;
-    } catch (e) { /* riders.lat/lng are best-effort */ }
-    const toRiderKm = (o) => {
-      const c = validCoord(o.addr_lat, o.addr_lng);
-      return rl && c ? haversineKm(rl.lat, rl.lng, c.lat, c.lng) : null;
-    };
-    drops.sort((a, b) => {
-      const da = toRiderKm(a), db = toRiderKm(b);
-      if (da != null && db != null) return da - db; // nearest first
-      if (da != null) return -1;
-      if (db != null) return 1;
-      return new Date(a.placed_at) - new Date(b.placed_at);
-    });
-    return asCustomerStop(drops[0]);
-  }
-
-  return null;
 }
 
 // GET /api/rider/deliveries/available — ready orders with no rider yet.
@@ -344,7 +220,6 @@ router.get(
        LEFT JOIN addresses a ON a.id = o.address_id
        WHERE o.status = 'ready' AND o.rider_id IS NULL
          AND o.order_type = 'delivery'
-         AND o.delivery_group_id IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM rider_declines rd
            WHERE rd.order_id = o.id AND rd.rider_id = $1
@@ -381,74 +256,7 @@ router.get(
       if (a.pickup_km != null && b.pickup_km != null) return a.pickup_km - b.pickup_km;
       return new Date(a.placed_at) - new Date(b.placed_at);
     });
-
-    // Grouped "on the way" trips: offered as ONE unit. A group is offerable
-    // when every non-cancelled sub-order is ready and unassigned, and the
-    // rider hasn't declined any piece of it.
-    const { rows: groupRows } = await db.query(
-      `SELECT g.id, g.order_ids, g.pickup_order_ids, g.fee_breakdown, g.created_at,
-              u.name AS customer_name,
-              a.line1, a.city, a.lat AS addr_lat, a.lng AS addr_lng
-       FROM delivery_groups g
-       JOIN users u ON u.id = g.customer_id
-       LEFT JOIN addresses a ON a.id = g.address_id
-       WHERE g.status = 'open' AND g.rider_id IS NULL
-         AND EXISTS (
-           SELECT 1 FROM orders o
-           WHERE o.delivery_group_id = g.id
-             AND o.status = 'ready' AND o.rider_id IS NULL
-             AND o.order_type = 'delivery'
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM orders o
-           WHERE o.delivery_group_id = g.id
-             AND o.status NOT IN ('ready', 'cancelled', 'rejected')
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM orders o
-           JOIN rider_declines rd ON rd.order_id = o.id
-           WHERE o.delivery_group_id = g.id AND rd.rider_id = $1
-         )
-       ORDER BY g.created_at ASC LIMIT 10`,
-      [rider.id]
-    );
-    const groups = [];
-    for (const g of groupRows) {
-      const { rows: subRows } = await db.query(
-        `SELECT o.id, o.total_paise, o.payment_method,
-                r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng
-         FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
-         WHERE o.id = ANY($1) AND o.status NOT IN ('cancelled', 'rejected')`,
-        [g.order_ids]
-      );
-      if (!subRows.length) continue;
-      const pos = {};
-      (g.pickup_order_ids || []).forEach((id, i) => { pos[String(id)] = i; });
-      subRows.sort((a, b) => (pos[String(a.id)] ?? 999) - (pos[String(b.id)] ?? 999));
-      let payout = 0;
-      for (const s of subRows) {
-        if (s.rest_lat != null && s.rest_lng != null && g.addr_lat != null && g.addr_lng != null) {
-          payout += riderPayoutPaise(config.riderPayout,
-            haversineKm(Number(s.rest_lat), Number(s.rest_lng), Number(g.addr_lat), Number(g.addr_lng)));
-        } else {
-          payout += 3000;
-        }
-      }
-      groups.push({
-        group_id: g.id,
-        is_group: true,
-        restaurant_names: subRows.map((s) => s.restaurant_name),
-        pickup_count: subRows.length,
-        customer_name: g.customer_name,
-        address: [g.line1, g.city].filter(Boolean).join(', '),
-        total_paise: subRows.reduce((s, r) => s + Number(r.total_paise || 0), 0),
-        payout_paise: payout,
-        placed_at: g.created_at,
-        order_ids: subRows.map((s) => s.id),
-        fee_breakdown: g.fee_breakdown || []
-      });
-    }
-    res.json({ deliveries: list, groups });
+    res.json({ deliveries: list });
   })
 );
 
@@ -472,10 +280,7 @@ router.get(
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params
     );
-    // Trip-level next stop: the backend decides where the rider goes next
-    // (remaining pickups first, then deliveries) so the client just follows.
-    const next_stop = req.query.status === 'active' ? await computeNextStop(rider.id) : null;
-    res.json({ deliveries: rows, next_stop });
+    res.json({ deliveries: rows });
   })
 );
 
@@ -487,9 +292,6 @@ router.get(
     if (!rider) return;
     const detail = await deliveryDetail(req.params.id, rider.id);
     if (!detail) return res.status(404).json({ error: 'Delivery not found' });
-    // Next stop computed from the rider's full active set, not just this
-    // delivery — after a pickup the rider goes wherever the trip needs next.
-    detail.next_stop = await computeNextStop(rider.id);
     res.json({ delivery: detail });
   })
 );
@@ -500,24 +302,11 @@ router.post(
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
-    // Declining one piece declines the whole grouped trip — the rider never
-    // wants a fragment of it back.
-    let declineIds = [req.params.id];
-    try {
-      const oRes = await db.query('SELECT delivery_group_id FROM orders WHERE id = $1', [req.params.id]);
-      const gid = oRes.rows[0] && oRes.rows[0].delivery_group_id;
-      if (gid) {
-        const gRes = await db.query('SELECT id FROM orders WHERE delivery_group_id = $1', [gid]);
-        if (gRes.rows.length) declineIds = gRes.rows.map((r) => r.id);
-      }
-    } catch (e) { /* fall back to single decline */ }
-    for (const oid of declineIds) {
-      await db.query(
-        `INSERT INTO rider_declines (rider_id, order_id, reason) VALUES ($1, $2, $3)
-         ON CONFLICT (rider_id, order_id) DO NOTHING`,
-        [rider.id, oid, req.body.reason || null]
-      );
-    }
+    await db.query(
+      `INSERT INTO rider_declines (rider_id, order_id, reason) VALUES ($1, $2, $3)
+       ON CONFLICT (rider_id, order_id) DO NOTHING`,
+      [rider.id, req.params.id, req.body.reason || null]
+    );
     res.json({ ok: true });
   })
 );
@@ -1049,15 +838,9 @@ router.post(
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
     if (!rider.online) return res.status(409).json({ error: 'Go online to accept deliveries' });
-    // Grouped sub-orders are never accepted piecemeal — take the whole trip.
-    const grpCheck = await db.query('SELECT delivery_group_id FROM orders WHERE id = $1', [req.params.id]);
-    if (grpCheck.rows[0] && grpCheck.rows[0].delivery_group_id) {
-      return res.status(409).json({ error: 'This order is part of a grouped trip — accept the whole trip instead' });
-    }
-    // Max 3 concurrent active deliveries per rider (a group counts as 1).
+    // Max 3 concurrent active deliveries per rider.
     const active = await db.query(
-      `SELECT COUNT(DISTINCT COALESCE(delivery_group_id, id)) AS n
-       FROM orders WHERE rider_id = $1 AND status NOT IN ('delivered','cancelled')`,
+      "SELECT COUNT(*) AS n FROM orders WHERE rider_id = $1 AND status NOT IN ('delivered','cancelled')",
       [rider.id]
     );
     if (Number(active.rows[0].n) >= 3) {
@@ -1080,71 +863,6 @@ router.post(
   })
 );
 
-// POST /api/rider/deliveries/groups/:groupId/accept — accept a whole grouped
-// "on the way" trip as ONE unit. All sub-orders are assigned atomically; the
-// group counts as 1 toward the 3-active cap.
-router.post(
-  '/deliveries/groups/:groupId/accept',
-  ah(async (req, res) => {
-    const rider = await requireActiveRider(req, res);
-    if (!rider) return;
-    if (!rider.online) return res.status(409).json({ error: 'Go online to accept deliveries' });
-    // Unit-based cap: each group counts as 1, each ungrouped order as 1.
-    const capRes = await db.query(
-      `SELECT COUNT(DISTINCT COALESCE(o.delivery_group_id, o.id)) AS n
-       FROM orders o WHERE o.rider_id = $1 AND o.status NOT IN ('delivered','cancelled')`,
-      [rider.id]
-    );
-    if (Number(capRes.rows[0].n) >= 3) {
-      return res.status(409).json({ error: 'You already have 3 active deliveries — complete one first' });
-    }
-    const client = await db.pool.connect();
-    try {
-      await client.query('BEGIN');
-      const gRes = await client.query('SELECT * FROM delivery_groups WHERE id = $1 FOR UPDATE', [req.params.groupId]);
-      const group = gRes.rows[0];
-      if (!group) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Trip not found' }); }
-      if (group.status !== 'open' || group.rider_id) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'Trip no longer available' });
-      }
-      // Atomic: assign every ready sub-order or nothing (prevents partial takes).
-      const aRes = await client.query(
-        `UPDATE orders SET rider_id = $1
-         WHERE delivery_group_id = $2 AND status = 'ready' AND rider_id IS NULL
-         RETURNING id`,
-        [rider.id, group.id]
-      );
-      const liveRes = await client.query(
-        `SELECT COUNT(*) AS n FROM orders WHERE delivery_group_id = $1 AND status NOT IN ('cancelled','rejected')`,
-        [group.id]
-      );
-      if (aRes.rows.length !== Number(liveRes.rows[0].n) || !aRes.rows.length) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'Trip no longer available' });
-      }
-      const at = new Date().toISOString();
-      for (const r of aRes.rows) {
-        const tRes = await client.query('SELECT timeline FROM orders WHERE id = $1', [r.id]);
-        const tl = (tRes.rows[0] && tRes.rows[0].timeline) || [];
-        tl.push({ status: 'rider_assigned', at, by: 'rider' });
-        await client.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [JSON.stringify(tl), r.id]);
-      }
-      await client.query(`UPDATE delivery_groups SET rider_id = $1, status = 'assigned' WHERE id = $2`,
-        [rider.id, group.id]);
-      await client.query('COMMIT');
-      await notify(group.customer_id, 'Rider assigned 🛵',
-        'Your rider is on the way — all your restaurants in one trip!');
-      res.json({ ok: true, group_id: group.id, order_ids: aRes.rows.map((r) => r.id) });
-    } catch (e) {
-      await client.query('ROLLBACK');
-      throw e;
-    } finally {
-      client.release();
-    }
-  })
-);
-
 // POST /api/rider/deliveries/:id/cancel { reason? } — rider releases the delivery.
 // Only before pickup: the order returns to the available pool for another rider.
 router.post(
@@ -1161,32 +879,15 @@ router.post(
     if (!['ready'].includes(order.status)) {
       return res.status(409).json({ error: 'Too late to cancel — the food is already picked up' });
     }
-    // Grouped trip: the trip is one unit — release it whole, but only if no
-    // piece has been picked up yet.
-    let releaseIds = [order.id];
-    const groupId = order.delivery_group_id || null;
-    if (groupId) {
-      const gRows = await db.query(
-        `SELECT id, status FROM orders WHERE delivery_group_id = $1 AND rider_id = $2 AND status != 'cancelled'`,
-        [groupId, rider.id]
-      );
-      if (gRows.rows.some((r) => r.status !== 'ready')) {
-        return res.status(409).json({ error: 'Too late to cancel — part of the trip is already picked up' });
-      }
-      releaseIds = gRows.rows.map((r) => r.id);
-    }
-    const at = new Date().toISOString();
-    const reason = req.body.reason || 'Rider cancelled';
-    for (const oid of releaseIds) {
-      const tRes = await db.query('SELECT timeline FROM orders WHERE id = $1', [oid]);
-      const tl = (tRes.rows[0] && tRes.rows[0].timeline) || [];
-      tl.push({ status: 'rider_cancelled', at, by: 'rider', reason });
-      await db.query('UPDATE orders SET rider_id = NULL, timeline = $1::jsonb WHERE id = $2',
-        [JSON.stringify(tl), oid]);
-    }
-    if (groupId) {
-      await db.query(`UPDATE delivery_groups SET rider_id = NULL, status = 'open' WHERE id = $1`, [groupId]);
-    }
+    const timeline = order.timeline || [];
+    timeline.push({
+      status: 'rider_cancelled', at: new Date().toISOString(), by: 'rider',
+      reason: req.body.reason || 'Rider cancelled'
+    });
+    await db.query(
+      'UPDATE orders SET rider_id = NULL, timeline = $1::jsonb WHERE id = $2',
+      [JSON.stringify(timeline), order.id]
+    );
     await db.query(
       'UPDATE riders SET cancelled_deliveries = COALESCE(cancelled_deliveries, 0) + 1 WHERE id = $1',
       [rider.id]
@@ -1215,11 +916,9 @@ router.put(
   })
 );
 
-// PUT /api/rider/deliveries/:id/picked-up { otp } — validates the restaurant
-// pickup OTP (minted when the kitchen marked the order ready; restaurant staff
-// read it from the order and tell the rider verbally). No photos anywhere in
-// the rider flow — delivery is confirmed by OTP only. On success, generates the
-// customer delivery OTP.
+// PUT /api/rider/deliveries/:id/picked-up { photo } — generates the delivery OTP
+// for the customer. Pickup photo (image data URL, max ~1.5MB) is REQUIRED and
+// is shown to the customer on live tracking as proof of packed-food pickup.
 router.put(
   '/deliveries/:id/picked-up',
   ah(async (req, res) => {
@@ -1229,56 +928,25 @@ router.put(
     if (!detail) return res.status(404).json({ error: 'Delivery not found' });
     if (detail.status !== 'ready') return res.status(409).json({ error: `Invalid status ${detail.status}` });
 
-    const otp = String(req.body.otp || '').trim();
-    if (!otp) return res.status(400).json({ error: 'Pickup OTP is required' });
-    const { rows: otpRows } = await db.query(
-      'SELECT pickup_otp FROM orders WHERE id = $1', [detail.id]
-    );
-    const expected = otpRows[0] && otpRows[0].pickup_otp;
-    if (!expected || otp !== String(expected)) {
-      return res.status(400).json({ error: 'Invalid pickup OTP' });
+    let photo = null;
+    if (req.body.photo != null) {
+      photo = String(req.body.photo);
+      const okPrefix = photo.startsWith('data:image/') || photo.startsWith('http');
+      if (!okPrefix || photo.length > 1500000) {
+        return res.status(400).json({ error: 'Photo must be an image under ~1.5MB' });
+      }
     }
 
-    const code = newDeliveryOtp();
-    const hash = await bcrypt.hash(code, 8);
-    // Grouped trip: ONE shared delivery OTP for the whole group. Generated on
-    // the first pickup, mirrored to every sub-order so the existing per-order
-    // complete flow verifies unchanged. The customer is notified exactly once.
-    const groupId = detail.delivery_group_id || null;
-    if (groupId) {
-      const client = await db.pool.connect();
-      try {
-        await client.query('BEGIN');
-        const gLock = await client.query(
-          'SELECT delivery_otp_hash, customer_id FROM delivery_groups WHERE id = $1 FOR UPDATE',
-          [groupId]
-        );
-        if (!gLock.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Trip not found' }); }
-        if (!gLock.rows[0].delivery_otp_hash) {
-          await client.query('UPDATE delivery_groups SET delivery_otp_hash = $1 WHERE id = $2', [hash, groupId]);
-          await client.query('UPDATE orders SET delivery_otp_hash = $1 WHERE delivery_group_id = $2', [hash, groupId]);
-          await client.query(`UPDATE delivery_groups SET status = 'in_progress' WHERE id = $1 AND status = 'assigned'`, [groupId]);
-          await client.query('COMMIT');
-          await notify(gLock.rows[0].customer_id, 'Your delivery OTP',
-            `Your rider has picked up your orders. Share this OTP to receive them: ${code}`);
-        } else {
-          await client.query(`UPDATE delivery_groups SET status = 'in_progress' WHERE id = $1 AND status = 'assigned'`, [groupId]);
-          await client.query('COMMIT');
-        }
-      } catch (e) {
-        await client.query('ROLLBACK');
-        throw e;
-      } finally {
-        client.release();
-      }
-      await db.query('UPDATE orders SET pickup_otp = NULL WHERE id = $1', [detail.id]);
-    } else {
-      await db.query('UPDATE orders SET delivery_otp_hash = $1, pickup_otp = NULL WHERE id = $2',
-        [hash, detail.id]);
-      await notify(detail.customer_id, 'Your delivery OTP',
-        `Your rider has picked up the order. Share this OTP to receive it: ${code}`);
+    if (!photo) {
+      return res.status(400).json({ error: 'A pickup photo is required to confirm pickup' });
     }
+
+    const code = null; /* stable OTP: placement OTP reused, never regenerated */
+    await db.query('UPDATE orders SET pickup_photo = COALESCE($1, pickup_photo) WHERE id = $2',
+      [photo, detail.id]);
     await transition(detail.id, 'picked_up', 'rider');
+    await notify(detail.customer_id, 'Your rider is on the way',
+      `Your rider has picked up the order. Share your delivery OTP to receive it.`);
     res.json({ ok: true, status: 'picked_up' });
   })
 );
@@ -1359,19 +1027,6 @@ router.post(
       );
     }
     await transition(order.id, 'delivered', 'rider');
-
-    // Grouped trip: when the last sub-order is delivered, close the group.
-    if (order.delivery_group_id) {
-      const rem = await db.query(
-        `SELECT COUNT(*) AS n FROM orders
-         WHERE delivery_group_id = $1 AND status NOT IN ('delivered','cancelled')`,
-        [order.delivery_group_id]
-      );
-      if (Number(rem.rows[0].n) === 0) {
-        await db.query(`UPDATE delivery_groups SET status = 'delivered' WHERE id = $1`,
-          [order.delivery_group_id]);
-      }
-    }
 
     const deliveryPhoto = req.body.delivery_photo || null;
     await db.query(
