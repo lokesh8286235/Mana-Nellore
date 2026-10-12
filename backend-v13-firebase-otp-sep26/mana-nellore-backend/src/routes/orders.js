@@ -291,7 +291,8 @@ async function placeMultiGroupOrder(req, res) {
         removed_off_route.push({ restaurant_id: g.restaurant_id, name: (r && r.name) || 'Restaurant', reason: 'unavailable' });
         continue;
       }
-      let onRoute = true;
+      // Default: off-route (100% fee) unless proven on-route. Missing coords = cannot verify = full fee.
+      let onRoute = false;
       if (primary.lat != null && primary.lng != null && address.lat != null && address.lng != null &&
           r.lat != null && r.lng != null) {
         const d = otwPointToSegKm(Number(r.lng), Number(r.lat),

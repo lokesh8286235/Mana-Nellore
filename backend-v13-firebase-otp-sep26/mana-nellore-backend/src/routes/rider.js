@@ -847,21 +847,46 @@ router.post(
     if (Number(active.rows[0].n) >= 3) {
       return res.status(409).json({ error: 'You already have 3 active deliveries — complete one first' });
     }
-    // Atomic: only assign if still unassigned (prevents double-accept race)
-    // For trips: assign ALL orders in the trip to this rider
-    const { rows } = await db.query(
-      "UPDATE orders SET rider_id = $1 WHERE id = $2 AND status = 'ready' AND rider_id IS NULL RETURNING *",
-      [rider.id, req.params.id]
-    );
-    const order = rows[0];
-    if (!order) return res.status(409).json({ error: 'Delivery no longer available' });
+    // Atomic trip accept: lock the entire trip in ONE query (prevents split-trip race)
+    // First, get the trip_id for this order
+    const tripRes = await db.query('SELECT trip_id FROM orders WHERE id = $1', [req.params.id]);
+    const tripId = tripRes.rows[0]?.trip_id;
 
-    // If this order is part of a trip, assign all trip orders to this rider
-    if (order.trip_id) {
-      await db.query(
-        "UPDATE orders SET rider_id = $1 WHERE trip_id = $2 AND status = 'ready' AND rider_id IS NULL",
-        [rider.id, order.trip_id]
+    let order;
+    if (tripId) {
+      // Trip: assign ALL unassigned ready orders in the trip atomically
+      // Only succeeds if ALL are still available (prevents partial assignment)
+      const { rows } = await db.query(
+        `UPDATE orders SET rider_id = $1
+         WHERE trip_id = $2 AND status = 'ready' AND rider_id IS NULL
+         RETURNING *`,
+        [rider.id, tripId]
       );
+      if (rows.length === 0) {
+        return res.status(409).json({ error: 'Delivery no longer available' });
+      }
+      // Verify we got ALL trip orders (not a partial race)
+      const countRes = await db.query(
+        "SELECT COUNT(*) AS n FROM orders WHERE trip_id = $1 AND status = 'ready'",
+        [tripId]
+      );
+      if (rows.length !== Number(countRes.rows[0].n)) {
+        // Partial assignment - rollback by unassigning
+        await db.query(
+          "UPDATE orders SET rider_id = NULL WHERE trip_id = $1 AND rider_id = $2",
+          [tripId, rider.id]
+        );
+        return res.status(409).json({ error: 'Delivery no longer available' });
+      }
+      order = rows[0];
+    } else {
+      // Single order: atomic assign
+      const { rows } = await db.query(
+        "UPDATE orders SET rider_id = $1 WHERE id = $2 AND status = 'ready' AND rider_id IS NULL RETURNING *",
+        [rider.id, req.params.id]
+      );
+      order = rows[0];
+      if (!order) return res.status(409).json({ error: 'Delivery no longer available' });
     }
 
     const timeline = order.timeline || [];
@@ -1050,7 +1075,18 @@ router.post(
         [rider.id, order.id, cashPaise]
       );
     }
-    await transition(order.id, 'delivered', 'rider');
+    // For trips: mark ALL orders in the trip as delivered (shared OTP)
+    if (order.trip_id) {
+      const tripOrders = await db.query(
+        "SELECT id FROM orders WHERE trip_id = $1 AND rider_id = $2 AND status = 'on_way'",
+        [order.trip_id, rider.id]
+      );
+      for (const to of tripOrders.rows) {
+        await transition(to.id, 'delivered', 'rider');
+      }
+    } else {
+      await transition(order.id, 'delivered', 'rider');
+    }
 
     const deliveryPhoto = req.body.delivery_photo || null;
     await db.query(
