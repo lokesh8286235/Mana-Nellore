@@ -243,9 +243,10 @@ router.delete(
 
 // ---- Referrals: share code, both sides earn a coupon (no wallet credits) ----
 function makeReferralCode() {
+  const crypto = require('crypto');
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = 'MN';
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 6; i++) code += chars[crypto.randomInt(chars.length)];
   return code;
 }
 
@@ -278,7 +279,7 @@ router.post(
       return res.status(400).json({ error: 'You are entering your own referral code 🙂' });
     }
     const mkCoupon = async (suffix) => {
-      const c = 'REF' + suffix + Math.random().toString(36).slice(2, 7).toUpperCase();
+      const c = 'REF' + suffix + require('crypto').randomBytes(4).toString('hex').toUpperCase();
       await db.query(
         `INSERT INTO coupons (code, discount_type, value, min_order_paise, max_discount_paise, active)
          VALUES ($1, 'flat', 5000, 19900, 5000, true)`, [c]

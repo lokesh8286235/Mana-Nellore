@@ -23,10 +23,11 @@ function normalizePhone(input) {
 
 // Shared find-or-create used by OTP verification.
 async function makeReferralCode() {
+  const crypto = require('crypto');
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   for (let attempt = 0; attempt < 5; attempt++) {
     let code = 'MN';
-    for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    for (let i = 0; i < 6; i++) code += chars[crypto.randomInt(chars.length)];
     const chk = await db.query('SELECT 1 FROM users WHERE referral_code = $1', [code]);
     if (!chk.rows[0]) return code;
   }
@@ -67,7 +68,7 @@ router.post(
     const phone = normalizePhone(req.body.phone);
     if (!phone) return res.status(400).json({ error: 'Enter a valid 10-digit mobile number' });
 
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const code = String(require('crypto').randomInt(100000, 1000000));
     const codeHash = await bcrypt.hash(code, 8);
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
