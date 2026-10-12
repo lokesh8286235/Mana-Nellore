@@ -274,7 +274,15 @@ router.get(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const { rows } = await db.query(
-      'SELECT * FROM menu_items WHERE restaurant_id = $1 ORDER BY sort_order, name', [id]
+      `SELECT mi.*,
+              COALESCE(dr.avg_rating, 0)::float AS rating_avg,
+              COALESCE(dr.rating_count, 0)::int AS rating_count
+       FROM menu_items mi
+       LEFT JOIN (
+         SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
+         FROM dish_ratings GROUP BY dish_id
+       ) dr ON dr.dish_id = mi.id
+       WHERE mi.restaurant_id = $1 ORDER BY mi.sort_order, mi.name`, [id]
     );
     res.json({ items: rows });
   })
@@ -555,6 +563,26 @@ router.get(
       [id]
     );
     res.json({ ratings: rows });
+  })
+);
+
+// GET /api/owner/dish-ratings — recent per-dish ratings for this restaurant's menu
+router.get(
+  '/dish-ratings',
+  ah(async (req, res) => {
+    const id = await requireRestaurant(req, res);
+    if (!id) return;
+    const { rows } = await db.query(
+      `SELECT dr.id, dr.rating, dr.created_at, dr.dish_id,
+              mi.name AS dish_name, u.name AS customer_name
+       FROM dish_ratings dr
+       JOIN menu_items mi ON mi.id = dr.dish_id
+       LEFT JOIN users u ON u.id = dr.customer_id
+       WHERE mi.restaurant_id = $1
+       ORDER BY dr.created_at DESC LIMIT 50`,
+      [id]
+    );
+    res.json({ dish_ratings: rows });
   })
 );
 

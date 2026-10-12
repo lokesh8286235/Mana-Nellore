@@ -1,5 +1,6 @@
 // Public restaurant discovery (customer app home + restaurant page).
 const express = require('express');
+const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, deliveryFeePaise } = require('../lib/pricing');
@@ -91,8 +92,18 @@ async function fetchRealDriveETAs(custLat, custLng, rows, gkey) {
 router.get(
   '/',
   ah(async (req, res) => {
-    const { q, veg, open, lat, lng, meal } = req.query;
-    const cacheKey = JSON.stringify({ q, veg, open, lat, lng, meal });
+    const { q, veg, open, lat, lng, meal, sort } = req.query;
+    // Optional identity for personalization: decode the token when present,
+    // but never reject anonymous browsing (this route is public).
+    let customerId = null;
+    const authH = req.headers.authorization || '';
+    if (authH.startsWith('Bearer ')) {
+      try {
+        const payload = jwt.verify(authH.slice(7), process.env.JWT_SECRET);
+        if (payload && payload.role === 'customer') customerId = payload.sub;
+      } catch (e) { /* anonymous */ }
+    }
+    const cacheKey = JSON.stringify({ q, veg, open, lat, lng, meal, sort, customerId });
     const cached = cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
@@ -121,6 +132,29 @@ router.get(
       conditions.push('r.is_open = true');
     }
 
+    // ---- Smart "Recommended" scoring inputs (all from the DB, one query) ----
+    // Global mean rating across rated restaurants (Bayesian prior), computed once.
+    const gmRes = await db.query(
+      `SELECT COALESCE(AVG(rating_avg), 0)::float AS m
+       FROM restaurants WHERE status = 'approved' AND rating_avg > 0`
+    );
+    const globalMean = Number(gmRes.rows[0].m) || 3.5;
+
+    // Personalization subqueries only when we know who is browsing.
+    const scoreSelect = [];
+    if (customerId) {
+      params.push(customerId);
+      const up = '$' + params.length;
+      scoreSelect.push(
+        `EXISTS (SELECT 1 FROM orders o WHERE o.restaurant_id = r.id AND o.customer_id = ${up} AND o.status = 'delivered') AS has_ordered`,
+        `EXISTS (SELECT 1 FROM favorites f WHERE f.customer_id = ${up} AND f.entity_type = 'restaurant' AND f.entity_id = r.id::text) AS is_fav`
+      );
+    }
+    const scoreCols = scoreSelect.length ? ',\n              ' + scoreSelect.join(',\n              ') : '';
+
+    // sort=rating keeps the legacy highest-rated order; the DB order only
+    // matters for that case — reco/fast are sorted in JS after scoring.
+    const dbOrder = sort === 'rating' ? 'ORDER BY r.rating_avg DESC, r.name ASC' : '';
     const { rows } = await db.query(
       `SELECT r.*,
               (SELECT COUNT(*) FROM orders o
@@ -131,8 +165,15 @@ router.get(
                WHERE o.restaurant_id = r.id AND o.packed_at IS NOT NULL
                  AND o.placed_at > now() - interval '30 days') AS avg_pack_minutes,
               (SELECT EXISTS (SELECT 1 FROM menu_items mi
-               WHERE mi.restaurant_id = r.id AND mi.veg = true AND mi.available = true)) AS has_veg
-       FROM restaurants r WHERE ${conditions.join(' AND ')} ORDER BY r.rating_avg DESC, r.name ASC`,
+               WHERE mi.restaurant_id = r.id AND mi.veg = true AND mi.available = true)) AS has_veg,
+              (SELECT COUNT(*)::int FROM orders o
+               WHERE o.restaurant_id = r.id
+                 AND o.status NOT IN ('cancelled', 'rejected')
+                 AND o.placed_at > now() - interval '7 days') AS orders_7d,
+              (SELECT COUNT(*)::int FROM ratings rt
+               WHERE rt.ratee_type = 'restaurant' AND rt.ratee_id = r.id
+                 AND rt.food_rating IS NOT NULL) AS rating_n${scoreCols}
+       FROM restaurants r WHERE ${conditions.join(' AND ')} ${dbOrder}`,
       params
     );
 
@@ -162,12 +203,38 @@ router.get(
         if (real.distance_km != null) distanceKm = real.distance_km;
       }
       const active = Number(r.active_orders);
+      // ---- Smart "Recommended" score (all inputs from the DB) ----
+      // Bayesian rating: a 4.8 with 200 reviews beats a 5.0 with 2 reviews.
+      const BAYES_C = 10; // confidence weight of the global prior (algorithm constant)
+      const n = Number(r.rating_n) || 0;
+      const bayesian = (BAYES_C * globalMean + Number(r.rating_avg) * n) / (BAYES_C + n);
+      // Popularity: orders in the last 7 days, log-scaled and capped.
+      const popularity = Math.min(1.5, Math.log10(1 + (Number(r.orders_7d) || 0)) * 0.75);
+      // Personalization: ordered before / favorited.
+      let personal = 0;
+      if (r.has_ordered) personal += 1.0;
+      if (r.is_fav) personal += 1.5;
+      // New-restaurant bump: decays linearly over the first 30 days so new
+      // places get visibility while they earn their first ratings.
+      let newBump = 0;
+      if (r.created_at) {
+        const ageDays = (Date.now() - new Date(r.created_at).getTime()) / 86400000;
+        if (ageDays >= 0 && ageDays < 30) newBump = 0.8 * (1 - ageDays / 30);
+      }
+      // Distance penalty: gentle nudge toward nearer restaurants; never hides
+      // far ones (full-city delivery rule). Uses the real drive distance when
+      // the Matrix provided one, else the haversine estimate.
+      const distPenalty = distanceKm == null ? 0 : Math.min(1.0, distanceKm * 0.05);
+      // Open now ranks above closed.
+      const openBoost = isOpenNow(r) ? 0.5 : -2.0;
+      const reco_score = Math.round((bayesian + popularity + personal + newBump - distPenalty + openBoost) * 100) / 100;
       return {
         id: r.id,
         name: r.name,
         description: r.description,
         image_url: r.image_url,
         rating_avg: Number(r.rating_avg),
+        rating_count: n,
         verified: !!r.verified,
         is_open: isOpenNow(r),
         opens_at: r.opens_at,
@@ -182,12 +249,18 @@ router.get(
         distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
         delivery_fee_paise: fee,
         has_veg: !!r.has_veg,
-        eta_minutes: eta
+        eta_minutes: eta,
+        reco_score: reco_score
       };
     });
-    // Nearest first when we know where the customer is
-    if (hasLoc) {
-      list.sort((a, b) => (a.distance_km == null ? 9999 : a.distance_km) - (b.distance_km == null ? 9999 : b.distance_km));
+    // Sorting: smart score by default (and ?sort=reco); legacy options kept.
+    if (sort === 'fast') {
+      list.sort((a, b) => (a.eta_minutes == null ? 9999 : a.eta_minutes) - (b.eta_minutes == null ? 9999 : b.eta_minutes));
+    } else if (sort === 'rating') {
+      // already ordered by the DB (rating_avg DESC, name ASC)
+    } else {
+      // default + ?sort=reco: smart score, tie-broken by rating then name
+      list.sort((a, b) => (b.reco_score - a.reco_score) || (b.rating_avg - a.rating_avg) || String(a.name).localeCompare(String(b.name)));
     }
     const out = { restaurants: list };
     cacheSet(cacheKey, out);
@@ -359,9 +432,15 @@ router.get(
     const { rows } = await db.query(
       `SELECT mi.id, mi.name, mi.price_paise, mi.image_url, mi.veg, mi.description,
               mi.restaurant_id, r.name AS restaurant_name, r.image_url AS restaurant_image,
-              r.rating_avg AS restaurant_rating, r.is_open AS restaurant_open
+              r.rating_avg AS restaurant_rating, r.is_open AS restaurant_open,
+              COALESCE(dr.avg_rating, 0)::float AS rating_avg,
+              COALESCE(dr.rating_count, 0)::int AS rating_count
        FROM menu_items mi
        JOIN restaurants r ON r.id = mi.restaurant_id
+       LEFT JOIN (
+         SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
+         FROM dish_ratings GROUP BY dish_id
+       ) dr ON dr.dish_id = mi.id
        WHERE ${conditions.join(' AND ')}
        ORDER BY r.rating_avg DESC NULLS LAST, mi.price_paise ASC
        LIMIT 30`,
@@ -371,6 +450,8 @@ router.get(
       dishes: rows.map((d) => ({
         ...d,
         price_paise: Number(d.price_paise),
+        rating_avg: Number(d.rating_avg) || 0,
+        rating_count: Number(d.rating_count) || 0,
         restaurant_rating: d.restaurant_rating == null ? null : Number(d.restaurant_rating),
       })),
     });
@@ -404,8 +485,16 @@ router.get(
       mealCond = ` AND ('all' = ANY(meal_slot) OR $${itemParams.length} = ANY(meal_slot))`;
     }
     const items = await db.query(
-      `SELECT * FROM menu_items WHERE restaurant_id = $1 AND available = true${mealCond}
-       ORDER BY is_combo DESC, sort_order, name`,
+      `SELECT mi.*,
+              COALESCE(dr.avg_rating, 0)::float AS rating_avg,
+              COALESCE(dr.rating_count, 0)::int AS rating_count
+       FROM menu_items mi
+       LEFT JOIN (
+         SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
+         FROM dish_ratings GROUP BY dish_id
+       ) dr ON dr.dish_id = mi.id
+       WHERE mi.restaurant_id = $1 AND mi.available = true${mealCond}
+       ORDER BY mi.is_combo DESC, mi.sort_order, mi.name`,
       itemParams
     );
     // Attach customizations to items

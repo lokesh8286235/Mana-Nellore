@@ -300,6 +300,20 @@ CREATE TABLE IF NOT EXISTS rider_bonuses (
 );
 CREATE INDEX IF NOT EXISTS idx_bonuses_rider ON rider_bonuses(rider_id);
 
+-- Dish ratings: customers rate individual dishes from delivered orders.
+-- One rating per dish per order (a customer can rate the same dish again in a different order).
+CREATE TABLE IF NOT EXISTS dish_ratings (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  dish_id uuid NOT NULL REFERENCES menu_items(id) ON DELETE CASCADE,
+  customer_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  order_id uuid NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  rating int NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (dish_id, customer_id, order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dish_ratings_dish ON dish_ratings(dish_id);
+CREATE INDEX IF NOT EXISTS idx_dish_ratings_order ON dish_ratings(order_id);
+
 -- Customer food-photo reviews
 ALTER TABLE ratings ADD COLUMN IF NOT EXISTS photo_url text;
 
