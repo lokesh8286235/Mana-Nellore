@@ -64,7 +64,7 @@ async function transition(orderId, status, by) {
 }
 
 function newDeliveryOtp() {
-  return String(Math.floor(1000 + Math.random() * 9000));
+  return String(require('crypto').randomInt(1000, 10000));
 }
 
 // GET /api/rider/profile
@@ -199,6 +199,7 @@ async function deliveryDetail(orderId, riderId) {
   const order = rows[0];
   if (!order) return null;
   delete order.delivery_otp_hash;
+  delete order.pickup_otp; // rider must get this verbally from restaurant staff
   const items = await db.query('SELECT name_snapshot, qty, unit_price_paise FROM order_items WHERE order_id = $1', [order.id]);
   return { ...order, items: items.rows };
 }
@@ -980,9 +981,12 @@ router.put(
     // }
 
     // Verify pickup OTP if provided (new rider app sends it; old app doesn't)
+    // NOTE: pickup_otp is stripped from deliveryDetail — fetch it directly here
     const providedOtp = req.body.pickup_otp || req.body.otp;
     if (providedOtp) {
-      if (String(providedOtp) !== String(detail.pickup_otp)) {
+      const otpRes = await db.query('SELECT pickup_otp FROM orders WHERE id = $1', [detail.id]);
+      const expectedOtp = otpRes.rows[0] && otpRes.rows[0].pickup_otp;
+      if (!expectedOtp || String(providedOtp) !== String(expectedOtp)) {
         return res.status(400).json({ error: 'Invalid pickup OTP. Ask the restaurant for the correct code.' });
       }
     } else {

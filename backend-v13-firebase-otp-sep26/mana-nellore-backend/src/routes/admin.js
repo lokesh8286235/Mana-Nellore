@@ -702,12 +702,12 @@ router.post(
       // Every order gets its own number + delivery OTP, same as customer placement.
       let cloneNumber = null;
       for (let i = 0; i < 12; i++) {
-        const num = 'MN-' + String(Math.floor(100000 + Math.random() * 900000));
+        const num = 'MN-' + String(require('crypto').randomInt(100000, 1000000));
         const chk = await db.query('SELECT 1 FROM orders WHERE order_number = $1', [num]);
         if (!chk.rows.length) { cloneNumber = num; break; }
       }
       if (!cloneNumber) cloneNumber = 'MN-' + String(Date.now()).slice(-6);
-      const cloneOtp = String(Math.floor(1000 + Math.random() * 9000));
+      const cloneOtp = String(require('crypto').randomInt(1000, 10000));
       const cloneOtpHash = await bcrypt.hash(cloneOtp, 8);
       const { rows } = await db.query(
         `INSERT INTO orders (customer_id, restaurant_id, address_id, order_type, table_id,

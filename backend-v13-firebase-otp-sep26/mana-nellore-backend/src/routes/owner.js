@@ -48,7 +48,7 @@ async function transition(orderId, status, by) {
   // Also generate pickup OTP for the rider
   let pickupOtp = null;
   if (status === 'ready') {
-    pickupOtp = String(Math.floor(1000 + Math.random() * 9000)); // 4-digit OTP
+    pickupOtp = String(require('crypto').randomInt(1000, 10000)); // 4-digit OTP (secure RNG)
   }
   const packed = status === 'ready' ? ', packed_at = now()' : '';
   const otpSet = status === 'ready' ? ', pickup_otp = $4' : '';
@@ -423,6 +423,13 @@ router.delete(
 );
 
 // ---- Orders ----
+// Strip fields the restaurant must never see (customer delivery OTP, hashes)
+function sanitizeOwnerOrder(o) {
+  if (!o) return o;
+  delete o.delivery_otp_hash;
+  delete o.delivery_otp_plain;
+  return o;
+}
 function orderDetailQuery(where, params) {
   return db.query(
     `SELECT o.*, r.name AS restaurant_name,
@@ -457,6 +464,7 @@ router.get(
     for (const o of rows) {
       const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [o.id]);
       o.items = items.rows;
+      sanitizeOwnerOrder(o);
     }
     res.json({ orders: rows });
   })
