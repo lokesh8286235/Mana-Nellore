@@ -25,13 +25,16 @@ async function transition(orderId, status, by) {
 }
 
 function newDeliveryOtp() {
-  return String(Math.floor(1000 + Math.random() * 9000));
+  // Use cryptographically secure RNG (not Math.random which is predictable)
+  const crypto = require('crypto');
+  return String(crypto.randomInt(1000, 10000));
 }
 
 // Order numbers: 6 random digits, collision-checked against the DB.
 async function newOrderNumber(dbClient) {
+  const crypto = require('crypto');
   for (let i = 0; i < 12; i++) {
-    const num = String(Math.floor(100000 + Math.random() * 900000));
+    const num = String(crypto.randomInt(100000, 1000000));
     const { rows } = await dbClient.query('SELECT 1 FROM orders WHERE order_number = $1', [num]);
     if (!rows.length) return num;
   }
