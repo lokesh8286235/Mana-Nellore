@@ -212,7 +212,7 @@ router.get(
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
     const { rows } = await db.query(
-      `SELECT o.id, o.total_paise, o.placed_at, o.payment_method,
+      `SELECT o.id, o.total_paise, o.placed_at, o.payment_method, o.trip_id,
               r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
               a.line1, a.city, a.lat AS addr_lat, a.lng AS addr_lng
        FROM orders o
@@ -275,7 +275,7 @@ router.get(
       where += ` AND o.status = $${params.length}`;
     }
     const { rows } = await db.query(
-      `SELECT o.id, o.status, o.total_paise, o.placed_at, r.name AS restaurant_name
+      `SELECT o.id, o.status, o.total_paise, o.placed_at, o.trip_id, r.name AS restaurant_name
        FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params
