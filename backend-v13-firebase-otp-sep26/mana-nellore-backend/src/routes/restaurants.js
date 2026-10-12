@@ -26,6 +26,67 @@ function isOpenNow(r) {
   return !!r.is_open;
 }
 
+// ---- Google Distance Matrix for REAL drive ETAs/distances (10-min cache) ----
+// Keyed by customer location rounded to a ~100m grid + the restaurant ID set,
+// so nearby customers share one batched Matrix call instead of hammering Google.
+const matrixCache = new Map(); // key -> { at, data: { [restaurantId]: { eta_minutes, distance_km } } }
+const MATRIX_CACHE_MS = 10 * 60 * 1000;
+function matrixCacheGet(key) {
+  const hit = matrixCache.get(key);
+  if (hit && Date.now() - hit.at < MATRIX_CACHE_MS) return hit.data;
+  matrixCache.delete(key);
+  return null;
+}
+function matrixCacheSet(key, data) {
+  if (matrixCache.size > 200) matrixCache.clear();
+  matrixCache.set(key, { at: Date.now(), data });
+}
+function grid100m(v) { return Math.round(v * 1000) / 1000; }
+
+// Batched Distance Matrix: origins = restaurants (<=25 per call, chunked),
+// single destination = customer. Returns null on any failure so callers fall
+// back to the haversine estimate — never breaks the list.
+async function fetchRealDriveETAs(custLat, custLng, rows, gkey) {
+  const withCoords = rows.filter((r) => r.lat != null && r.lng != null);
+  if (!withCoords.length || !gkey) return null;
+  const key = 'm|' + grid100m(custLat) + ',' + grid100m(custLng)
+    + '|' + withCoords.map((r) => String(r.id)).sort().join(',');
+  const cached = matrixCacheGet(key);
+  if (cached) return cached;
+
+  const dest = custLat + ',' + custLng;
+  const out = {};
+  try {
+    for (let i = 0; i < withCoords.length; i += 25) {
+      const chunk = withCoords.slice(i, i + 25);
+      const origins = chunk.map((r) => r.lat + ',' + r.lng).join('|');
+      const url = 'https://maps.googleapis.com/maps/api/distancematrix/json?units=metric&mode=driving'
+        + '&departure_time=now&traffic_model=best_guess'
+        + '&origins=' + encodeURIComponent(origins)
+        + '&destinations=' + encodeURIComponent(dest)
+        + '&key=' + encodeURIComponent(gkey);
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 4000);
+      const resp = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(t);
+      const dm = await resp.json();
+      if (dm.status !== 'OK' || !Array.isArray(dm.rows)) return null;
+      for (let j = 0; j < chunk.length; j++) {
+        const el = dm.rows[j] && dm.rows[j].elements && dm.rows[j].elements[0];
+        if (el && el.status === 'OK' && el.duration) {
+          const dur = (el.duration_in_traffic && el.duration_in_traffic.value) ? el.duration_in_traffic : el.duration;
+          out[chunk[j].id] = {
+            eta_minutes: Math.round(dur.value / 60),
+            distance_km: el.distance ? Math.round(el.distance.value / 100) / 10 : null,
+          };
+        }
+      }
+    }
+  } catch (e) { return null; }
+  matrixCacheSet(key, out);
+  return out;
+}
+
 // GET /api/restaurants?q=&veg=&open=&lat=&lng=&meal=
 router.get(
   '/',
@@ -81,12 +142,24 @@ router.get(
     const hasLoc = Number.isFinite(custLat) && Number.isFinite(custLng);
     if (hasLoc) config = await loadPricingConfig(db);
 
+    // Real drive times from Google Distance Matrix (cached 10 min); falls back
+    // to the haversine formula when the key is missing or the call fails.
+    const gkey = process.env.GOOGLE_MAPS_KEY;
+    const realETAs = (hasLoc && gkey) ? await fetchRealDriveETAs(custLat, custLng, rows, gkey) : null;
+
     const list = rows.map((r) => {
       let distanceKm = null;
       let fee = null;
+      let eta = null; // null = hidden, never invented
       if (hasLoc && r.lat != null && r.lng != null) {
         distanceKm = haversineKm(custLat, custLng, r.lat, r.lng);
         fee = deliveryFeePaise(config.deliveryTiers, distanceKm, 0, []);
+        eta = Math.round(20 + distanceKm * 3); // estimate; replaced by Matrix data when available
+      }
+      const real = realETAs && realETAs[r.id];
+      if (real) {
+        if (real.eta_minutes != null) eta = real.eta_minutes;
+        if (real.distance_km != null) distanceKm = real.distance_km;
       }
       const active = Number(r.active_orders);
       return {
@@ -109,7 +182,7 @@ router.get(
         distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
         delivery_fee_paise: fee,
         has_veg: !!r.has_veg,
-        eta_minutes: distanceKm == null ? 30 : Math.round(20 + distanceKm * 3)
+        eta_minutes: eta
       };
     });
     // Nearest first when we know where the customer is

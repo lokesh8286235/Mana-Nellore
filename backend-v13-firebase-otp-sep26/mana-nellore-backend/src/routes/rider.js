@@ -276,7 +276,7 @@ router.get(
       where += ` AND o.status = $${params.length}`;
     }
     const { rows } = await db.query(
-      `SELECT o.id, o.status, o.total_paise, o.placed_at, o.trip_id, r.name AS restaurant_name
+      `SELECT o.id, o.status, o.total_paise, o.placed_at, o.trip_id, o.order_number, r.name AS restaurant_name
        FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params
@@ -761,7 +761,8 @@ router.post(
         const km = haversineKm(o.rest_lat, o.rest_lng, o.addr_lat, o.addr_lng);
         return { payout: riderPayoutPaise(config.riderPayout, km), km };
       }
-      return { payout: 3000, km: 0 };
+      // No hardcoded fallback: return null (UI hides payout when location unknown)
+      return { payout: null, km: null };
     };
 
     // Simulate a batch: sequence stops, sum payout and minutes, count deadline risks.
@@ -980,18 +981,16 @@ router.put(
     //   return res.status(400).json({ error: 'A pickup photo is required to confirm pickup' });
     // }
 
-    // Verify pickup OTP if provided (new rider app sends it; old app doesn't)
+    // Pickup OTP is MANDATORY (user requirement 2026-10-12)
     // NOTE: pickup_otp is stripped from deliveryDetail — fetch it directly here
     const providedOtp = req.body.pickup_otp || req.body.otp;
-    if (providedOtp) {
-      const otpRes = await db.query('SELECT pickup_otp FROM orders WHERE id = $1', [detail.id]);
-      const expectedOtp = otpRes.rows[0] && otpRes.rows[0].pickup_otp;
-      if (!expectedOtp || String(providedOtp) !== String(expectedOtp)) {
-        return res.status(400).json({ error: 'Invalid pickup OTP. Ask the restaurant for the correct code.' });
-      }
-    } else {
-      // Old app version: log warning but allow (remove after rider app deployed)
-      console.warn(`[SECURITY] Pickup without OTP verification: order ${detail.id}, rider ${rider.id}`);
+    if (!providedOtp) {
+      return res.status(400).json({ error: 'Pickup OTP is required. Ask the restaurant for the code.' });
+    }
+    const otpRes = await db.query('SELECT pickup_otp FROM orders WHERE id = $1', [detail.id]);
+    const expectedOtp = otpRes.rows[0] && otpRes.rows[0].pickup_otp;
+    if (!expectedOtp || String(providedOtp) !== String(expectedOtp)) {
+      return res.status(400).json({ error: 'Invalid pickup OTP. Ask the restaurant for the correct code.' });
     }
 
     const code = null; /* stable OTP: placement OTP reused, never regenerated */
@@ -1045,7 +1044,7 @@ router.post(
     const l = loc.rows[0];
     const config = await loadPricingConfig(db);
     let distanceKm = null;
-    let payout = 3000; // fallback Rs 30 when locations unknown
+    let payout = null; // No hardcoded fallback: null when locations unknown
     if (l.rest_lat != null && l.rest_lng != null && l.addr_lat != null && l.addr_lng != null) {
       distanceKm = haversineKm(l.rest_lat, l.rest_lng, l.addr_lat, l.addr_lng);
       payout = riderPayoutPaise(config.riderPayout, distanceKm);
@@ -1067,11 +1066,17 @@ router.post(
       paymentStatus = 'collected';
     }
 
-    await db.query(
-      `INSERT INTO rider_payouts (rider_id, order_id, amount_paise, distance_km)
-       VALUES ($1, $2, $3, $4) ON CONFLICT (order_id) DO NOTHING`,
-      [rider.id, order.id, payout, distanceKm]
-    );
+    // Only record payout when we could calculate it from real coordinates.
+    // Never invent a payout value when location is unknown.
+    if (payout != null) {
+      await db.query(
+        `INSERT INTO rider_payouts (rider_id, order_id, amount_paise, distance_km)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (order_id) DO NOTHING`,
+        [rider.id, order.id, payout, distanceKm]
+      );
+    } else {
+      console.warn(`[payout] Skipped payout for order ${order.id}: location unknown, no payout recorded`);
+    }
     if (cod) {
       await db.query(
         `INSERT INTO rider_cod_ledger (rider_id, order_id, amount_paise)

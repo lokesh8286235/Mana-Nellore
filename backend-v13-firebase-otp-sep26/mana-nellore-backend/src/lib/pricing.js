@@ -87,9 +87,10 @@ function riderPayoutPaise(cfg, distanceKm) {
 
 function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct }) {
   const net = subtotalPaise - discountPaise;
+  // No hardcoded fallback: if distance unknown, fee is null (frontend hides it)
   const deliveryFee =
     distanceKm == null
-      ? 2500 // fallback Rs 25 when locations are unknown
+      ? null
       : deliveryFeePaise(config.deliveryTiers, distanceKm, net, config.freeDeliveryRules);
   const platformFeePaise = config.platformFeePaise;
   const pct = commissionPct != null ? Number(commissionPct) : config.defaultCommissionPct;
