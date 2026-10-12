@@ -252,6 +252,58 @@ router.get(
   })
 );
 
+// GET /api/restaurants/dishes/search?q=&max_price_paise= — Ask Floop dish search
+// Spelling-tolerant via ILIKE; accepts missing q (returns popular available dishes).
+router.get(
+  '/dishes/search',
+  ah(async (req, res) => {
+    const q = String(req.query.q || '').trim();
+    const maxPrice = req.query.max_price_paise ? Number(req.query.max_price_paise) : null;
+    const params = [];
+    const conditions = [
+      'mi.available = true',
+      "r.status = 'approved'",
+      'r.is_open = true',
+      'COALESCE(r.is_coming_soon, false) = false',
+    ];
+    if (q) {
+      // Split into words; every word must appear in the dish name (order-free,
+      // spelling-tolerant-ish via ILIKE). Frontend also sends alias-normalized q.
+      const words = q.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 1);
+      for (const w of words.slice(0, 5)) {
+        params.push(`%${w}%`);
+        conditions.push(`mi.name ILIKE $${params.length}`);
+      }
+      if (!words.length) {
+        params.push(`%${q}%`);
+        conditions.push(`mi.name ILIKE $${params.length}`);
+      }
+    }
+    if (Number.isFinite(maxPrice) && maxPrice > 0) {
+      params.push(String(Math.round(maxPrice)));
+      conditions.push(`mi.price_paise <= $${params.length}`);
+    }
+    const { rows } = await db.query(
+      `SELECT mi.id, mi.name, mi.price_paise, mi.image_url, mi.veg, mi.description,
+              mi.restaurant_id, r.name AS restaurant_name, r.image_url AS restaurant_image,
+              r.rating_avg AS restaurant_rating, r.is_open AS restaurant_open
+       FROM menu_items mi
+       JOIN restaurants r ON r.id = mi.restaurant_id
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY r.rating_avg DESC NULLS LAST, mi.price_paise ASC
+       LIMIT 30`,
+      params
+    );
+    res.json({
+      dishes: rows.map((d) => ({
+        ...d,
+        price_paise: Number(d.price_paise),
+        restaurant_rating: d.restaurant_rating == null ? null : Number(d.restaurant_rating),
+      })),
+    });
+  })
+);
+
 // GET /api/restaurants/:id -> restaurant + categories + available menu items
 router.get(
   '/:id',
