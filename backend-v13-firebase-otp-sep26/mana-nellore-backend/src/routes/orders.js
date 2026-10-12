@@ -453,11 +453,10 @@ async function placeMultiGroupOrder(req, res) {
     }
 
     await client.query('COMMIT');
-    const otpLines = orders.map(function(o){
-      return `${o.order.order_number || 'order'} — OTP ${o.order.delivery_otp}`;
-    }).join(' · ');
+    // Single shared delivery OTP for the entire trip
+    const sharedOtp = orders[0]?.order?.delivery_otp;
     await notify(req.user.id, 'Order placed ✅',
-      `Your restaurants got the orders and kitchens are firing up! 🔥 Delivery OTP${orders.length > 1 ? 's' : ''}: ${otpLines} — share with your rider at handover.`);
+      `Your restaurants got the orders and kitchens are firing up! 🔥 Delivery OTP: ${sharedOtp} — share with your rider at handover.`);
 
     res.status(201).json({
       orders,
@@ -872,13 +871,32 @@ router.post(
     if (order.status !== 'placed') {
       return res.status(409).json({ error: 'Order can no longer be cancelled' });
     }
+    // For trips: cancel ALL orders in the trip (bulletproof - no partial trips)
+    const cancelIds = [order.id];
+    if (order.trip_id) {
+      const tripRes = await db.query(
+        "SELECT id, payment_status FROM orders WHERE trip_id = $1 AND status = 'placed'",
+        [order.trip_id]
+      );
+      for (const to of tripRes.rows) {
+        if (to.id !== order.id) {
+          await transition(to.id, 'cancelled', 'customer');
+          const toRefunded = to.payment_status === 'paid';
+          await db.query(
+            'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
+            [req.body.reason || 'Cancelled by customer (trip)', toRefunded ? 'refunded' : to.payment_status, to.id]
+          );
+          cancelIds.push(to.id);
+        }
+      }
+    }
     await transition(order.id, 'cancelled', 'customer');
     const refunded = order.payment_status === 'paid';
     await db.query(
       'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
       [req.body.reason || 'Cancelled by customer', refunded ? 'refunded' : order.payment_status, order.id]
     );
-    res.json({ ok: true, refunded });
+    res.json({ ok: true, refunded, cancelled_orders: cancelIds.length });
   })
 );
 
