@@ -168,9 +168,7 @@ router.post(
 
     // Multi-restaurant on-the-way quote: group items by restaurant_id (item-level).
     // primary = cart.restaurant_id (100% fee).
-    // Secondaries: marginal-cost pricing — 20% of the TRUE extra road
-    // distance they add (road X→Y→Z minus road X→Z), not a flat discount.
-    // Falls back to 20% of Y→Z fee if the Routes API is unavailable.
+    // Secondaries: flat on-the-way fee (Rs 5 default, config-driven).
     let groupsOut = null;
     if (!dineIn) {
       const byRest = {};
@@ -213,8 +211,8 @@ router.post(
           });
           const isPrim = gi === 0;
           // Primary: 100% of its own normal fee.
-          // Secondary: 20% of its own normal Y→Z fee (simple, user-dictated).
-          const secFee = isPrim ? gQuote.deliveryFeePaise : otwSecondaryFeePaise(gQuote.deliveryFeePaise);
+          // Secondary: flat on-the-way fee (Rs 5 default, config-driven).
+          const secFee = isPrim ? gQuote.deliveryFeePaise : otwSecondaryFeePaise(gQuote.deliveryFeePaise, config);
           groupsOut.push({
             restaurant_id: rid,
             is_primary: isPrim,
@@ -259,7 +257,7 @@ router.post(
 
 // POST /api/orders with groups[] — on-the-way multi-restaurant checkout.
 // groups[0] = primary (100% of its own normal delivery fee + platform fee).
-// groups[1..] = secondaries (20% of their OWN normal delivery fee each, platform fee 0).
+// groups[1..] = secondaries (flat on-the-way fee each, platform fee 0).
 // Off-route secondaries are REMOVED (never repriced) and reported in removed_off_route.
 async function placeMultiGroupOrder(req, res) {
   const { groups, address_id, coupon_code, payment_method,
@@ -405,9 +403,8 @@ async function placeMultiGroupOrder(req, res) {
       }
 
       // Fees: primary = 100% of its own normal fee, platform fee applies.
-      // Secondary on-the-way (validated by true road detour above):
-      // marginal-cost = 20% × true_detour_km × per-km rate. Platform 0.
-      // Falls back to 20% of Y→Z fee if the detour is unavailable.
+      // Secondary on-the-way (validated ≤500m above):
+      // flat on-the-way fee (Rs 5 default, config-driven). Platform 0.
       let distanceKm = null;
       if (restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
         distanceKm = haversineKm(Number(restaurant.lat), Number(restaurant.lng), Number(address.lat), Number(address.lng));
@@ -421,8 +418,8 @@ async function placeMultiGroupOrder(req, res) {
       });
       const normalFee = quote.deliveryFeePaise;
       // Primary: 100% of its own normal fee.
-      // Secondary: 20% of its own normal Y→Z fee (simple, user-dictated).
-      const deliveryFee = isPrimary ? normalFee : otwSecondaryFeePaise(normalFee);
+      // Secondary: flat on-the-way fee (Rs 5 default, config-driven).
+      const deliveryFee = isPrimary ? normalFee : otwSecondaryFeePaise(normalFee, config);
       const platformFee = isPrimary ? quote.platformFeePaise : 0;
       const tipPaise = isPrimary ? Math.max(0, Math.round(Number(tip_paise) || 0)) : 0;
       const finalTotal = (subtotal - discount) + deliveryFee + platformFee + tipPaise;

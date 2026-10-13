@@ -40,6 +40,8 @@ async function loadPricingConfig(db) {
       (m.free_delivery_rules && m.free_delivery_rules.rules) || [],
     // Honest ETA estimate shown to customers ("Usually ~X min") — NOT a delivery promise.
     etaMinutes: Number(m.eta_minutes != null ? m.eta_minutes : 30),
+    // On-the-way secondary fee: flat amount in paise (user-dictated 2026-10-13).
+    otwFlatFeePaise: Number(m.otw_flat_fee_paise != null ? m.otw_flat_fee_paise : 500),
   };
 }
 
@@ -85,14 +87,16 @@ function riderPayoutPaise(cfg, distanceKm) {
   );
 }
 
-// On-the-way secondary delivery fee (user-dictated 2026-10-13, simplified).
-// Every on-the-way secondary pays a flat 20% of its OWN normal delivery fee.
+// On-the-way secondary delivery fee (user-dictated 2026-10-13).
+// Flat fee from config (otw_flat_fee_paise, default 500 paise = Rs 5).
 // "On the way" = within 500m of the primary→customer route line — enforced by
 // the caller (discovery only lists ≤500m; order placement removes the rest).
 // Restaurants beyond 500m are never offered as on-the-way options.
 // Free-delivery rules never apply to secondaries — no silent freebies.
-function otwSecondaryFeePaise(normalFeePaise) {
-  return normalFeePaise != null ? Math.round(normalFeePaise * 0.2) : null;
+function otwSecondaryFeePaise(normalFeePaise, config) {
+  if (normalFeePaise == null) return null;
+  const flat = Number(config && config.otwFlatFeePaise != null ? config.otwFlatFeePaise : 500);
+  return Math.round(flat);
 }
 
 function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct }) {

@@ -3,7 +3,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { ah } = require('../middleware/auth');
-const { haversineKm, loadPricingConfig, deliveryFeePaise } = require('../lib/pricing');
+const { haversineKm, loadPricingConfig, deliveryFeePaise, otwSecondaryFeePaise } = require('../lib/pricing');
 const { pointToSegKm } = require('../lib/otw');
 
 const router = express.Router();
@@ -350,7 +350,7 @@ router.get(
 // GET /api/restaurants/on-the-way?from_lat=&from_lng=&to_lat=&to_lng=&primary_id=
 // Simple on-the-way discovery (user-dictated 2026-10-13):
 //   - Only restaurants within 500m (straight-line) of the X→Z route segment.
-//   - Each shows delivery_fee_paise = 20% of its normal Y→Z delivery fee.
+//   - Each shows delivery_fee_paise = flat on-the-way fee (Rs 5 default).
 // No detour calculations, no Routes API calls.
 router.get(
   '/on-the-way',
@@ -375,7 +375,7 @@ router.get(
     );
 
     // Simple: within 500m (straight-line) of the X→Z segment → on the way.
-    // Fee = 20% of the normal Y→Z delivery fee (tiered pricing).
+    // Fee = flat on-the-way fee (Rs 5 default, config-driven).
     const out = [];
     for (const r of rows) {
       if (primaryId && String(r.id) === primaryId) continue;
@@ -387,7 +387,7 @@ router.get(
       if (distKm > THRESHOLD_KM) continue;
       const yzKm = haversineKm(Number(r.lat), Number(r.lng), toLat, toLng);
       const normalFee = deliveryFeePaise(config.deliveryTiers, yzKm, 0, []);
-      const feePaise = Math.round(normalFee * 0.2);
+      const feePaise = otwSecondaryFeePaise(normalFee, config);
       out.push({
         id: r.id,
         name: r.name,
