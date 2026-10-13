@@ -85,17 +85,14 @@ function riderPayoutPaise(cfg, distanceKm) {
   );
 }
 
-// On-the-way secondary detour fee: 20% of the tier-priced detour distance.
-// The detour is how far the secondary restaurant sits off the primary→customer
-// route line. The 20% discount applies to the detour cost itself — a restaurant
-// 100m off-route pays less than one 500m off-route. Free-delivery rules never
-// apply to the detour — it's extra service on top of the main delivery.
-// Per-km rate comes from deliveryTiers (first tier covers all detours, which
-// are ≤ 0.5km by the on-route definition).
-function otwDetourFeePaise(config, detourKm) {
-  const d = Math.max(0, Number(detourKm) || 0);
-  const detourCost = deliveryFeePaise(config.deliveryTiers, d, 0, []);
-  return Math.round(detourCost * 0.2);
+// On-the-way secondary delivery fee (user-dictated 2026-10-13, simplified).
+// Every on-the-way secondary pays a flat 20% of its OWN normal delivery fee.
+// "On the way" = within 500m of the primary→customer route line — enforced by
+// the caller (discovery only lists ≤500m; order placement removes the rest).
+// Restaurants beyond 500m are never offered as on-the-way options.
+// Free-delivery rules never apply to secondaries — no silent freebies.
+function otwSecondaryFeePaise(normalFeePaise) {
+  return normalFeePaise != null ? Math.round(normalFeePaise * 0.2) : null;
 }
 
 function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct }) {
@@ -125,6 +122,6 @@ module.exports = {
   loadPricingConfig,
   deliveryFeePaise,
   riderPayoutPaise,
-  otwDetourFeePaise,
+  otwSecondaryFeePaise,
   computeQuote
 };

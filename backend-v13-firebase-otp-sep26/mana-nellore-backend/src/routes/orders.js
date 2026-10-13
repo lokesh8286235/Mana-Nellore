@@ -4,7 +4,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
-const { haversineKm, loadPricingConfig, computeQuote, otwDetourFeePaise } = require('../lib/pricing');
+const { haversineKm, loadPricingConfig, computeQuote, otwSecondaryFeePaise } = require('../lib/pricing');
 
 const router = express.Router();
 router.use(authenticate);
@@ -167,9 +167,9 @@ router.post(
 
     // Multi-restaurant on-the-way quote: group items by restaurant_id (item-level).
     // primary = cart.restaurant_id (100% fee).
-    // Secondaries: detour-based fee (base + per-km for actual detour off the
-    // primary→customer route, on-route = within 500m); off-route = 100% of
-    // their own normal fee; unverifiable (missing coords) = old 20% fallback.
+    // Secondaries: flat 20% of their OWN normal delivery fee each.
+    // Only restaurants within 500m of the primary→customer route are offered
+    // as on-the-way options (see GET /api/restaurants/on-the-way).
     let groupsOut = null;
     if (!dineIn) {
       const byRest = {};
@@ -186,7 +186,6 @@ router.post(
           [ordered]
         );
         const rMap = Object.fromEntries(rAll.rows.map((r) => [String(r.id), r]));
-        const primR = rMap[primaryRid];
         groupsOut = [];
         for (let gi = 0; gi < ordered.length; gi++) {
           const rid = ordered[gi];
@@ -212,25 +211,12 @@ router.post(
             commissionPct: rr.commission_pct
           });
           const isPrim = gi === 0;
-          // Detour of this secondary off the primary→customer route line (km).
-          let detourKm = null;
-          if (!isPrim && primR && primR.lat != null && primR.lng != null &&
-              address.lat != null && address.lng != null &&
-              rr.lat != null && rr.lng != null) {
-            detourKm = otwPointToSegKm(Number(rr.lng), Number(rr.lat),
-              Number(primR.lng), Number(primR.lat),
-              Number(address.lng), Number(address.lat));
-          }
           let secFee;
           if (isPrim) {
             secFee = gQuote.deliveryFeePaise;
-          } else if (detourKm != null && detourKm <= 0.5) {
-            secFee = otwDetourFeePaise(config, detourKm);
-          } else if (detourKm != null) {
-            secFee = gQuote.deliveryFeePaise; // off-route (>500m): full fee
           } else {
-            // Cannot verify route (missing coords): old 20% fallback
-            secFee = gQuote.deliveryFeePaise != null ? Math.round(gQuote.deliveryFeePaise * 0.2) : null;
+            // Flat 20% of the secondary's own normal fee.
+            secFee = otwSecondaryFeePaise(gQuote.deliveryFeePaise);
           }
           groupsOut.push({
             restaurant_id: rid,
@@ -238,7 +224,6 @@ router.post(
             subtotal_paise: gSub,
             normal_fee_paise: gQuote.deliveryFeePaise,
             delivery_fee_paise: secFee,
-            detour_km: detourKm != null ? Math.round(detourKm * 100) / 100 : null,
             platform_fee_paise: isPrim ? gQuote.platformFeePaise : 0
           });
         }
@@ -308,12 +293,12 @@ async function placeMultiGroupOrder(req, res) {
     if (!primary) throw { status: 404, message: 'Primary restaurant not available' };
     if (!primary.is_open) throw { status: 400, message: 'Primary restaurant is currently closed' };
 
-    // Route validation: secondary on-route (within 500m of the primary→customer
-    // route line) pays base + per-km for the actual detour; off-route (>500m)
-    // pays 100% fee. Missing coords = cannot verify = full fee (off-route).
-    // User rule 2026-10-11: off-route is allowed, just charged full delivery fee, not removed
+    // Route validation: only secondaries within 500m of the primary→customer
+    // route line are on-the-way (flat 20% of their own normal fee).
+    // Beyond 500m — or missing coords — the secondary is REMOVED from the
+    // order and reported in removed_off_route. Nothing is ever repriced.
     const removed_off_route = [];
-    const validGroups = [{ ...groups[0], _onRoute: true, _detourKm: 0 }];
+    const validGroups = [{ ...groups[0] }];
     for (let i = 1; i < groups.length; i++) {
       const g = groups[i];
       const r = restById[String(g.restaurant_id)];
@@ -321,18 +306,19 @@ async function placeMultiGroupOrder(req, res) {
         removed_off_route.push({ restaurant_id: g.restaurant_id, name: (r && r.name) || 'Restaurant', reason: 'unavailable' });
         continue;
       }
-      // Default: off-route (100% fee) unless proven on-route. Missing coords = cannot verify = full fee.
       let onRoute = false;
-      let detourKm = null;
       if (primary.lat != null && primary.lng != null && address.lat != null && address.lng != null &&
           r.lat != null && r.lng != null) {
-        detourKm = otwPointToSegKm(Number(r.lng), Number(r.lat),
+        const detourKm = otwPointToSegKm(Number(r.lng), Number(r.lat),
           Number(primary.lng), Number(primary.lat),
           Number(address.lng), Number(address.lat));
         onRoute = detourKm <= 0.5;
       }
-      // Keep the group, mark onRoute status + detour for fee calculation
-      validGroups.push({ ...g, _onRoute: onRoute, _detourKm: detourKm });
+      if (!onRoute) {
+        removed_off_route.push({ restaurant_id: g.restaurant_id, name: r.name || 'Restaurant', reason: 'not_on_the_way' });
+        continue;
+      }
+      validGroups.push(g);
     }
 
     const config = await loadPricingConfig(client);
@@ -413,8 +399,8 @@ async function placeMultiGroupOrder(req, res) {
       }
 
       // Fees: primary = 100% of its own normal fee, platform fee applies.
-      // Secondary on-route (detour <= 500m): base + per-km for the actual detour.
-      // Secondary off-route or unverifiable: 100% of its own normal fee. Platform 0.
+      // Secondary on-the-way (validated ≤500m above): flat 20% of its own
+      // normal fee. Platform 0.
       let distanceKm = null;
       if (restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
         distanceKm = haversineKm(Number(restaurant.lat), Number(restaurant.lng), Number(address.lat), Number(address.lng));
@@ -427,18 +413,11 @@ async function placeMultiGroupOrder(req, res) {
         commissionPct: restaurant.commission_pct
       });
       const normalFee = quote.deliveryFeePaise;
-      const onRoute = g._onRoute === true;
-      const detourKm = g._detourKm;
       let deliveryFee;
       if (isPrimary) {
         deliveryFee = normalFee;
-      } else if (onRoute && detourKm != null) {
-        deliveryFee = otwDetourFeePaise(config, detourKm);
-      } else if (onRoute) {
-        // On-route but detour unknown (shouldn't happen): old 20% fallback
-        deliveryFee = normalFee != null ? Math.round(normalFee * 0.2) : null;
       } else {
-        deliveryFee = normalFee; // off-route (>500m) or unverifiable: full fee
+        deliveryFee = otwSecondaryFeePaise(normalFee);
       }
       const platformFee = isPrimary ? quote.platformFeePaise : 0;
       const tipPaise = isPrimary ? Math.max(0, Math.round(Number(tip_paise) || 0)) : 0;

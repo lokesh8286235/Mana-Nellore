@@ -347,9 +347,10 @@ router.get(
 
 
 // GET /api/restaurants/on-the-way?from_lat=&from_lng=&to_lat=&to_lng=&primary_id=
-// Returns approved restaurants within 1km of the straight line from the
+// Returns approved restaurants within 500m of the straight line from the
 // primary restaurant (X) to the delivery address (Z), sorted by position along
-// the route. Used for the "On your way" multi-restaurant checkout.
+// the route. Restaurants beyond 500m are never listed. Used for the
+// "On your way" multi-restaurant checkout.
 router.get(
   '/on-the-way',
   ah(async (req, res) => {
@@ -388,7 +389,7 @@ router.get(
     for (const r of rows) {
       if (primaryId && String(r.id) === primaryId) continue;
       const pr = proj(Number(r.lng) * kx, Number(r.lat) * ky);
-      if (pr.dist <= 1.0) {
+      if (pr.dist <= 0.5) {
         out.push({
           id: r.id,
           name: r.name,
