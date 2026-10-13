@@ -312,7 +312,7 @@ router.post(
   })
 );
 
-// ---- Route optimization helpers (Phase 2: v2-insertion solver) ----
+// ---- Route optimization helpers (Phase 3: exact DP solver) ----
 // Shared by GET /route/optimized and POST /deliveries/evaluate.
 const AVG_KMH = 25;   // city riding speed for ETA estimates
 const STOP_MIN = 3;   // per-stop handling time
@@ -369,56 +369,130 @@ function routeStopKey(s) {
   return s.type + ':' + (s.order_ids || []).join(',');
 }
 
-// Nearest-neighbor sequencing with pickup-before-dropoff constraint and
-// urgency boost. Assigns a human-readable `reason` to every chosen stop.
+// Exact route sequencing via Held-Karp dynamic programming with
+// pickup-before-dropoff precedence constraints. n <= 6 always (max 3 orders,
+// same-restaurant pickups merged), so 2^n * n^2 states is trivial (<1ms).
+// Returns the TRUE minimum-cost feasible sequence under the same cost model
+// the old nearest-neighbor greedy approximated (haversine legs, 0.7x urgency
+// multiplier on inbound legs to near-deadline dropoffs).
+// Assigns a human-readable `reason` to every chosen stop.
 function sequenceRouteStops(candidates, rows, cur, now, haversineKm) {
+  const n = candidates.length;
+  if (!n) return { seq: [], startPt: cur };
   const distKm = (a, b) => haversineKm(a.lat, a.lng, b.lat, b.lng);
-  const seq = [];
-  const remaining = candidates.slice();
+
+  // Precedence: a dropoff requires its restaurant's pickup stop earlier in the
+  // sequence, unless that restaurant was already picked up.
   const pickedRestIds = new Set();
+  const orderRest = new Map();
   rows.forEach(o => {
     if (o.status === 'picked_up' || o.status === 'on_way') pickedRestIds.add(String(o.restaurant_id));
+    orderRest.set(String(o.id), String(o.restaurant_id));
   });
-  let curPt = cur;
-  if (!curPt && candidates.length) curPt = { lat: candidates[0].lat, lng: candidates[0].lng };
-  let first = true;
-  while (remaining.length) {
-    let best = -1, bestD = Infinity, bestReason = '', bestUrgent = false;
-    remaining.forEach((s, i) => {
-      if (s.type === 'dropoff') {
-        const oid = s.order_ids[0];
-        const o = rows.find(r => String(r.id) === String(oid));
-        const restKey = o ? String(o.restaurant_id) : null;
-        const pickupSeq = seq.some(x => x.type === 'pickup' && x.restaurant_id === restKey);
-        if (restKey && !pickedRestIds.has(restKey) && !pickupSeq) return; // not eligible yet
+  const pickupIdxByRest = new Map();
+  candidates.forEach((s, i) => {
+    if (s.type === 'pickup') pickupIdxByRest.set(String(s.restaurant_id), i);
+  });
+  const required = new Array(n).fill(0);   // bitmask of mandatory predecessors
+  const feasible = new Array(n).fill(true);
+  candidates.forEach((s, i) => {
+    if (s.type === 'dropoff') {
+      const restKey = orderRest.get(String(s.order_ids[0]));
+      if (restKey && !pickedRestIds.has(restKey)) {
+        const pi = pickupIdxByRest.get(restKey);
+        if (pi == null) feasible[i] = false; // pickup missing: can never be served
+        else required[i] = (1 << pi);
       }
-      const d = curPt ? distKm(curPt, s) : 0;
-      let score = d, urgent = false, minsLeft = null;
-      if (s.type === 'dropoff' && s.deadline_at) {
-        minsLeft = (new Date(s.deadline_at).getTime() - now) / 60000;
-        if (minsLeft < 20) { score = d * 0.7; urgent = true; }
-      }
-      if (score < bestD) {
-        bestD = score; best = i; bestUrgent = urgent;
-        if (s.type === 'pickup' && s.order_ids.length > 1) {
-          bestReason = 'Combines ' + s.order_ids.length + ' orders from one restaurant';
-        } else if (urgent) {
-          bestReason = 'Urgent — about ' + Math.max(1, Math.round(minsLeft)) + ' min to deadline';
-        } else if (first) {
-          bestReason = 'Nearest to your current location';
-        } else {
-          bestReason = 'Next stop on the fastest route';
-        }
-      }
-    });
-    if (best < 0) break; // safety: no eligible stop (should not happen)
-    const next = remaining.splice(best, 1)[0];
-    next.reason = bestReason;
-    seq.push(next);
-    curPt = { lat: next.lat, lng: next.lng };
-    if (next.type === 'pickup') pickedRestIds.add(next.restaurant_id);
-    first = false;
+    }
+  });
+
+  // Urgency boost (same as before): dropoffs within 20 min of deadline get
+  // 0.7x inbound-leg cost so the optimizer prefers them, exactly.
+  const urgent = candidates.map(s => {
+    if (s.type !== 'dropoff' || !s.deadline_at) return false;
+    return (new Date(s.deadline_at).getTime() - now) / 60000 < 20;
+  });
+  const legCost = (from, toIdx) => {
+    const d = from ? distKm(from, candidates[toIdx]) : 0;
+    return urgent[toIdx] ? d * 0.7 : d;
+  };
+
+  // Compact to feasible stops; remap precedence masks to DP positions.
+  const idx = [];
+  const pos = new Array(n).fill(-1);
+  candidates.forEach((s, i) => { if (feasible[i]) { pos[i] = idx.length; idx.push(i); } });
+  const m = idx.length;
+  if (!m) return { seq: [], startPt: cur };
+  const reqMask = idx.map(ci => {
+    let mm = 0;
+    for (let k = 0; k < n; k++) if ((required[ci] >> k) & 1) mm |= (1 << pos[k]);
+    return mm;
+  });
+
+  // Old behavior when rider location unknown: start at the first candidate,
+  // so the first leg to it costs 0.
+  const startPt = cur || { lat: candidates[0].lat, lng: candidates[0].lng };
+
+  // Held-Karp DP: dp[mask][last] = min cost to visit `mask` ending at `last`.
+  const N = 1 << m;
+  const INF = 1e18;
+  const dp = new Float64Array(N * m).fill(INF);
+  const par = new Int16Array(N * m).fill(-1);
+  const at = (mask, last) => mask * m + last;
+  for (let p = 0; p < m; p++) {
+    if (reqMask[p] === 0) dp[at(1 << p, p)] = legCost(startPt, idx[p]);
   }
+  for (let mask = 1; mask < N; mask++) {
+    for (let last = 0; last < m; last++) {
+      if (!((mask >> last) & 1)) continue;
+      const curCost = dp[at(mask, last)];
+      if (curCost >= INF) continue;
+      const fromPt = candidates[idx[last]];
+      for (let nxt = 0; nxt < m; nxt++) {
+        if ((mask >> nxt) & 1) continue;
+        if ((reqMask[nxt] & ~mask) !== 0) continue; // precedence violated
+        const nm = mask | (1 << nxt);
+        const nc = curCost + legCost(fromPt, idx[nxt]);
+        if (nc < dp[at(nm, nxt)]) { dp[at(nm, nxt)] = nc; par[at(nm, nxt)] = last; }
+      }
+    }
+  }
+  const full = N - 1;
+  let bestLast = -1, bestCost = INF;
+  for (let last = 0; last < m; last++) {
+    if (dp[at(full, last)] < bestCost) { bestCost = dp[at(full, last)]; bestLast = last; }
+  }
+  const order = [];
+  if (bestLast >= 0) {
+    let mask = full, last = bestLast;
+    while (last >= 0) {
+      order.push(idx[last]);
+      const p = par[at(mask, last)];
+      mask ^= (1 << last);
+      last = p;
+    }
+    order.reverse();
+  } else {
+    // Defensive: unreachable full tour (should not happen — pickups are
+    // unconstrained so a feasible tour always exists). Keep candidate order.
+    for (let p = 0; p < m; p++) order.push(idx[p]);
+  }
+
+  const seq = order.map(ci => candidates[ci]);
+  seq.forEach((s, i) => {
+    let reason;
+    if (s.type === 'pickup' && s.order_ids.length > 1) {
+      reason = 'Combines ' + s.order_ids.length + ' orders from one restaurant';
+    } else if (urgent[order[i]]) {
+      const minsLeft = Math.max(1, Math.round((new Date(s.deadline_at).getTime() - now) / 60000));
+      reason = 'Urgent — about ' + minsLeft + ' min to deadline';
+    } else if (i === 0) {
+      reason = 'First stop on the optimal route';
+    } else {
+      reason = 'Next stop on the optimal route';
+    }
+    s.reason = reason;
+  });
   return { seq, startPt: cur };
 }
 
@@ -535,7 +609,7 @@ router.get(
     );
     const now = Date.now();
     if (!rows.length) {
-      return res.json({ stops: [], total_km: 0, total_minutes: 0, optimized_at: new Date().toISOString(), solver: 'v2-insertion', hysteresis_applied: false });
+      return res.json({ stops: [], total_km: 0, total_minutes: 0, optimized_at: new Date().toISOString(), solver: 'v3-exact', hysteresis_applied: false });
     }
 
     const { haversineKm } = require('../lib/pricing');
@@ -586,7 +660,7 @@ router.get(
       total_minutes: totalMinutes,
       optimized_at: new Date().toISOString(),
       traffic_aware: trafficAware,
-      solver: 'v2-insertion',
+      solver: 'v3-exact',
       hysteresis_applied: hysteresisApplied
     });
   })
