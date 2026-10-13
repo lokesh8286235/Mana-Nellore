@@ -5,7 +5,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, computeQuote, otwSecondaryFeePaise } = require('../lib/pricing');
-const { trueDetourKm, otwMarginalFeePaise } = require('../lib/otw');
+const { pointToSegKm } = require('../lib/otw');
 
 const router = express.Router();
 router.use(authenticate);
@@ -187,11 +187,6 @@ router.post(
           [ordered]
         );
         const rMap = Object.fromEntries(rAll.rows.map((r) => [String(r.id), r]));
-        const otw = (config.otw) || {};
-        const thresholdKm = Number(otw.detourThresholdKm) || 0.5;
-        const perKmRatePaise = Number(otw.perKmRatePaise) || 1000;
-        const gkey = process.env.GOOGLE_MAPS_KEY;
-        const prim = rMap[primaryRid];
         groupsOut = [];
         for (let gi = 0; gi < ordered.length; gi++) {
           const rid = ordered[gi];
@@ -217,29 +212,9 @@ router.post(
             commissionPct: rr.commission_pct
           });
           const isPrim = gi === 0;
-          let secFee;
-          let detourKm = null;
-          if (isPrim) {
-            secFee = gQuote.deliveryFeePaise;
-          } else {
-            // Marginal-cost: 20% × true road detour × per-km rate.
-            // Fallback: 20% of Y→Z fee (never break the quote).
-            if (prim && prim.lat != null && prim.lng != null &&
-                rr.lat != null && rr.lng != null &&
-                address.lat != null && address.lng != null) {
-              const x = { lat: Number(prim.lat), lng: Number(prim.lng) };
-              const y = { lat: Number(rr.lat), lng: Number(rr.lng) };
-              const z = { lat: Number(address.lat), lng: Number(address.lng) };
-              const r = await trueDetourKm(x, y, z, gkey, null);
-              if (r.detourKm != null && r.detourKm <= thresholdKm) {
-                detourKm = r.detourKm;
-                secFee = otwMarginalFeePaise(r.detourKm, perKmRatePaise);
-              }
-            }
-            if (secFee == null) {
-              secFee = otwSecondaryFeePaise(gQuote.deliveryFeePaise);
-            }
-          }
+          // Primary: 100% of its own normal fee.
+          // Secondary: 20% of its own normal Y→Z fee (simple, user-dictated).
+          const secFee = isPrim ? gQuote.deliveryFeePaise : otwSecondaryFeePaise(gQuote.deliveryFeePaise);
           groupsOut.push({
             restaurant_id: rid,
             is_primary: isPrim,
@@ -324,11 +299,10 @@ async function placeMultiGroupOrder(req, res) {
     // removed_off_route. Nothing is ever repriced.
     const removed_off_route = [];
     const validGroups = [{ ...groups[0] }];
-    const otw = ((await loadPricingConfig(client)).otw) || {};
-    const thresholdKm = Number(otw.detourThresholdKm) || 0.5;
-    const gkey = process.env.GOOGLE_MAPS_KEY;
-    // Detour per secondary (computed once, reused for the fee below)
-    const detourByGroup = {};
+    // Route validation: only secondaries within 500m (straight-line) of the
+    // primary→customer route segment are on-the-way. Beyond 500m — or missing
+    // coords — the secondary is REMOVED from the order and reported in
+    // removed_off_route. Nothing is ever repriced.
     for (let i = 1; i < groups.length; i++) {
       const g = groups[i];
       const r = restById[String(g.restaurant_id)];
@@ -336,20 +310,20 @@ async function placeMultiGroupOrder(req, res) {
         removed_off_route.push({ restaurant_id: g.restaurant_id, name: (r && r.name) || 'Restaurant', reason: 'unavailable' });
         continue;
       }
-      let detourKm = null;
+      let onRoute = false;
       if (primary.lat != null && primary.lng != null && address.lat != null && address.lng != null &&
           r.lat != null && r.lng != null) {
-        const x = { lat: Number(primary.lat), lng: Number(primary.lng) };
-        const y = { lat: Number(r.lat), lng: Number(r.lng) };
-        const z = { lat: Number(address.lat), lng: Number(address.lng) };
-        const rr = await trueDetourKm(x, y, z, gkey, null);
-        detourKm = rr.detourKm;
+        const distKm = pointToSegKm(
+          Number(r.lng), Number(r.lat),
+          Number(primary.lng), Number(primary.lat),
+          Number(address.lng), Number(address.lat)
+        );
+        onRoute = distKm <= 0.5;
       }
-      if (detourKm == null || detourKm > thresholdKm) {
+      if (!onRoute) {
         removed_off_route.push({ restaurant_id: g.restaurant_id, name: r.name || 'Restaurant', reason: 'not_on_the_way' });
         continue;
       }
-      detourByGroup[String(g.restaurant_id)] = detourKm;
       validGroups.push(g);
     }
 
@@ -446,17 +420,9 @@ async function placeMultiGroupOrder(req, res) {
         commissionPct: restaurant.commission_pct
       });
       const normalFee = quote.deliveryFeePaise;
-      let deliveryFee;
-      if (isPrimary) {
-        deliveryFee = normalFee;
-      } else {
-        const detourKm = detourByGroup[String(g.restaurant_id)];
-        const perKmRatePaise = Number((config.otw || {}).perKmRatePaise) || 1000;
-        deliveryFee = otwMarginalFeePaise(detourKm, perKmRatePaise);
-        if (deliveryFee == null) {
-          deliveryFee = otwSecondaryFeePaise(normalFee);
-        }
-      }
+      // Primary: 100% of its own normal fee.
+      // Secondary: 20% of its own normal Y→Z fee (simple, user-dictated).
+      const deliveryFee = isPrimary ? normalFee : otwSecondaryFeePaise(normalFee);
       const platformFee = isPrimary ? quote.platformFeePaise : 0;
       const tipPaise = isPrimary ? Math.max(0, Math.round(Number(tip_paise) || 0)) : 0;
       const finalTotal = (subtotal - discount) + deliveryFee + platformFee + tipPaise;
