@@ -409,3 +409,11 @@ CREATE TABLE IF NOT EXISTS student_applications (
     CHECK (status IN ('pending','approved','rejected')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS restaurant_photos (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  restaurant_id uuid NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  photo_url text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_restaurant_photos_rest ON restaurant_photos(restaurant_id);

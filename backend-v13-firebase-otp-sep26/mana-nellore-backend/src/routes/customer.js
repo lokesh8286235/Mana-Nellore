@@ -404,6 +404,22 @@ router.put(
   })
 );
 
+// ---- My refunds: orders with payment_status='refunded' ----
+router.get(
+  '/refunds',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT o.id AS order_id, o.total_paise AS amount_paise, o.payment_status AS status,
+              o.placed_at, o.cancel_reason, r.name AS restaurant_name
+       FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.customer_id = $1 AND o.payment_status = 'refunded'
+       ORDER BY o.placed_at DESC LIMIT 50`,
+      [req.user.id]
+    );
+    res.json({ refunds: rows });
+  })
+);
+
 // ---- My coupons: only codes actually issued to this customer, with live status ----
 router.get(
   '/coupons',

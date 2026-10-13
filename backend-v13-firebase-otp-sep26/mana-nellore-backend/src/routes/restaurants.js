@@ -473,6 +473,19 @@ router.get(
     const restaurant = rows[0];
     if (!restaurant) return res.status(404).json({ error: 'Restaurant not found' });
 
+    // Live rating stats from the ratings table (never the stale stored columns),
+    // so the detail page always matches the list page.
+    const liveRatings = await db.query(
+      `SELECT COUNT(*)::int AS count,
+              ROUND(AVG(food_rating)::numeric, 1)::float AS avg
+       FROM ratings
+       WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL`,
+      [restaurant.id]
+    );
+    const lr = liveRatings.rows[0] || {};
+    restaurant.rating_avg = lr.avg == null ? 0 : Number(lr.avg);
+    restaurant.rating_count = Number(lr.count) || 0;
+
     const cats = await db.query(
       'SELECT * FROM categories WHERE restaurant_id = $1 ORDER BY sort_order, name',
       [restaurant.id]

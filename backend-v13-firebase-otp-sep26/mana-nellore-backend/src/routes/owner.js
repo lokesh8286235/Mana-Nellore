@@ -652,4 +652,47 @@ router.get(
   })
 );
 
+
+// ---- Restaurant gallery photos ----
+router.get(
+  '/restaurants/:id/photos',
+  ah(async (req, res) => {
+    const id = await requireRestaurant(req, res);
+    if (!id) return;
+    if (id !== req.params.id) return res.status(403).json({ error: 'Not your restaurant' });
+    const { rows } = await db.query(
+      'SELECT id, photo_url, created_at FROM restaurant_photos WHERE restaurant_id = $1 ORDER BY created_at DESC',
+      [id]
+    );
+    res.json({ photos: rows });
+  })
+);
+
+router.post(
+  '/restaurants/:id/photos',
+  ah(async (req, res) => {
+    const id = await requireRestaurant(req, res);
+    if (!id) return;
+    if (id !== req.params.id) return res.status(403).json({ error: 'Not your restaurant' });
+    const { photo_url } = req.body;
+    if (!photo_url) return res.status(400).json({ error: 'photo_url is required' });
+    const { rows } = await db.query(
+      'INSERT INTO restaurant_photos (restaurant_id, photo_url) VALUES ($1, $2) RETURNING id, photo_url, created_at',
+      [id, photo_url]
+    );
+    res.status(201).json({ photo: rows[0] });
+  })
+);
+
+router.delete(
+  '/restaurants/:id/photos/:photoId',
+  ah(async (req, res) => {
+    const id = await requireRestaurant(req, res);
+    if (!id) return;
+    if (id !== req.params.id) return res.status(403).json({ error: 'Not your restaurant' });
+    await db.query('DELETE FROM restaurant_photos WHERE id = $1 AND restaurant_id = $2', [req.params.photoId, id]);
+    res.json({ ok: true });
+  })
+);
+
 module.exports = router;

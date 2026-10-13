@@ -973,11 +973,18 @@ router.post(
       );
     }
     if (food_rating) {
+      // Keep the stored columns in sync so nothing drifts from the live ratings table
       await db.query(
-        `UPDATE restaurants SET rating_avg = (
-           SELECT COALESCE(AVG(food_rating), 0) FROM ratings
-           WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
-         ) WHERE id = $1`,
+        `UPDATE restaurants SET
+           rating_avg = (
+             SELECT COALESCE(AVG(food_rating), 0) FROM ratings
+             WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
+           ),
+           rating_count = (
+             SELECT COUNT(*) FROM ratings
+             WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
+           )
+         WHERE id = $1`,
         [order.restaurant_id]
       );
     }
