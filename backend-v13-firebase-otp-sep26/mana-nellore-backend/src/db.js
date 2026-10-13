@@ -9,6 +9,8 @@ const pool = new Pool({
   max: 25,                    // headroom for 1000+ concurrent app users polling
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+  statement_timeout: 15000,   // kill runaway queries before they cascade
+  query_timeout: 15000,
 });
 
 function query(text, params) {

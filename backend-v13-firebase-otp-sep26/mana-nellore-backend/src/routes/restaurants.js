@@ -103,7 +103,10 @@ router.get(
         if (payload && payload.role === 'customer') customerId = payload.sub;
       } catch (e) { /* anonymous */ }
     }
-    const cacheKey = JSON.stringify({ q, veg, open, lat, lng, meal, sort, customerId });
+    // Grid-round coords to ~100m so the cache actually hits (raw GPS jitters every reading)
+    const glat = lat != null && Number.isFinite(Number(lat)) ? Math.round(Number(lat) * 1000) / 1000 : null;
+    const glng = lng != null && Number.isFinite(Number(lng)) ? Math.round(Number(lng) * 1000) / 1000 : null;
+    const cacheKey = JSON.stringify({ q, veg, open, lat: glat, lng: glng, meal, sort, customerId });
     const cached = cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
@@ -157,23 +160,29 @@ router.get(
     const dbOrder = sort === 'rating' ? 'ORDER BY r.rating_avg DESC, r.name ASC' : '';
     const { rows } = await db.query(
       `SELECT r.*,
-              (SELECT COUNT(*) FROM orders o
-               WHERE o.restaurant_id = r.id
-                 AND o.status IN ('placed','accepted','preparing','ready')) AS active_orders,
-              (SELECT ROUND(AVG(EXTRACT(EPOCH FROM (o.packed_at - o.placed_at)) / 60))
-               FROM orders o
-               WHERE o.restaurant_id = r.id AND o.packed_at IS NOT NULL
-                 AND o.placed_at > now() - interval '30 days') AS avg_pack_minutes,
-              (SELECT EXISTS (SELECT 1 FROM menu_items mi
-               WHERE mi.restaurant_id = r.id AND mi.veg = true AND mi.available = true)) AS has_veg,
-              (SELECT COUNT(*)::int FROM orders o
-               WHERE o.restaurant_id = r.id
-                 AND o.status NOT IN ('cancelled', 'rejected')
-                 AND o.placed_at > now() - interval '7 days') AS orders_7d,
-              (SELECT COUNT(*)::int FROM ratings rt
-               WHERE rt.ratee_type = 'restaurant' AND rt.ratee_id = r.id
-                 AND rt.food_rating IS NOT NULL) AS rating_n${scoreCols}
-       FROM restaurants r WHERE ${conditions.join(' AND ')} ${dbOrder}`,
+              COALESCE(ao.cnt, 0)::int AS active_orders,
+              COALESCE(ap.avg_min, 0)::int AS avg_pack_minutes,
+              COALESCE(hv.has_veg, false) AS has_veg,
+              COALESCE(o7.cnt, 0)::int AS orders_7d,
+              COALESCE(rn.cnt, 0)::int AS rating_n${scoreCols}
+       FROM restaurants r
+       LEFT JOIN (SELECT restaurant_id, COUNT(*) AS cnt FROM orders
+                  WHERE status IN ('placed','accepted','preparing','ready')
+                  GROUP BY restaurant_id) ao ON ao.restaurant_id = r.id
+       LEFT JOIN (SELECT restaurant_id, ROUND(AVG(EXTRACT(EPOCH FROM (packed_at - placed_at)) / 60)) AS avg_min
+                  FROM orders WHERE packed_at IS NOT NULL
+                  AND placed_at > now() - interval '30 days'
+                  GROUP BY restaurant_id) ap ON ap.restaurant_id = r.id
+       LEFT JOIN (SELECT DISTINCT restaurant_id, true AS has_veg FROM menu_items
+                  WHERE veg = true AND available = true) hv ON hv.restaurant_id = r.id
+       LEFT JOIN (SELECT restaurant_id, COUNT(*) AS cnt FROM orders
+                  WHERE status NOT IN ('cancelled', 'rejected')
+                  AND placed_at > now() - interval '7 days'
+                  GROUP BY restaurant_id) o7 ON o7.restaurant_id = r.id
+       LEFT JOIN (SELECT ratee_id, COUNT(*) AS cnt FROM ratings
+                  WHERE ratee_type = 'restaurant' AND food_rating IS NOT NULL
+                  GROUP BY ratee_id) rn ON rn.ratee_id = r.id
+       WHERE ${conditions.join(' AND ')} ${dbOrder}`,
       params
     );
 
@@ -466,30 +475,31 @@ router.get(
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
-    const { rows } = await db.query(
-      "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'",
-      [req.params.id]
-    );
-    const restaurant = rows[0];
+    // Parallelize independent queries: restaurant + live ratings + categories
+    const [restRes, liveRatings, catsRes] = await Promise.all([
+      db.query(
+        "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'",
+        [req.params.id]
+      ),
+      db.query(
+        `SELECT COUNT(*)::int AS count,
+                ROUND(AVG(food_rating)::numeric, 1)::float AS avg
+         FROM ratings
+         WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL`,
+        [req.params.id]
+      ),
+      db.query(
+        'SELECT * FROM categories WHERE restaurant_id = $1 ORDER BY sort_order, name',
+        [req.params.id]
+      ),
+    ]);
+    const restaurant = restRes.rows[0];
     if (!restaurant) return res.status(404).json({ error: 'Restaurant not found' });
-
-    // Live rating stats from the ratings table (never the stale stored columns),
-    // so the detail page always matches the list page.
-    const liveRatings = await db.query(
-      `SELECT COUNT(*)::int AS count,
-              ROUND(AVG(food_rating)::numeric, 1)::float AS avg
-       FROM ratings
-       WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL`,
-      [restaurant.id]
-    );
+    const cats = catsRes;
     const lr = liveRatings.rows[0] || {};
     restaurant.rating_avg = lr.avg == null ? 0 : Number(lr.avg);
     restaurant.rating_count = Number(lr.count) || 0;
 
-    const cats = await db.query(
-      'SELECT * FROM categories WHERE restaurant_id = $1 ORDER BY sort_order, name',
-      [restaurant.id]
-    );
     const meal = req.query.meal; // breakfast | lunch | dinner
     const itemParams = [restaurant.id];
     let mealCond = '';
@@ -552,8 +562,10 @@ router.get(
     if (Number.isFinite(dLat) && Number.isFinite(dLng) && restaurant.lat != null && restaurant.lng != null) {
       detailDist = Math.round(haversineKm(dLat, dLng, Number(restaurant.lat), Number(restaurant.lng)) * 10) / 10;
     }
+    // Strip PII/sensitive fields before sending to client
+    const { aadhar, gstin, owner_id, commission_pct, bank_account, ifsc, ...safeRestaurant } = restaurant;
     res.json({
-      restaurant: { ...restaurant, rating_avg: Number(restaurant.rating_avg), is_open: isOpenNow(restaurant),
+      restaurant: { ...safeRestaurant, rating_avg: Number(restaurant.rating_avg), is_open: isOpenNow(restaurant),
         verified: !!restaurant.verified, distance_km: detailDist },
       categories: cats.rows.map((c) => ({ ...c, items: byCat[c.id] || [] })),
       uncategorized: byCat.uncategorized || [],

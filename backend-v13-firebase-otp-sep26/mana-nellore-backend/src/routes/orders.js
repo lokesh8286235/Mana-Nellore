@@ -1092,16 +1092,27 @@ router.post(
       return res.status(409).json({ error: `Payment already ${order.payment_status}` });
     }
     const auth = Buffer.from(`${keyId}:${keySecret}`).toString('base64');
-    const rpRes = await fetch('https://api.razorpay.com/v1/orders', {
-      method: 'POST',
-      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        amount: order.total_paise,
-        currency: 'INR',
-        receipt: 'mn_' + order.id.slice(0, 24),
-        notes: { mana_order_id: order.id }
-      })
-    });
+    // 10s timeout — never hang checkout on gateway stall (receipt is idempotency key)
+    const rpCtrl = new AbortController();
+    const rpTimer = setTimeout(() => { try { rpCtrl.abort(); } catch (e) {} }, 10000);
+    let rpRes;
+    try {
+      rpRes = await fetch('https://api.razorpay.com/v1/orders', {
+        method: 'POST',
+        headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          amount: order.total_paise,
+          currency: 'INR',
+          receipt: 'mn_' + order.id.slice(0, 24),
+          notes: { mana_order_id: order.id }
+        }),
+        signal: rpCtrl.signal
+      });
+    } catch (e) {
+      clearTimeout(rpTimer);
+      return res.status(504).json({ error: 'Payment gateway timed out. Please try again.' });
+    }
+    clearTimeout(rpTimer);
     if (!rpRes.ok) {
       return res.status(502).json({ error: 'Payment gateway error. Please try again.' });
     }

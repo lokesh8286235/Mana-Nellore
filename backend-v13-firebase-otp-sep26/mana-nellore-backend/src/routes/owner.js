@@ -469,10 +469,21 @@ router.get(
       where += ` AND o.status = $${params.length}`;
     }
     const { rows } = await orderDetailQuery(where, params);
-    for (const o of rows) {
-      const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [o.id]);
-      o.items = items.rows;
-      sanitizeOwnerOrder(o);
+    // Batch: single query for all order items instead of N+1
+    if (rows.length) {
+      const orderIds = rows.map((o) => o.id);
+      const { rows: allItems } = await db.query(
+        'SELECT * FROM order_items WHERE order_id = ANY($1)',
+        [orderIds]
+      );
+      const byOrder = {};
+      for (const it of allItems) {
+        (byOrder[it.order_id] = byOrder[it.order_id] || []).push(it);
+      }
+      for (const o of rows) {
+        o.items = byOrder[o.id] || [];
+        sanitizeOwnerOrder(o);
+      }
     }
     res.json({ orders: rows });
   })

@@ -314,6 +314,16 @@ CREATE TABLE IF NOT EXISTS dish_ratings (
 CREATE INDEX IF NOT EXISTS idx_dish_ratings_dish ON dish_ratings(dish_id);
 CREATE INDEX IF NOT EXISTS idx_dish_ratings_order ON dish_ratings(order_id);
 
+-- Rider declined offers (prevents re-offering declined orders)
+CREATE TABLE IF NOT EXISTS rider_declines (
+  rider_id uuid NOT NULL,
+  order_id uuid NOT NULL,
+  reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (rider_id, order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rider_declines_order ON rider_declines(order_id, rider_id);
+
 -- Customer food-photo reviews
 ALTER TABLE ratings ADD COLUMN IF NOT EXISTS photo_url text;
 
@@ -417,3 +427,12 @@ CREATE TABLE IF NOT EXISTS restaurant_photos (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_restaurant_photos_rest ON restaurant_photos(restaurant_id);
+
+-- Performance indexes (hot query paths)
+CREATE INDEX IF NOT EXISTS idx_orders_placed_at ON orders(placed_at);
+CREATE INDEX IF NOT EXISTS idx_ratings_ratee ON ratings(ratee_type, ratee_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_categories_restaurant ON categories(restaurant_id);
+CREATE INDEX IF NOT EXISTS idx_cust_groups_item ON customization_groups(menu_item_id);
+CREATE INDEX IF NOT EXISTS idx_cust_opts_group ON customization_options(group_id);
+CREATE INDEX IF NOT EXISTS idx_orders_trip ON orders(trip_id);

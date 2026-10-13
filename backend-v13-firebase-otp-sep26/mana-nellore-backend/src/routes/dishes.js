@@ -5,6 +5,90 @@ const db = require('../db');
 const { authenticate, ah } = require('../middleware/auth');
 
 const router = express.Router();
+
+// Short in-memory cache: category pages are hit repeatedly.
+const byCatCache = new Map();
+const BYCAT_CACHE_MS = 60 * 1000;
+
+// GET /api/dishes/by-category?q=<query>&lat=&lng= — PUBLIC (category browsing is open).
+// All dishes matching a category in ONE query. Replaces the frontend's N+1
+// per-restaurant menu fetch on category pages (was 8+ sequential full-menu
+// fetches at ~700ms each).
+// Match: menu category name ILIKE %q% OR dish name ILIKE %q% — whole phrase,
+// or all words when q has multiple words (same matcher as the frontend).
+router.get(
+  '/by-category',
+  ah(async (req, res) => {
+    const rawQ = String(req.query.q || '').toLowerCase().trim();
+    if (!rawQ) return res.json({ dishes: [] });
+    const words = rawQ.split(/[^a-z0-9]+/).filter((w) => w.length > 1);
+
+    const cacheKey = 'bc|' + rawQ;
+    const hit = byCatCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < BYCAT_CACHE_MS) {
+      return res.json({ dishes: hit.dishes, cached: true });
+    }
+    if (hit) byCatCache.delete(cacheKey);
+
+    // Escape LIKE wildcards in user input
+    const escLike = (s) => s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const params = [];
+    const likeCol = (col, val) => {
+      params.push('%' + escLike(val) + '%');
+      return `LOWER(${col}) LIKE $${params.length} ESCAPE '\\'`;
+    };
+    const conds = [];
+    // Whole-phrase match on category name or dish name
+    conds.push(`(${likeCol('c.name', rawQ)} OR ${likeCol('mi.name', rawQ)})`);
+    // All-words match: all words in the category name, or all in the dish name
+    if (words.length > 1) {
+      const catWords = words.map((w) => likeCol('c.name', w)).join(' AND ');
+      const dishWords = words.map((w) => likeCol('mi.name', w)).join(' AND ');
+      conds.push(`((${catWords}) OR (${dishWords}))`);
+    }
+
+    const { rows } = await db.query(
+      `SELECT mi.id, mi.name, mi.description, mi.image_url, mi.price_paise, mi.veg,
+              mi.restaurant_id,
+              COALESCE(dr.avg_rating, 0)::float AS rating_avg,
+              COALESCE(dr.rating_count, 0)::int AS rating_count,
+              r.name AS restaurant_name,
+              r.is_open AS restaurant_open,
+              COALESCE(r.rating_avg, 0)::float AS restaurant_rating
+       FROM menu_items mi
+       JOIN restaurants r ON r.id = mi.restaurant_id
+       LEFT JOIN categories c ON c.id = mi.category_id
+       LEFT JOIN (
+         SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
+         FROM dish_ratings GROUP BY dish_id
+       ) dr ON dr.dish_id = mi.id
+       WHERE mi.available = true
+         AND r.status = 'approved'
+         AND (${conds.join(' OR ')})
+       ORDER BY r.rating_avg DESC NULLS LAST, r.name ASC, mi.sort_order ASC, mi.name ASC
+       LIMIT 300`,
+      params
+    );
+    const dishes = rows.map((d) => ({
+      id: d.id,
+      name: d.name,
+      description: d.description,
+      image_url: d.image_url,
+      price_paise: d.price_paise,
+      veg: !!d.veg,
+      rating_avg: d.rating_avg,
+      rating_count: d.rating_count,
+      restaurant_id: d.restaurant_id,
+      restaurant_name: d.restaurant_name,
+      restaurant_open: d.restaurant_open !== false,
+      restaurant_rating: d.restaurant_rating,
+    }));
+    if (byCatCache.size > 50) byCatCache.clear();
+    byCatCache.set(cacheKey, { at: Date.now(), dishes });
+    res.json({ dishes });
+  })
+);
+
 router.use(authenticate);
 
 // POST /api/dishes/:id/rate { rating: 1-5, order_id }
