@@ -163,12 +163,19 @@ CREATE TABLE IF NOT EXISTS orders (
   no_cutlery boolean NOT NULL DEFAULT false,
   tip_paise int NOT NULL DEFAULT 0,
   recipient_name text,
-  recipient_phone text
+  recipient_phone text,
+  -- Proximity dispatch (nearest-rider offer cascade)
+  offered_to_rider_id uuid REFERENCES riders(id) ON DELETE SET NULL,
+  offer_expires_at timestamptz,
+  offer_history uuid[] NOT NULL DEFAULT '{}',
+  dispatch_attempted_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_restaurant ON orders(restaurant_id);
 CREATE INDEX IF NOT EXISTS idx_orders_rider ON orders(rider_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_offer_sweep ON orders (offer_expires_at) WHERE rider_id IS NULL AND status = 'ready' AND offered_to_rider_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_dispatch_pending ON orders (dispatch_attempted_at) WHERE rider_id IS NULL AND status = 'ready' AND offered_to_rider_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS order_items (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

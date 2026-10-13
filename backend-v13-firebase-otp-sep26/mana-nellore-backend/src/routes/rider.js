@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, riderPayoutPaise } = require('../lib/pricing');
+const { dispatchOrder, sweepExpiredOffers, dispatchPendingOrders, clearRiderOffer } = require('../lib/dispatch');
 
 const router = express.Router();
 router.use(authenticate, requireRole('rider'));
@@ -142,6 +143,10 @@ router.put(
       'UPDATE riders SET online = $1 WHERE id = $2 RETURNING online',
       [!!req.body.online, rider.id]
     );
+    // Just came online: immediately offer any queued orders (no throttle wait).
+    if (rows[0].online) {
+      try { await dispatchPendingOrders(true); } catch (e) { console.error('[dispatch] online dispatch failed', e.message); }
+    }
     res.json({ online: rows[0].online });
   })
 );
@@ -205,13 +210,18 @@ async function deliveryDetail(orderId, riderId) {
 }
 
 // GET /api/rider/deliveries/available — ready orders with no rider yet.
-// Sorted nearest-first by rider-to-restaurant distance when the rider's
-// location is known (proximity dispatch); oldest first as fallback.
+// Proximity dispatch: each order is offered to ONE nearest rider at a time
+// (30s window, then cascades). This endpoint sweeps expired offers and
+// dispatches queued orders, then shows this rider only their own offers
+// (plus unassigned ones as a liveness fallback).
 router.get(
   '/deliveries/available',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
+    // Cascade timed-out offers, then offer anything still queued.
+    try { await sweepExpiredOffers(); } catch (e) { console.error('[dispatch] sweep failed', e.message); }
+    try { await dispatchPendingOrders(false); } catch (e) { console.error('[dispatch] pending failed', e.message); }
     const { rows } = await db.query(
       `SELECT o.id, o.total_paise, o.placed_at, o.payment_method, o.trip_id,
               r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
@@ -225,6 +235,7 @@ router.get(
            SELECT 1 FROM rider_declines rd
            WHERE rd.order_id = o.id AND rd.rider_id = $1
          )
+         AND (o.offered_to_rider_id = $1 OR o.offered_to_rider_id IS NULL OR o.offer_expires_at < now())
        ORDER BY o.placed_at ASC LIMIT 20`,
       [rider.id]
     );
@@ -297,7 +308,9 @@ router.get(
   })
 );
 
-// POST /api/rider/deliveries/:id/decline — rider declines, never shown again to this rider
+// POST /api/rider/deliveries/:id/decline — rider declines, never shown again to this rider.
+// Clears their active offer (and trip siblings offered together) and cascades
+// the order to the next nearest rider.
 router.post(
   '/deliveries/:id/decline',
   ah(async (req, res) => {
@@ -308,6 +321,9 @@ router.post(
        ON CONFLICT (rider_id, order_id) DO NOTHING`,
       [rider.id, req.params.id, req.body.reason || null]
     );
+    try { await clearRiderOffer(req.params.id, rider.id); } catch (e) { console.error('[dispatch] clear offer failed', e.message); }
+    // Cascade to the next nearest eligible rider.
+    try { await dispatchOrder(req.params.id); } catch (e) { console.error('[dispatch] cascade failed', e.message); }
     res.json({ ok: true });
   })
 );
@@ -923,6 +939,16 @@ router.post(
     if (Number(active.rows[0].n) >= 3) {
       return res.status(409).json({ error: 'You already have 3 active deliveries — complete one first' });
     }
+    // Proximity dispatch: only the designated offeree (or anyone, if the
+    // order is unassigned / the offer expired) may accept.
+    const offerOk = await db.query(
+      `SELECT id FROM orders WHERE id = $1 AND status = 'ready' AND rider_id IS NULL
+       AND (offered_to_rider_id IS NULL OR offered_to_rider_id = $2 OR offer_expires_at < now())`,
+      [req.params.id, rider.id]
+    );
+    if (!offerOk.rows.length) {
+      return res.status(409).json({ error: 'Delivery no longer available' });
+    }
     // Atomic trip accept: lock the entire trip in ONE query (prevents split-trip race)
     // First, get the trip_id for this order
     const tripRes = await db.query('SELECT trip_id FROM orders WHERE id = $1', [req.params.id]);
@@ -970,6 +996,20 @@ router.post(
     await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
       JSON.stringify(timeline), order.id
     ]);
+    // Assigned: clear any dispatch offer state on the orders we just took.
+    if (tripId) {
+      await db.query(
+        `UPDATE orders SET offered_to_rider_id = NULL, offer_expires_at = NULL, offer_history = '{}'
+         WHERE trip_id = $1 AND rider_id = $2`,
+        [tripId, rider.id]
+      );
+    } else {
+      await db.query(
+        `UPDATE orders SET offered_to_rider_id = NULL, offer_expires_at = NULL, offer_history = '{}'
+         WHERE id = $1`,
+        [order.id]
+      );
+    }
     await notify(order.customer_id, 'Rider assigned', 'Your rider is on the way to the restaurant.');
     res.json({ ok: true, trip_id: order.trip_id || null });
   })
@@ -1006,6 +1046,8 @@ router.post(
     );
     await notify(order.customer_id, 'Finding you another rider 🛵',
       'Your rider had to step away — we\u2019re assigning a new one right now.');
+    // Back to the pool: re-dispatch to the nearest available rider.
+    try { await dispatchOrder(order.id); } catch (e) { console.error('[dispatch] re-dispatch failed', e.message); }
     res.json({ ok: true });
   })
 );

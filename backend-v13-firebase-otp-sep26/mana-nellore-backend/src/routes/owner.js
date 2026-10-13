@@ -7,6 +7,8 @@ const { authenticate, requireRole, ah } = require('../middleware/auth');
 const router = express.Router();
 router.use(authenticate, requireRole('restaurant_owner'));
 
+const { dispatchOrder } = require('../lib/dispatch');
+
 async function ownRestaurantId(userId) {
   const { rows } = await db.query('SELECT id FROM restaurants WHERE owner_id = $1', [userId]);
   return rows[0] ? rows[0].id : null;
@@ -85,6 +87,10 @@ async function transition(orderId, status, by) {
         [orderId, restaurantId, acceptedAt, prepMinutes]
       );
     } catch (e) { /* prep logging must never break the order flow */ }
+  }
+  // Freshly ready delivery order: offer it to the nearest available rider.
+  if (status === 'ready') {
+    try { await dispatchOrder(orderId); } catch (e) { console.error('[dispatch] ready dispatch failed', e.message); }
   }
 }
 
