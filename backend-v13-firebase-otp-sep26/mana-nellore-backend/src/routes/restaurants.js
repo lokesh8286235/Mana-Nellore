@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, deliveryFeePaise } = require('../lib/pricing');
+const { trueDetourKm, otwMarginalFeePaise } = require('../lib/otw');
 
 const router = express.Router();
 
@@ -347,13 +348,24 @@ router.get(
 
 
 // GET /api/restaurants/on-the-way?from_lat=&from_lng=&to_lat=&to_lng=&primary_id=
-// Returns approved restaurants within 500m of the straight line from the
-// primary restaurant (X) to the delivery address (Z), sorted by position along
-// the route. Restaurants beyond 500m are never listed. Used for the
-// "On your way" multi-restaurant checkout.
+// Marginal-cost on-the-way discovery (user-dictated 2026-10-13).
+// For order from restaurant X, home at Z, candidate middle restaurant Y:
+//
+//   true_detour_km = road_distance(X→Y→Z) − road_distance(X→Z)
+//
+// Only restaurants with true_detour_km ≤ 0.5 are listed. Fee for each:
+//   20% × (true_detour_km × per_km_rate)
+//
+// Performance (< 1s total):
+//   1. Straight-line pre-filter to top 3 candidates (no API)
+//   2. Haversine shortcut: <100m straight-line → skip API (×1.3 road factor)
+//   3. Parallel Routes API calls (D0 + all D1 at once)
+//   4. 800ms hard timeout → haversine fallback
+// Falls back to straight-line results if the API is unavailable.
 router.get(
   '/on-the-way',
   ah(async (req, res) => {
+    const t0 = Date.now();
     const fromLat = Number(req.query.from_lat);
     const fromLng = Number(req.query.from_lng);
     const toLat = Number(req.query.to_lat);
@@ -362,6 +374,13 @@ router.get(
       return res.status(400).json({ error: 'from_lat, from_lng, to_lat, to_lng are required' });
     }
     const primaryId = req.query.primary_id ? String(req.query.primary_id) : null;
+
+    const config = await loadPricingConfig(db);
+    const otw = (config && config.otw) || {};
+    const prefilterKm = Number(otw.prefilterKm) || 1.0;
+    const thresholdKm = Number(otw.detourThresholdKm) || 0.5;
+    const perKmRatePaise = Number(otw.perKmRatePaise) || 1000;
+    const gkey = process.env.GOOGLE_MAPS_KEY;
 
     // Equirectangular projection (good enough for <15km): x = lng*cos(lat), y = lat
     const meanLat = ((fromLat + toLat) / 2) * Math.PI / 180;
@@ -385,26 +404,56 @@ router.get(
        FROM restaurants
        WHERE status = 'approved' AND lat IS NOT NULL AND lng IS NOT NULL`
     );
-    const out = [];
+
+    // Step 1: cheap straight-line pre-filter, top 3 only
+    const prefiltered = [];
     for (const r of rows) {
       if (primaryId && String(r.id) === primaryId) continue;
       const pr = proj(Number(r.lng) * kx, Number(r.lat) * ky);
-      if (pr.dist <= 0.5) {
-        out.push({
-          id: r.id,
-          name: r.name,
-          photo_url: r.image_url,
-          image_url: r.image_url,
-          is_open: !!r.is_open,
-          rating: r.rating,
-          
-          route_dist_km: Math.round(pr.dist * 100) / 100,
-          route_pos: Math.round(pr.t * 1000) / 1000
-        });
+      if (pr.dist <= prefilterKm) {
+        prefiltered.push({ r, straightKm: pr.dist, routePos: pr.t });
       }
     }
-    out.sort((a, b) => a.route_pos - b.route_pos);
-    res.json({ restaurants: out.slice(0, 20) });
+    prefiltered.sort((a, b) => a.straightKm - b.straightKm);
+    const top3 = prefiltered.slice(0, 3);
+
+    // Step 2: true road detour for the top 3 (parallel, <800ms, haversine shortcut)
+    const x = { lat: fromLat, lng: fromLng };
+    const z = { lat: toLat, lng: toLng };
+    const { batchDetourKm } = require('../lib/otw');
+    const { results } = await batchDetourKm(
+      x, z,
+      top3.map((c) => ({ y: { lat: Number(c.r.lat), lng: Number(c.r.lng) }, straightKm: c.straightKm })),
+      gkey
+    );
+
+    // Step 3: keep only true_detour ≤ threshold, compute marginal fee
+    const out = [];
+    for (let i = 0; i < top3.length; i++) {
+      const detourKm = results[i].detourKm;
+      if (detourKm == null || detourKm > thresholdKm) continue;
+      const feePaise = otwMarginalFeePaise(detourKm, perKmRatePaise);
+      const c = top3[i];
+      out.push({
+        id: c.r.id,
+        name: c.r.name,
+        photo_url: c.r.image_url,
+        image_url: c.r.image_url,
+        is_open: !!c.r.is_open,
+        rating: c.r.rating,
+        route_dist_km: Math.round(c.straightKm * 100) / 100,
+        route_pos: Math.round(c.routePos * 1000) / 1000,
+        // Marginal-cost pricing fields
+        true_detour_km: Math.round(detourKm * 1000) / 1000,
+        detour_via_api: results[i].viaApi,
+        delivery_fee_paise: feePaise,
+      });
+    }
+    out.sort((a, b) => a.true_detour_km - b.true_detour_km);
+
+    const elapsedMs = Date.now() - t0;
+    console.log(`[otw] discovery: ${top3.length} candidates, ${out.length} on-the-way, ${elapsedMs}ms`);
+    res.json({ restaurants: out.slice(0, 20), _elapsed_ms: elapsedMs });
   })
 );
 

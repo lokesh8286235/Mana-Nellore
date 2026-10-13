@@ -40,6 +40,21 @@ async function loadPricingConfig(db) {
       (m.free_delivery_rules && m.free_delivery_rules.rules) || [],
     // Honest ETA estimate shown to customers ("Usually ~X min") — NOT a delivery promise.
     etaMinutes: Number(m.eta_minutes != null ? m.eta_minutes : 30),
+    // On-the-way marginal-cost pricing (user-dictated 2026-10-13).
+    // Only restaurants within otwDetourThresholdKm of TRUE road detour are
+    // shown; fee = 20% × detour × otwPerKmRatePaise. Prefilter uses
+    // straight-line distance to limit Routes API calls.
+    otw: {
+      detourThresholdKm: Number(m.otw_detour_threshold_km != null ? m.otw_detour_threshold_km : 0.5),
+      prefilterKm: Number(m.otw_prefilter_km != null ? m.otw_prefilter_km : 1.0),
+      // Per-km rate for the detour: first delivery tier rate (short distances
+      // always fall in tier 1). Falls back to 1000 paise (Rs 10/km).
+      perKmRatePaise: Number(
+        m.otw_per_km_rate_paise != null
+          ? m.otw_per_km_rate_paise
+          : ((m.delivery_tiers && m.delivery_tiers.tiers && m.delivery_tiers.tiers[0] && m.delivery_tiers.tiers[0].rate_paise_per_km) || 1000)
+      ),
+    },
   };
 }
 
