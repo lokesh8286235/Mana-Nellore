@@ -168,7 +168,9 @@ router.post(
 
     // Multi-restaurant on-the-way quote: group items by restaurant_id (item-level).
     // primary = cart.restaurant_id (100% fee).
-    // Secondaries: flat on-the-way fee (Rs 5 default, config-driven).
+    // Secondaries within 500m of the primary→customer route: flat on-the-way
+    // fee (Rs 5 default, config-driven). Secondaries beyond 500m stay in the
+    // order but pay their FULL normal delivery fee (never removed).
     let groupsOut = null;
     if (!dineIn) {
       const byRest = {};
@@ -185,6 +187,7 @@ router.post(
           [ordered]
         );
         const rMap = Object.fromEntries(rAll.rows.map((r) => [String(r.id), r]));
+        const pR = rMap[primaryRid];
         groupsOut = [];
         for (let gi = 0; gi < ordered.length; gi++) {
           const rid = ordered[gi];
@@ -210,12 +213,28 @@ router.post(
             commissionPct: rr.commission_pct
           });
           const isPrim = gi === 0;
+          // On-the-way check: secondary within 500m of the primary→customer
+          // route segment gets the flat fee; beyond 500m it stays at FULL fee.
+          let onTheWay = isPrim;
+          if (!isPrim && pR && pR.lat != null && pR.lng != null &&
+              address.lat != null && address.lng != null &&
+              rr.lat != null && rr.lng != null) {
+            onTheWay = pointToSegKm(
+              Number(rr.lng), Number(rr.lat),
+              Number(pR.lng), Number(pR.lat),
+              Number(address.lng), Number(address.lat)
+            ) <= 0.5;
+          }
           // Primary: 100% of its own normal fee.
-          // Secondary: flat on-the-way fee (Rs 5 default, config-driven).
-          const secFee = isPrim ? gQuote.deliveryFeePaise : otwSecondaryFeePaise(gQuote.deliveryFeePaise, config);
+          // Secondary on-the-way: flat fee (Rs 5 default, config-driven).
+          // Secondary off-route: FULL normal fee (kept, not removed).
+          const secFee = isPrim ? gQuote.deliveryFeePaise
+            : onTheWay ? otwSecondaryFeePaise(gQuote.deliveryFeePaise, config)
+            : gQuote.deliveryFeePaise;
           groupsOut.push({
             restaurant_id: rid,
             is_primary: isPrim,
+            on_the_way: onTheWay,
             subtotal_paise: gSub,
             normal_fee_paise: gQuote.deliveryFeePaise,
             delivery_fee_paise: secFee,
@@ -257,8 +276,9 @@ router.post(
 
 // POST /api/orders with groups[] — on-the-way multi-restaurant checkout.
 // groups[0] = primary (100% of its own normal delivery fee + platform fee).
-// groups[1..] = secondaries (flat on-the-way fee each, platform fee 0).
-// Off-route secondaries are REMOVED (never repriced) and reported in removed_off_route.
+// groups[1..] = secondaries: within 500m of route = flat on-the-way fee each
+// (platform fee 0); beyond 500m = FULL normal fee (kept, not removed).
+// Unavailable/closed restaurants are reported in removed_off_route.
 async function placeMultiGroupOrder(req, res) {
   const { groups, address_id, coupon_code, payment_method,
           delivery_note, no_cutlery, tip_paise,
@@ -291,16 +311,16 @@ async function placeMultiGroupOrder(req, res) {
 
     // Route validation: marginal-cost on-the-way.
     // For each secondary Y: true_detour = road(X→Y→Z) − road(X→Z).
-    // Y stays only if true_detour ≤ threshold (default 0.5km).
+    // Y gets the flat on-the-way fee only if true_detour ≤ threshold (default 0.5km).
     // Beyond threshold — or missing coords, or API failure with no
-    // haversine fallback — the secondary is REMOVED and reported in
-    // removed_off_route. Nothing is ever repriced.
+    // haversine fallback — the secondary STAYS in the order but pays its FULL
+    // normal delivery fee (never removed, never repriced to the flat fee).
     const removed_off_route = [];
     const validGroups = [{ ...groups[0] }];
+    const offRouteSet = new Set();
     // Route validation: only secondaries within 500m (straight-line) of the
-    // primary→customer route segment are on-the-way. Beyond 500m — or missing
-    // coords — the secondary is REMOVED from the order and reported in
-    // removed_off_route. Nothing is ever repriced.
+    // primary→customer route segment get the flat on-the-way fee. Beyond 500m
+    // — or missing coords — the secondary stays at FULL normal fee.
     for (let i = 1; i < groups.length; i++) {
       const g = groups[i];
       const r = restById[String(g.restaurant_id)];
@@ -319,8 +339,7 @@ async function placeMultiGroupOrder(req, res) {
         onRoute = distKm <= 0.5;
       }
       if (!onRoute) {
-        removed_off_route.push({ restaurant_id: g.restaurant_id, name: r.name || 'Restaurant', reason: 'not_on_the_way' });
-        continue;
+        offRouteSet.add(String(g.restaurant_id));
       }
       validGroups.push(g);
     }
@@ -417,9 +436,13 @@ async function placeMultiGroupOrder(req, res) {
         commissionPct: restaurant.commission_pct
       });
       const normalFee = quote.deliveryFeePaise;
+      const isOffRoute = !isPrimary && offRouteSet.has(String(g.restaurant_id));
       // Primary: 100% of its own normal fee.
-      // Secondary: flat on-the-way fee (Rs 5 default, config-driven).
-      const deliveryFee = isPrimary ? normalFee : otwSecondaryFeePaise(normalFee, config);
+      // Secondary on-the-way: flat fee (Rs 5 default, config-driven).
+      // Secondary off-route: full normal fee (kept, not removed).
+      const deliveryFee = isPrimary ? normalFee
+        : isOffRoute ? normalFee
+        : otwSecondaryFeePaise(normalFee, config);
       const platformFee = isPrimary ? quote.platformFeePaise : 0;
       const tipPaise = isPrimary ? Math.max(0, Math.round(Number(tip_paise) || 0)) : 0;
       const finalTotal = (subtotal - discount) + deliveryFee + platformFee + tipPaise;

@@ -2,7 +2,7 @@
 //
 // Formula:
 //   X→Z (primary):   100% of normal delivery fee for X→Z distance
-//   Y→Z (secondary): 20% of the normal delivery fee for Y→Z distance
+//   Y→Z (secondary): flat ₹5 (config otw_flat_fee_paise, default 500 paise) — user 2026-10-13
 //
 // "On the way" = restaurant within 500m (straight-line) of the X→Z route
 // segment. No detour calculations, no Routes API calls for pricing.
