@@ -39,6 +39,17 @@ async function loadPricingConfig(db) {
       per_km_paise: 800,          // Rs 8/km beyond base
       per_intermediate_stop_paise: 500  // Rs 5 per intermediate restaurant
     },
+    // Customer delivery fee with free-km tiers (user 2026-10-15, FINAL)
+    customerFee: m.customer_fee || {
+      base_paise: 2000,  // Rs 20 for first 2km (below Rs 501)
+      base_km: 2,
+      per_km_paise: 800,  // Rs 8/km
+      tiers: [
+        { min_order_paise: 50100, free_km: 3 },   // Rs 501+: 3km free
+        { min_order_paise: 90100, free_km: 5 },   // Rs 901+: 5km free
+        { min_order_paise: 130100, free_km: 8 }   // Rs 1301+: 8km free
+      ]
+    },
     platformFeePaise: Number(m.platform_fee_paise != null ? m.platform_fee_paise : 800),
     defaultCommissionPct: Number(
       m.default_commission_pct != null ? m.default_commission_pct : 12
@@ -92,6 +103,53 @@ function riderPayoutPaise(cfg, distanceKm) {
     baseKm * Number(cfg.slab3_base_rate_paise_per_km) +
       (d - baseKm) * Number(cfg.slab3_extra_rate_paise_per_km)
   );
+}
+
+// Customer delivery fee with free-km tiers (user 2026-10-15, FINAL).
+// Below Rs 501: Rs 20 base (first 2km) + Rs 8/km beyond
+// Rs 501+: first 3km free, Rs 8/km after (no base fee)
+// Rs 901+: first 5km free, Rs 8/km after
+// Rs 1301+: first 8km free, Rs 8/km after
+// Config: customerFee { base_paise, base_km, per_km_paise, tiers: [{min_order_paise, free_km}] }
+// Returns { fee_paise, free_km, next_tier } where next_tier helps the upsell nudge.
+function customerDeliveryFeePaise(cfg, distanceKm, orderValuePaise) {
+  const km = Number(distanceKm) || 0;
+  const orderPaise = Number(orderValuePaise) || 0;
+  const basePaise = Number(cfg.base_paise);
+  const baseKm = Number(cfg.base_km);
+  const perKmPaise = Number(cfg.per_km_paise);
+  const tiers = Array.isArray(cfg.tiers) ? cfg.tiers : [];
+
+  // Find the highest tier the order qualifies for
+  let freeKm = 0;
+  let nextTier = null;
+  const sorted = tiers.slice().sort((a, b) => Number(a.min_order_paise) - Number(b.min_order_paise));
+  for (const t of sorted) {
+    if (orderPaise >= Number(t.min_order_paise)) {
+      freeKm = Number(t.free_km);
+    } else if (!nextTier) {
+      nextTier = t;
+    }
+  }
+
+  let fee;
+  if (freeKm > 0) {
+    // Tier qualified: free km, then per-km rate (no base fee)
+    fee = Math.round(Math.max(0, km - freeKm) * perKmPaise);
+  } else {
+    // Below first tier: base fee covers first base_km, then per-km
+    fee = basePaise + Math.round(Math.max(0, km - baseKm) * perKmPaise);
+  }
+
+  return {
+    fee_paise: fee,
+    free_km: freeKm,
+    next_tier: nextTier ? {
+      min_order_paise: Number(nextTier.min_order_paise),
+      free_km: Number(nextTier.free_km),
+      amount_needed_paise: Math.max(0, Number(nextTier.min_order_paise) - orderPaise)
+    } : null
+  };
 }
 
 // Trip-based rider payout (user 2026-10-15, FINAL).
@@ -163,6 +221,7 @@ module.exports = {
   haversineKm,
   loadPricingConfig,
   deliveryFeePaise,
+  customerDeliveryFeePaise,
   riderPayoutPaise,
   tripPayoutPaise,
   otwSecondaryFeePaise,
