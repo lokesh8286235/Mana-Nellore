@@ -4,7 +4,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
-const { haversineKm, loadPricingConfig, computeQuote, otwSecondaryFeePaise } = require('../lib/pricing');
+const { haversineKm, loadPricingConfig, computeQuote, otwSecondaryFeePaise, tripPayoutPaise } = require('../lib/pricing');
 const { pointToSegKm } = require('../lib/otw');
 
 const router = express.Router();
@@ -460,16 +460,16 @@ async function placeMultiGroupOrder(req, res) {
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash, delivery_otp_plain, trip_id)
+            order_number, delivery_otp_hash, delivery_otp_plain, trip_id, is_primary)
          VALUES ($1,$2,$3,'placed','delivery',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17::jsonb,
-                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22, $23)
+                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22, $23, $24)
          RETURNING *`,
         [req.user.id, restaurant.id, address_id,
          subtotal, discount, deliveryFee, platformFee,
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, tripId]
+         orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, tripId, isPrimary]
       );
       const order = oRes.rows[0];
       for (const s of snapshots) {
@@ -495,6 +495,60 @@ async function placeMultiGroupOrder(req, res) {
         await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
           `Delivery order worth Rs ${(finalTotal / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
       }
+    }
+
+    // Trip-based rider payout (user 2026-10-15): calculate once per trip, store on all orders
+    try {
+      const tripRestaurants = [];
+      for (const o of orders) {
+        const rid = String(o.order.restaurant_id);
+        const r = restById[rid];
+        if (r && r.lat != null && r.lng != null) {
+          tripRestaurants.push({
+            id: rid,
+            lat: Number(r.lat),
+            lng: Number(r.lng),
+            isPrimary: !!o.is_primary
+          });
+        }
+      }
+      // Primary first, then secondaries nearest-first from primary
+      const primary = tripRestaurants.find(r => r.isPrimary) || tripRestaurants[0];
+      const secondaries = tripRestaurants.filter(r => r !== primary);
+      if (primary) {
+        secondaries.sort((a, b) => {
+          const da = haversineKm(primary.lat, primary.lng, a.lat, a.lng);
+          const db = haversineKm(primary.lat, primary.lng, b.lat, b.lng);
+          return da - db;
+        });
+      }
+      // Build route: X -> Y1 -> Y2 -> ... -> Z (customer)
+      const route = primary ? [primary, ...secondaries] : [];
+      let totalKm = 0;
+      if (address && address.lat != null && address.lng != null && route.length > 0) {
+        let prevLat = route[0].lat, prevLng = route[0].lng;
+        // X -> Y1 -> Y2 ... (between restaurants)
+        for (let i = 1; i < route.length; i++) {
+          totalKm += haversineKm(prevLat, prevLng, route[i].lat, route[i].lng);
+          prevLat = route[i].lat; prevLng = route[i].lng;
+        }
+        // Last restaurant -> customer
+        totalKm += haversineKm(prevLat, prevLng, Number(address.lat), Number(address.lng));
+      }
+      // Intermediate stops = secondaries count (not primary, not delivery)
+      const intermediateStops = secondaries.length;
+      const payout = tripPayoutPaise(config.tripPayout, totalKm, intermediateStops);
+      // Store on all orders in the trip
+      await client.query(
+        `UPDATE orders SET trip_payout_paise = $1, trip_distance_km = $2,
+         trip_intermediate_stops = $3, trip_payout_breakdown = $4::jsonb
+         WHERE trip_id = $5`,
+        [payout.payout_paise, Math.round(totalKm * 100) / 100, intermediateStops,
+         JSON.stringify(payout.breakdown), tripId]
+      );
+    } catch (e) {
+      console.error('[trip-payout] calculation failed:', e.message);
+      // Non-fatal: orders are created, payout can be backfilled
     }
 
     await client.query('COMMIT');

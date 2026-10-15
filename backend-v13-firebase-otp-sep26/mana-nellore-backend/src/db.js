@@ -192,6 +192,15 @@ async function migrate() {
   )`);
   await q('CREATE INDEX IF NOT EXISTS idx_coupon_issuances_user ON coupon_issuances(user_id)');
 
+
+  // Trip-based rider payout (user 2026-10-15): is_primary + trip payout fields
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_primary BOOLEAN DEFAULT FALSE');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS trip_payout_paise INTEGER');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS trip_distance_km NUMERIC(8,2)');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS trip_intermediate_stops INTEGER DEFAULT 0');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS trip_payout_breakdown JSONB');
+  await q('CREATE INDEX IF NOT EXISTS orders_trip_id_idx ON orders(trip_id)');
+
   // Backfill share tokens for old orders
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
            WHERE share_token IS NULL`);

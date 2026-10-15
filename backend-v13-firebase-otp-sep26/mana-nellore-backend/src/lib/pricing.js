@@ -21,7 +21,7 @@ async function loadPricingConfig(db) {
       (m.delivery_tiers && m.delivery_tiers.tiers) || [
         { up_to_km: 3, rate_paise_per_km: 1000 },
         { up_to_km: 8, rate_paise_per_km: 900 },
-        { up_to_km: null, rate_paise_per_km: 800 }
+        { up_to_km: null, rate_paise_per_km: 900 }
       ],
     riderPayout: m.rider_payout_tiers || {
       slab1_up_to_km: 5,
@@ -30,7 +30,14 @@ async function loadPricingConfig(db) {
       slab2_rate_paise_per_km: 900,
       slab3_base_km: 8,
       slab3_base_rate_paise_per_km: 800,
-      slab3_extra_rate_paise_per_km: 1000
+      slab3_extra_rate_paise_per_km: 800
+    },
+    // Trip-based rider payout (user 2026-10-15): flat base + per-km + per intermediate stop
+    tripPayout: m.trip_payout || {
+      base_paise: 2000,           // Rs 20 for first 2km
+      base_km: 2,
+      per_km_paise: 800,          // Rs 8/km beyond base
+      per_intermediate_stop_paise: 500  // Rs 5 per intermediate restaurant
     },
     platformFeePaise: Number(m.platform_fee_paise != null ? m.platform_fee_paise : 800),
     defaultCommissionPct: Number(
@@ -45,7 +52,7 @@ async function loadPricingConfig(db) {
   };
 }
 
-// Marginal tiers: 0-3 km @ Rs 10/km, 3-8 km @ Rs 9/km, 8+ km @ Rs 8/km.
+// Marginal tiers: 0-3 km @ Rs 10/km, 3-8 km @ Rs 9/km, 8+ km @ Rs 9/km.
 // Free-delivery rules (order value + distance) zero the fee when matched.
 function deliveryFeePaise(tiers, distanceKm, orderValuePaise, freeRules) {
   if (
@@ -87,6 +94,37 @@ function riderPayoutPaise(cfg, distanceKm) {
   );
 }
 
+// Trip-based rider payout (user 2026-10-15, FINAL).
+// Formula: base_paise (first base_km) + per_km_paise * max(0, totalKm - base_km) + per_intermediate_stop_paise * intermediateStops
+// Returns { payout_paise, breakdown } where breakdown has base, distance, stops components.
+function tripPayoutPaise(cfg, totalKm, intermediateStops) {
+  const basePaise = Number(cfg.base_paise);
+  const baseKm = Number(cfg.base_km);
+  const perKmPaise = Number(cfg.per_km_paise);
+  const perStopPaise = Number(cfg.per_intermediate_stop_paise);
+  const km = Number(totalKm) || 0;
+  const stops = Math.max(0, Math.floor(Number(intermediateStops) || 0));
+  const extraKm = Math.max(0, km - baseKm);
+  const basePart = basePaise;
+  const distancePart = Math.round(extraKm * perKmPaise);
+  const stopsPart = stops * perStopPaise;
+  const total = basePart + distancePart + stopsPart;
+  return {
+    payout_paise: total,
+    breakdown: {
+      base_paise: basePart,
+      base_km: baseKm,
+      extra_km: Math.round(extraKm * 100) / 100,
+      distance_paise: distancePart,
+      per_km_paise: perKmPaise,
+      intermediate_stops: stops,
+      stops_paise: stopsPart,
+      per_stop_paise: perStopPaise,
+      total_km: Math.round(km * 100) / 100
+    }
+  };
+}
+
 // On-the-way secondary delivery fee (user-dictated 2026-10-13).
 // Flat fee from config (otw_flat_fee_paise, default 500 paise = Rs 5).
 // "On the way" = within 500m of the primary→customer route line — enforced by
@@ -126,6 +164,7 @@ module.exports = {
   loadPricingConfig,
   deliveryFeePaise,
   riderPayoutPaise,
+  tripPayoutPaise,
   otwSecondaryFeePaise,
   computeQuote
 };

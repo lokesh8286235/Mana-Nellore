@@ -224,6 +224,8 @@ router.get(
     try { await dispatchPendingOrders(false); } catch (e) { console.error('[dispatch] pending failed', e.message); }
     const { rows } = await db.query(
       `SELECT o.id, o.total_paise, o.placed_at, o.payment_method, o.trip_id,
+              o.is_primary, o.trip_payout_paise, o.trip_distance_km,
+              o.trip_intermediate_stops, o.trip_payout_breakdown,
               r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
               a.line1, a.city, a.lat AS addr_lat, a.lng AS addr_lng
        FROM orders o
@@ -244,7 +246,12 @@ router.get(
       let distanceKm = null;
       let payout = null;
       let pickupKm = null;
-      if (o.rest_lat != null && o.rest_lng != null && o.addr_lat != null && o.addr_lng != null) {
+      // Trip-based payout (user 2026-10-15): use pre-calculated trip payout if available
+      if (o.trip_payout_paise != null) {
+        payout = o.trip_payout_paise;
+        distanceKm = o.trip_distance_km != null ? Number(o.trip_distance_km) : null;
+      } else if (o.rest_lat != null && o.rest_lng != null && o.addr_lat != null && o.addr_lng != null) {
+        // Fallback: legacy per-order calculation for old orders without trip payout
         distanceKm = haversineKm(o.rest_lat, o.rest_lng, o.addr_lat, o.addr_lng);
         payout = riderPayoutPaise(config.riderPayout, distanceKm);
       }
@@ -261,7 +268,11 @@ router.get(
         address: [o.line1, o.city].filter(Boolean).join(', '),
         distance_km: distanceKm == null ? null : Math.round(distanceKm * 10) / 10,
         pickup_km: pickupKm == null ? null : Math.round(pickupKm * 10) / 10,
-        payout_paise: payout
+        payout_paise: payout,
+        is_primary: !!o.is_primary,
+        trip_distance_km: o.trip_distance_km != null ? Number(o.trip_distance_km) : null,
+        trip_intermediate_stops: o.trip_intermediate_stops != null ? Number(o.trip_intermediate_stops) : 0,
+        trip_payout_breakdown: o.trip_payout_breakdown || null
       };
     });
     list.sort((a, b) => {
