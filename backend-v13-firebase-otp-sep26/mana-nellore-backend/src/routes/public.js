@@ -135,12 +135,25 @@ router.get(
   '/config',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      "SELECT value FROM pricing_config WHERE key = 'call_to_order_phone'"
+      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'customer_fee')"
     );
+    const m = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+    // Customer delivery fee tiers (user 2026-10-15): backend-configurable, nothing hardcoded in apps
+    const customerFee = m.customer_fee || {
+      base_paise: 2000,
+      base_km: 2,
+      per_km_paise: 800,
+      tiers: [
+        { min_order_paise: 50100, free_km: 3 },
+        { min_order_paise: 90100, free_km: 5 },
+        { min_order_paise: 130100, free_km: 8 }
+      ]
+    };
     res.json({
-      call_to_order_phone: (rows[0] && rows[0].value) || '',
+      call_to_order_phone: (m.call_to_order_phone) || '',
       maps_key: process.env.GOOGLE_MAPS_KEY || '',
-      razorpay_key: process.env.RAZORPAY_KEY_ID || ''
+      razorpay_key: process.env.RAZORPAY_KEY_ID || '',
+      customer_fee: customerFee
     });
   })
 );
