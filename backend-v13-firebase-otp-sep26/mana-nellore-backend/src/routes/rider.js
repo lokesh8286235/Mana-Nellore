@@ -123,6 +123,98 @@ router.put(
   })
 );
 
+// PUT /api/rider/registration — full Swiggy/Zomato-style rider registration (2026-10-15).
+// Saves one step at a time; step 4 completion marks registration_completed=true.
+// Photos: data:image/* URLs (client-downscaled) or https URLs.
+router.put(
+  '/registration',
+  ah(async (req, res) => {
+    const b = req.body || {};
+    const checkPhoto = (p) => {
+      if (p == null || p === '') return null;
+      const s = String(p);
+      const okPrefix = s.startsWith('data:image/') || s.startsWith('http');
+      if (!okPrefix || s.length > 1500000) {
+        const err = new Error('Photo must be an image under ~1.5MB.');
+        err.status = 400;
+        throw err;
+      }
+      return s;
+    };
+    const str = (v, max) => {
+      if (v == null || v === '') return null;
+      return String(v).trim().slice(0, max || 100);
+    };
+    // Validate Aadhaar (12 digits) and PAN (10 chars) formats when provided
+    if (b.aadhaar_no && !/^\d{12}$/.test(String(b.aadhaar_no).replace(/\s/g, ''))) {
+      const err = new Error('Aadhaar number must be 12 digits.');
+      err.status = 400; throw err;
+    }
+    if (b.pan_no && !/^[A-Z]{5}[0-9]{4}[A-Z]$/i.test(String(b.pan_no).replace(/\s/g, ''))) {
+      const err = new Error('PAN must be 10 characters (e.g. ABCDE1234F).');
+      err.status = 400; throw err;
+    }
+    const step = Math.min(4, Math.max(0, parseInt(b.step, 10) || 0));
+    const completed = b.completed === true || step >= 4;
+    // Update user name if provided
+    if (b.name && String(b.name).trim()) {
+      await db.query('UPDATE users SET name = $1 WHERE id = $2',
+        [String(b.name).trim().slice(0, 60), req.user.id]);
+    }
+    const { rows } = await db.query(
+      `UPDATE riders SET
+         dob = COALESCE($1::date, dob),
+         gender = COALESCE($2, gender),
+         email = COALESCE($3, email),
+         address = COALESCE($4, address),
+         aadhaar_no = COALESCE($5, aadhaar_no),
+         aadhaar_front_photo = COALESCE($6, aadhaar_front_photo),
+         aadhaar_back_photo = COALESCE($7, aadhaar_back_photo),
+         pan_no = COALESCE($8, pan_no),
+         pan_photo = COALESCE($9, pan_photo),
+         profile_photo = COALESCE($10, profile_photo),
+         vehicle_type = COALESCE($11, vehicle_type),
+         vehicle_number = COALESCE($12, vehicle_number),
+         licence_no = COALESCE($13, licence_no),
+         licence_photo = COALESCE($14, licence_photo),
+         rc_photo = COALESCE($15, rc_photo),
+         bank_account = COALESCE($16, bank_account),
+         ifsc = COALESCE($17, ifsc),
+         cancelled_cheque_photo = COALESCE($18, cancelled_cheque_photo),
+         upi_id = COALESCE($19, upi_id),
+         registration_step = GREATEST(registration_step, $20),
+         registration_completed = registration_completed OR $21,
+         status = CASE WHEN $21 AND status = 'pending' THEN 'pending' ELSE status END
+       WHERE user_id = $22 RETURNING *`,
+      [
+        b.dob || null,
+        str(b.gender, 20),
+        str(b.email, 120),
+        str(b.address, 300),
+        b.aadhaar_no ? String(b.aadhaar_no).replace(/\s/g, '') : null,
+        checkPhoto(b.aadhaar_front_photo),
+        checkPhoto(b.aadhaar_back_photo),
+        b.pan_no ? String(b.pan_no).replace(/\s/g, '').toUpperCase() : null,
+        checkPhoto(b.pan_photo),
+        checkPhoto(b.profile_photo),
+        str(b.vehicle_type, 30),
+        str(b.vehicle_number, 20),
+        str(b.licence_no, 30),
+        checkPhoto(b.licence_photo),
+        checkPhoto(b.rc_photo),
+        str(b.bank_account, 30),
+        b.ifsc ? String(b.ifsc).replace(/\s/g, '').toUpperCase() : null,
+        checkPhoto(b.cancelled_cheque_photo),
+        str(b.upi_id, 60),
+        step,
+        completed,
+        req.user.id,
+      ]
+    );
+    res.json({ ok: true, rider: rows[0] || null, step, completed });
+  })
+);
+
 // PUT /api/rider/online { online }
 router.put(
   '/online',

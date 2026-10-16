@@ -43,7 +43,9 @@ async function findOrCreateUserByPhone(phone, role, name) {
     [phone, role]
   );
   let user = userRes.rows[0];
+  let isNew = false;
   if (!user) {
+    isNew = true;
     const created = await db.query(
       'INSERT INTO users (phone, name, role, referral_code) VALUES ($1, $2, $3, $4) RETURNING *',
       [phone, name || null, role, await makeReferralCode()]
@@ -53,6 +55,7 @@ async function findOrCreateUserByPhone(phone, role, name) {
       await db.query('INSERT INTO riders (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [user.id]);
     }
   }
+  user._isNew = isNew;
   return user;
 }
 
@@ -116,9 +119,20 @@ router.post(
 
     const user = await findOrCreateUserByPhone(phone, role, name);
     const token = signToken(user);
+    // For riders: tell the app if this is a brand-new registration so it can
+    // show the "Register Now" full onboarding flow (2026-10-15).
+    let isNewRider = false;
+    if (role === 'rider' && user._isNew) {
+      isNewRider = true;
+    } else if (role === 'rider') {
+      const { rows: rrows } = await db.query(
+        'SELECT registration_completed FROM riders WHERE user_id = $1', [user.id]);
+      isNewRider = rrows.length > 0 && !rrows[0].registration_completed;
+    }
     res.json({
       token,
-      user: { id: user.id, phone: user.phone, name: user.name, role: user.role }
+      user: { id: user.id, phone: user.phone, name: user.name, role: user.role },
+      is_new_rider: isNewRider
     });
   })
 );

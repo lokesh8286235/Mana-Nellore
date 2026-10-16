@@ -163,6 +163,23 @@ async function migrate() {
   await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_photo text');
   await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS profile_photo text');
   await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS cancelled_deliveries int NOT NULL DEFAULT 0');
+  // Full rider registration (Swiggy/Zomato-style) — 2026-10-15
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS dob date');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS gender text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS email text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS address text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_front_photo text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_back_photo text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS pan_no text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS pan_photo text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS licence_photo text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS rc_photo text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS bank_account text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS ifsc text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS cancelled_cheque_photo text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS upi_id text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS registration_step int NOT NULL DEFAULT 0');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS registration_completed boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now()');
   await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS requires_student boolean NOT NULL DEFAULT false');
   // Trip grouping for on-the-way multi-restaurant orders
