@@ -197,10 +197,11 @@ function otwSecondaryFeePaise(normalFeePaise, config) {
 
 function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct }) {
   const net = subtotalPaise - discountPaise;
-  // No hardcoded fallback: if distance unknown, fee is null (frontend hides it)
+  // If distance unknown, use base fee from config (never null — DB requires it)
+  const baseFee = Number(config.customerFee && config.customerFee.base_paise) || 2000;
   const deliveryFee =
     distanceKm == null
-      ? null
+      ? baseFee
       : deliveryFeePaise(config.deliveryTiers, distanceKm, net, config.freeDeliveryRules);
   const platformFeePaise = config.platformFeePaise;
   const pct = commissionPct != null ? Number(commissionPct) : config.defaultCommissionPct;
