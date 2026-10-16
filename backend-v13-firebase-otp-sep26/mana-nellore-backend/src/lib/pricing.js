@@ -199,10 +199,12 @@ function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, co
   const net = subtotalPaise - discountPaise;
   // If distance unknown, use base fee from config (never null — DB requires it)
   const baseFee = Number(config.customerFee && config.customerFee.base_paise) || 2000;
+  // FINAL fee model (user 2026-10-15): free-km tiers by order value, Rs 8/km beyond.
+  // This matches what the checkout nudge advertises — the bill must equal the promise.
   const deliveryFee =
     distanceKm == null
       ? baseFee
-      : deliveryFeePaise(config.deliveryTiers, distanceKm, net, config.freeDeliveryRules);
+      : customerDeliveryFeePaise(config.customerFee, distanceKm, net).fee_paise;
   const platformFeePaise = config.platformFeePaise;
   const pct = commissionPct != null ? Number(commissionPct) : config.defaultCommissionPct;
   const commissionPaise = Math.round((net * pct) / 100);
