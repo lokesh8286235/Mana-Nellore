@@ -7,7 +7,7 @@
 // - Tiny per-user rate limit to protect the free-tier quota.
 // - Short timeout; on any failure the app falls back to its local brain.
 const express = require('express');
-const { ah } = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -37,7 +37,7 @@ const SYSTEM_PROMPT = [
   'Never mention you are an AI model; you are Ask Floop.',
 ].join('\n');
 
-router.post('/ask', ah, async (req, res) => {
+router.post('/ask', authenticate, async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(503).json({ error: 'ai_unavailable' });
