@@ -90,4 +90,88 @@ router.post('/ask', authenticate, async (req, res) => {
   }
 });
 
+const INTENT_PROMPT = [
+  'You are the intent classifier for Ask Floop, a food-delivery app assistant in Nellore, India.',
+  'Classify the user message into ONE intent and extract fields. Reply with ONLY a JSON object, no other text.',
+  '',
+  'Intents:',
+  '- order: user wants to find/order a dish (e.g. "2 dosas", "biryani under 500", "something spicy"). Extract dish, qty, maxPrice (number, rupees), restaurant if named.',
+  '- track: user asks about their order status/location.',
+  '- otp: user asks for their delivery OTP / one-time password.',
+  '- cart_show: user asks what is in their cart.',
+  '- cart_clear: user wants to empty their cart.',
+  '- offers: user asks about offers, coupons, discounts.',
+  '- suggest: user wants recommendations ("suggest something", "what is popular").',
+  '- converse: anything else — chit-chat, advice, questions, help. Put a short warm reply (1-3 sentences, mirror their language: English/Telugu/Tanglish) in the "reply" field.',
+  '',
+  'JSON shape: {"intent":"order","dish":"dosa","qty":2,"maxPrice":null,"restaurant":null,"reply":null}',
+  'For converse: {"intent":"converse","reply":"..."} — other fields null.',
+  'Rules: dish should be just the food name (e.g. "dosa" not "i want dosa"). qty defaults to 1. Never invent restaurant names or prices.',
+].join('\n');
+
+router.post('/intent', authenticate, async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(503).json({ error: 'ai_unavailable' });
+
+    const userId = String((req.user && (req.user.id || req.user.phone)) || 'anon');
+    if (!rateOk(userId)) return res.status(429).json({ error: 'rate_limited' });
+
+    const message = String(req.body && req.body.message || '').slice(0, 500).trim();
+    if (!message) return res.status(400).json({ error: 'empty_message' });
+
+    const history = Array.isArray(req.body.history) ? req.body.history.slice(-6) : [];
+    const contents = history
+      .filter(h => h && (h.q || h.a))
+      .flatMap(h => ([
+        ...(h.q ? [{ role: 'user', parts: [{ text: String(h.q).slice(0, 300) }] }] : []),
+        ...(h.a ? [{ role: 'model', parts: [{ text: String(h.a).slice(0, 300) }] }] : []),
+      ]));
+    contents.push({ role: 'user', parts: [{ text: message }] });
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    let resp;
+    try {
+      resp = await fetch(GEMINI_URL, {
+        method: 'POST',
+        signal: ctrl.signal,
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: INTENT_PROMPT }] },
+          contents,
+          generationConfig: { maxOutputTokens: 300, temperature: 0.2, responseMimeType: 'application/json' },
+        }),
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!resp.ok) return res.status(502).json({ error: resp.status === 429 ? 'rate_limited' : 'ai_error' });
+    const data = await resp.json();
+    const text = data && data.candidates && data.candidates[0] &&
+      data.candidates[0].content && data.candidates[0].content.parts &&
+      data.candidates[0].content.parts.map(p => p.text || '').join('').trim();
+    if (!text) return res.status(502).json({ error: 'ai_empty' });
+    let parsed;
+    try {
+      parsed = JSON.parse(text.replace(/^```json\s*|\s*```$/g, ''));
+    } catch (e) {
+      return res.status(502).json({ error: 'ai_parse' });
+    }
+    const valid = ['order', 'track', 'otp', 'cart_show', 'cart_clear', 'offers', 'suggest', 'converse'];
+    if (!parsed || valid.indexOf(parsed.intent) < 0) return res.status(502).json({ error: 'ai_parse' });
+    res.json({
+      intent: parsed.intent,
+      dish: parsed.dish ? String(parsed.dish).slice(0, 60) : null,
+      qty: Math.min(20, Math.max(1, parseInt(parsed.qty, 10) || 1)),
+      maxPrice: parsed.maxPrice ? Math.max(0, Number(parsed.maxPrice) || 0) : null,
+      restaurant: parsed.restaurant ? String(parsed.restaurant).slice(0, 80) : null,
+      reply: parsed.reply ? String(parsed.reply).slice(0, 1200) : null,
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'ai_error' });
+  }
+});
+
 module.exports = router;
