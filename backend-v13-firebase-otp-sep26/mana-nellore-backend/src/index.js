@@ -45,7 +45,6 @@ app.use('/api/rider', require('./routes/rider'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/upload', require('./routes/upload'));
 app.use('/api/maps', require('./routes/maps'));
-app.use('/api/ai', require('./routes/ai'));
 app.use('/api', require('./routes/public'));
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
