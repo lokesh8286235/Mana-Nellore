@@ -173,6 +173,7 @@ router.get(
        LEFT JOIN (SELECT restaurant_id, ROUND(AVG(EXTRACT(EPOCH FROM (packed_at - placed_at)) / 60)) AS avg_min
                   FROM orders WHERE packed_at IS NOT NULL
                   AND placed_at > now() - interval '30 days'
+                  AND (packed_at - placed_at) < interval '120 minutes'
                   GROUP BY restaurant_id) ap ON ap.restaurant_id = r.id
        LEFT JOIN (SELECT DISTINCT restaurant_id, true AS has_veg FROM menu_items
                   WHERE veg = true AND available = true) hv ON hv.restaurant_id = r.id
