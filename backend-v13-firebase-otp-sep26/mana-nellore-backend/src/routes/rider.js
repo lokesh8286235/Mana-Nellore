@@ -367,11 +367,15 @@ router.get(
         trip_payout_breakdown: o.trip_payout_breakdown || null
       };
     });
-    list.sort((a, b) => {
+    // User 2026-10-18: only show orders within 1.5 km of the rider (pickup distance).
+    // Orders with unknown distance (missing coords) are included — can't filter what we can't measure.
+    const MAX_PICKUP_KM = 1.5;
+    const filtered = list.filter(o => o.pickup_km == null || o.pickup_km <= MAX_PICKUP_KM);
+    filtered.sort((a, b) => {
       if (a.pickup_km != null && b.pickup_km != null) return a.pickup_km - b.pickup_km;
       return new Date(a.placed_at) - new Date(b.placed_at);
     });
-    res.json({ deliveries: list });
+    res.json({ deliveries: filtered });
   })
 );
 
