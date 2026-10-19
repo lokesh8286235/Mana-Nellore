@@ -22,7 +22,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: floop-captain/package-lock.json
 
@@ -46,15 +46,7 @@ jobs:
           path: floop-captain/sync.log
           retention-days: 7
 
-      - name: Push sync log to debug branch
-        if: failure()
-        run: |
-          git config user.name "muse-builder"
-          git config user.email "builder@local"
-          cp floop-captain/sync.log ./SYNC_DEBUG.log
-          git add SYNC_DEBUG.log
-          git commit -m "debug: cap sync log" || true
-          git push origin HEAD:debug-sync-log --force || true
+
 
       - name: Verify background-location capability in manifest
         run: |
