@@ -30,7 +30,10 @@ jobs:
         run: npm ci
 
       - name: Sync Capacitor Android
-        run: npx cap sync android
+        run: |
+          ls -la node_modules/.bin/cap || (echo "FATAL: cap binary not installed" && exit 1)
+          node --version && npm --version
+          ./node_modules/.bin/cap sync android
 
       - name: Verify background-location capability in manifest
         run: |
