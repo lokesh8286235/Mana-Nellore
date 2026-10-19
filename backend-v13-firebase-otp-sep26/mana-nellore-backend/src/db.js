@@ -74,6 +74,9 @@ async function migrate() {
 
   // Menu items: meal slots, combos, allergens
   await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS meal_slot text[] NOT NULL DEFAULT '{all}'");
+  await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS calories INT');
+  await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS protein_g NUMERIC(5,1)');
+  await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS is_jain BOOLEAN DEFAULT false');
   // meal_slot was single text before multi-select — convert legacy values to text[]
   await q(`DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns
