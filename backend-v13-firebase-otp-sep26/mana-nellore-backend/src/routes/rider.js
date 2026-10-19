@@ -302,10 +302,8 @@ async function deliveryDetail(orderId, riderId) {
 }
 
 // GET /api/rider/deliveries/available — ready orders with no rider yet.
-// Proximity dispatch: each order is offered to ONE nearest rider at a time
-// (30s window, then cascades). This endpoint sweeps expired offers and
-// dispatches queued orders, then shows this rider only their own offers
-// (plus unassigned ones as a liveness fallback).
+// User 2026-10-19: show ALL available orders to every rider (no proximity dispatch filter).
+// This endpoint still sweeps expired offers and dispatches queued orders for bookkeeping.
 router.get(
   '/deliveries/available',
   ah(async (req, res) => {
@@ -329,8 +327,7 @@ router.get(
            SELECT 1 FROM rider_declines rd
            WHERE rd.order_id = o.id AND rd.rider_id = $1
          )
-         AND (o.offered_to_rider_id = $1 OR o.offered_to_rider_id IS NULL OR o.offer_expires_at < now())
-       ORDER BY o.placed_at ASC LIMIT 20`,
+       ORDER BY o.placed_at ASC LIMIT 50`,
       [rider.id]
     );
     const config = await loadPricingConfig(db);
