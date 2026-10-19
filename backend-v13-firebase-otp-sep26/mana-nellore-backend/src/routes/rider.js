@@ -1481,4 +1481,46 @@ router.get(
   })
 );
 
+
+// GET /api/rider/peak-hours — busiest hours based on last 30 days (user 2026-10-18)
+router.get(
+  '/peak-hours',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const { rows } = await db.query(
+      `SELECT EXTRACT(HOUR FROM placed_at)::int AS hr, COUNT(*)::int AS n
+       FROM orders
+       WHERE placed_at > now() - interval '30 days'
+         AND status NOT IN ('cancelled', 'rejected')
+       GROUP BY hr ORDER BY n DESC LIMIT 3`
+    );
+    const nowHr = new Date().getHours();
+    const isPeak = rows.some(r => Math.abs(r.hr - nowHr) <= 1);
+    res.json({
+      peak_hours: rows.map(r => r.hr),
+      is_peak_now: isPeak,
+      top_hour: rows.length ? rows[0].hr : null
+    });
+  })
+);
+
+// POST /api/rider/quick-msg — send a preset message to customer (user 2026-10-18)
+router.post(
+  '/quick-msg',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const { order_id, msg } = req.body || {};
+    const allowed = ["I'm outside", "On my way", "5 mins away", "Reached restaurant", "Picked up your order"];
+    if (!allowed.includes(msg)) return res.status(400).json({ error: 'Invalid message' });
+    // Store in order timeline for now (SMS/push later)
+    await db.query(
+      `UPDATE orders SET timeline = timeline || $1::jsonb WHERE id = $2 AND rider_id = $3`,
+      [JSON.stringify([{ type: 'rider_msg', msg, at: new Date().toISOString() }]), order_id, rider.id]
+    );
+    res.json({ ok: true });
+  })
+);
+
 module.exports = router;
