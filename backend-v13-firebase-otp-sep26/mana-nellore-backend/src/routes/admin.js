@@ -1270,6 +1270,75 @@ router.put(
   })
 );
 
+
+// ---- Customer management ----
+// GET /api/admin/customers — list customers with order stats
+router.get(
+  '/customers',
+  ah(async (req, res) => {
+    const q = (req.query.q || '').trim();
+    const params = [];
+    let where = "u.role = 'customer'";
+    if (q) {
+      params.push('%' + q + '%');
+      where += ' AND (u.name ILIKE $1 OR u.phone ILIKE $1)';
+    }
+    const { rows } = await db.query(
+      `SELECT u.id, u.phone, u.name, u.is_blocked, u.created_at,
+              COUNT(o.id) AS order_count,
+              COALESCE(SUM(CASE WHEN o.status = 'delivered' THEN o.total_paise ELSE 0 END), 0) AS spent_paise,
+              MAX(o.placed_at) AS last_order_at
+       FROM users u
+       LEFT JOIN orders o ON o.customer_id = u.id
+       WHERE ${where}
+       GROUP BY u.id, u.phone, u.name, u.is_blocked, u.created_at
+       ORDER BY MAX(o.placed_at) DESC NULLS LAST, u.created_at DESC
+       LIMIT 100`,
+      params
+    );
+    res.json({ customers: rows });
+  })
+);
+
+// GET /api/admin/customers/:id — customer detail with order history
+router.get(
+  '/customers/:id',
+  ah(async (req, res) => {
+    const { rows: urows } = await db.query(
+      `SELECT u.id, u.phone, u.name, u.is_blocked, u.created_at, u.referral_code,
+              (SELECT name FROM users r WHERE r.id = u.referred_by) AS referred_by_name
+       FROM users u WHERE u.id = $1 AND u.role = 'customer'`,
+      [req.params.id]
+    );
+    if (!urows[0]) return res.status(404).json({ error: 'Customer not found' });
+    const { rows: orders } = await db.query(
+      `SELECT o.id, o.order_number, o.status, o.total_paise, o.placed_at,
+              r.name AS restaurant_name
+       FROM orders o
+       LEFT JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.customer_id = $1
+       ORDER BY o.placed_at DESC LIMIT 50`,
+      [req.params.id]
+    );
+    res.json({ customer: urows[0], orders });
+  })
+);
+
+// PUT /api/admin/customers/:id/block — block/unblock a customer
+router.put(
+  '/customers/:id/block',
+  ah(async (req, res) => {
+    const blocked = !!req.body.blocked;
+    const { rows } = await db.query(
+      `UPDATE users SET is_blocked = $1 WHERE id = $2 AND role = 'customer' RETURNING id, is_blocked`,
+      [blocked, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Customer not found' });
+    await audit(req, blocked ? 'customer_block' : 'customer_unblock', 'customer', req.params.id, { blocked });
+    res.json({ ok: true, is_blocked: rows[0].is_blocked });
+  })
+);
+
 module.exports = router;// ---- Menu items (admin) ----
 // GET /api/admin/restaurants/:id/menu/items - list all menu items
 router.get(
@@ -1368,6 +1437,75 @@ router.delete(
     if (!rows[0]) return res.status(404).json({ error: 'Menu item not found' });
     await audit(req, 'menu_item_delete', 'menu_item', req.params.itemId, {});
     res.json({ ok: true });
+  })
+);
+
+
+// ---- Customer management ----
+// GET /api/admin/customers — list customers with order stats
+router.get(
+  '/customers',
+  ah(async (req, res) => {
+    const q = (req.query.q || '').trim();
+    const params = [];
+    let where = "u.role = 'customer'";
+    if (q) {
+      params.push('%' + q + '%');
+      where += ' AND (u.name ILIKE $1 OR u.phone ILIKE $1)';
+    }
+    const { rows } = await db.query(
+      `SELECT u.id, u.phone, u.name, u.is_blocked, u.created_at,
+              COUNT(o.id) AS order_count,
+              COALESCE(SUM(CASE WHEN o.status = 'delivered' THEN o.total_paise ELSE 0 END), 0) AS spent_paise,
+              MAX(o.placed_at) AS last_order_at
+       FROM users u
+       LEFT JOIN orders o ON o.customer_id = u.id
+       WHERE ${where}
+       GROUP BY u.id, u.phone, u.name, u.is_blocked, u.created_at
+       ORDER BY MAX(o.placed_at) DESC NULLS LAST, u.created_at DESC
+       LIMIT 100`,
+      params
+    );
+    res.json({ customers: rows });
+  })
+);
+
+// GET /api/admin/customers/:id — customer detail with order history
+router.get(
+  '/customers/:id',
+  ah(async (req, res) => {
+    const { rows: urows } = await db.query(
+      `SELECT u.id, u.phone, u.name, u.is_blocked, u.created_at, u.referral_code,
+              (SELECT name FROM users r WHERE r.id = u.referred_by) AS referred_by_name
+       FROM users u WHERE u.id = $1 AND u.role = 'customer'`,
+      [req.params.id]
+    );
+    if (!urows[0]) return res.status(404).json({ error: 'Customer not found' });
+    const { rows: orders } = await db.query(
+      `SELECT o.id, o.order_number, o.status, o.total_paise, o.placed_at,
+              r.name AS restaurant_name
+       FROM orders o
+       LEFT JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.customer_id = $1
+       ORDER BY o.placed_at DESC LIMIT 50`,
+      [req.params.id]
+    );
+    res.json({ customer: urows[0], orders });
+  })
+);
+
+// PUT /api/admin/customers/:id/block — block/unblock a customer
+router.put(
+  '/customers/:id/block',
+  ah(async (req, res) => {
+    const blocked = !!req.body.blocked;
+    const { rows } = await db.query(
+      `UPDATE users SET is_blocked = $1 WHERE id = $2 AND role = 'customer' RETURNING id, is_blocked`,
+      [blocked, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Customer not found' });
+    await audit(req, blocked ? 'customer_block' : 'customer_unblock', 'customer', req.params.id, { blocked });
+    res.json({ ok: true, is_blocked: rows[0].is_blocked });
   })
 );
 

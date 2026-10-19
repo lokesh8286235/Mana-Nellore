@@ -574,6 +574,11 @@ async function placeMultiGroupOrder(req, res) {
 router.post(
   '/',
   ah(async (req, res) => {
+    /* Blocked customers cannot place orders */
+    const _blockCheck = await db.query('SELECT is_blocked FROM users WHERE id = $1', [req.user.id]);
+    if (_blockCheck.rows[0] && _blockCheck.rows[0].is_blocked) {
+      return res.status(403).json({ error: 'Your account has been blocked. Please contact support.' });
+    }
     const { restaurant_id, address_id, items, coupon_code, payment_method,
             order_type, table_id, delivery_note, no_cutlery, tip_paise,
             recipient_name, recipient_phone, groups } = req.body;

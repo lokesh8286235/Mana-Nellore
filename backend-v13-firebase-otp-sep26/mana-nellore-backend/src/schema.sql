@@ -25,6 +25,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS lat double precision;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS lng double precision;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS veg_only boolean NOT NULL DEFAULT false;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS healthy_default boolean NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked boolean NOT NULL DEFAULT false;
 
 -- OTP login codes (hashed, single-use, expiring)
 CREATE TABLE IF NOT EXISTS otp_codes (
