@@ -1,4 +1,4 @@
-package com.mananellore.captain;
+package com.floop.captain;
 
 import com.getcapacitor.BridgeActivity;
 
