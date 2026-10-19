@@ -1424,4 +1424,61 @@ router.get(
   })
 );
 
+
+// GET /api/rider/leaderboard — top earners this week (user 2026-10-18: best rider app)
+router.get(
+  '/leaderboard',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const { rows } = await db.query(
+      `SELECT r.id, r.name,
+              COUNT(o.id)::int AS trips,
+              COALESCE(SUM(o.rider_payout_paise), 0)::int AS earned_paise
+       FROM riders r
+       LEFT JOIN orders o ON o.rider_id = r.id
+         AND o.status = 'delivered'
+         AND o.delivered_at > now() - interval '7 days'
+       WHERE r.active = true
+       GROUP BY r.id, r.name
+       HAVING COUNT(o.id) > 0
+       ORDER BY earned_paise DESC
+       LIMIT 10`
+    );
+    const myRank = rows.findIndex(x => String(x.id) === String(rider.id)) + 1;
+    res.json({
+      board: rows.map((x, i) => ({
+        rank: i + 1,
+        name: x.id === rider.id ? 'You' : (x.name || 'Rider').split(' ')[0],
+        trips: x.trips,
+        earned: Math.round(x.earned_paise / 100),
+        is_me: String(x.id) === String(rider.id)
+      })),
+      my_rank: myRank || null
+    });
+  })
+);
+
+// GET /api/rider/hotspots — areas with unassigned orders right now
+router.get(
+  '/hotspots',
+  ah(async (req, res) => {
+    const rider = await requireActiveRider(req, res);
+    if (!rider) return;
+    const { rows } = await db.query(
+      `SELECT r.name AS area, r.lat, r.lng, COUNT(o.id)::int AS orders
+       FROM orders o
+       JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.status = 'ready' AND o.rider_id IS NULL
+         AND o.order_type = 'delivery'
+         AND r.lat IS NOT NULL
+       GROUP BY r.name, r.lat, r.lng
+       HAVING COUNT(o.id) > 0
+       ORDER BY COUNT(o.id) DESC
+       LIMIT 5`
+    );
+    res.json({ hotspots: rows });
+  })
+);
+
 module.exports = router;
