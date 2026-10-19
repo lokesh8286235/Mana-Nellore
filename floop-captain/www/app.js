@@ -29,7 +29,7 @@ try { fetchBackendConfig(); } catch (e) {}
    cached app.js self-reloads to the live build (same mechanism as the
    customer app). Bump this + version.txt + the ?v= queries in index.html
    on every rider build. */
-const APP_V = '20261017r70';
+const APP_V = '20261017r71';
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || null,
@@ -2199,7 +2199,9 @@ function activeCard(d) {
 
   let action = '';
   if (step === 0) {
-    action = `<button class="btn accept ap-nav" data-reached="${esc(id)}">Navigate to Restaurant</button>`;
+    action = `<button class="btn accept ap-nav" data-navrest="${esc(id)}">Navigate to Restaurant</button>
+      <div style="height:8px"></div>
+      <button class="btn ghost" data-reached="${esc(id)}">Reached Restaurant</button>`;
   } else if (step === 1) {
     const photo = state.pickupPhotos[id];
     action = `
@@ -2210,7 +2212,9 @@ function activeCard(d) {
       ${photo ? `<img class="photo-preview" src="${photo}" alt="Pickup photo preview">` : ''}
       <button class="btn accept ap-nav" data-picked="${esc(id)}">${I.check} Picked up — head to customer</button>`;
   } else if (step === 2) {
-    action = `<button class="btn accept ap-nav" data-arrived-cust="${esc(id)}">Navigate to Customer</button>`;
+    action = `<button class="btn accept ap-nav" data-navcust="${esc(id)}">Navigate to Customer</button>
+      <div style="height:8px"></div>
+      <button class="btn ghost" data-arrived-cust="${esc(id)}">Reached Customer</button>`;
   } else {
     const isCod = String(d.payment_method || '').toLowerCase() === 'cod' && String(d.payment_status || '') === 'pending';
     action = `
@@ -2290,6 +2294,13 @@ function paintActiveList() {
   const singleHtml = singles.map(activeCard).join('');
   list.innerHTML = tripHtml + tripOrdersHtml + singleHtml;
 
+  $$('#active-list [data-navrest]').forEach(btn => {
+    btn.onclick = () => {
+      // Go to Maps and draw the route to the restaurant (does NOT mark arrival)
+      location.hash = '#/maps';
+      setTimeout(() => { try { startNavigation(); } catch (e) {} }, 1500);
+    };
+  });
   $$('#active-list [data-reached]').forEach(btn => {
     btn.onclick = () => stepAction(btn.getAttribute('data-reached'), 'arrived-restaurant', undefined, btn, 'Marking reached…');
   });
@@ -2318,6 +2329,12 @@ function paintActiveList() {
       const otpInput = document.getElementById('pickup-otp-' + id);
       const otp = otpInput ? otpInput.value.trim() : '';
       stepAction(id, 'picked-up', { photo: state.pickupPhotos[id], pickup_otp: otp }, btn, 'Confirming pickup…');
+    };
+  });
+  $$('#active-list [data-navcust]').forEach(btn => {
+    btn.onclick = () => {
+      location.hash = '#/maps';
+      setTimeout(() => { try { startNavigation(); } catch (e) {} }, 1500);
     };
   });
   $$('#active-list [data-arrived-cust]').forEach(btn => {
