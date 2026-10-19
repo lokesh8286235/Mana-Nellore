@@ -324,14 +324,19 @@ router.get(
   ah(async (req, res) => {
     const { rows } = await db.query(
       `SELECT oi.menu_item_id, oi.name_snapshot AS name, mi.image_url, mi.price_paise,
-              mi.veg, r.id AS restaurant_id, r.name AS restaurant_name, COUNT(*) AS orders
+              mi.veg, r.id AS restaurant_id, r.name AS restaurant_name, COUNT(*) AS orders,
+              COALESCE(dr.avg_rating, 0)::float AS rating_avg,
+              COALESCE(dr.rating_count, 0)::int AS rating_count
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
        LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
        LEFT JOIN restaurants r ON r.id = o.restaurant_id
+       LEFT JOIN (SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
+                  FROM dish_ratings GROUP BY dish_id) dr ON dr.dish_id = oi.menu_item_id
        WHERE o.status IN ('placed','accepted','preparing','ready','picked_up','on_way','delivered')
          AND o.placed_at > now() - interval '3 hours'
-       GROUP BY oi.menu_item_id, oi.name_snapshot, mi.image_url, mi.price_paise, mi.veg, r.id, r.name
+       GROUP BY oi.menu_item_id, oi.name_snapshot, mi.image_url, mi.price_paise, mi.veg, r.id, r.name,
+                dr.avg_rating, dr.rating_count
        ORDER BY orders DESC LIMIT 10`
     );
     res.json({ trending: rows.map((x) => ({ ...x, orders: Number(x.orders) })) });

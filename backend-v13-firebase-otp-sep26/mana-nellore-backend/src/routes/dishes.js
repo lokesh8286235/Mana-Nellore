@@ -97,9 +97,13 @@ router.get(
     const limit = Math.min(Number(req.query.limit) || 10, 30);
     const { rows } = await db.query(
       `SELECT mi.id, mi.name, mi.image_url, mi.price_paise, mi.veg, mi.restaurant_id,
-              r.name AS restaurant_name, r.is_open AS restaurant_open
+              r.name AS restaurant_name, r.is_open AS restaurant_open,
+              COALESCE(dr.avg_rating, 0)::float AS rating_avg,
+              COALESCE(dr.rating_count, 0)::int AS rating_count
        FROM menu_items mi
        JOIN restaurants r ON r.id = mi.restaurant_id
+       LEFT JOIN (SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
+                  FROM dish_ratings GROUP BY dish_id) dr ON dr.dish_id = mi.id
        WHERE mi.available = true AND r.status = 'approved' AND r.is_open = true
          AND mi.price_paise <= $1
        ORDER BY mi.price_paise ASC LIMIT $2`,
