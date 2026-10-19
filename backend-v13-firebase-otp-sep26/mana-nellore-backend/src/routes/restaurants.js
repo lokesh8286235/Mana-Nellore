@@ -318,6 +318,26 @@ router.get(
   })
 );
 
+// GET /api/restaurants/charts/trending-now — dishes ordered in the last 3 hours
+router.get(
+  '/charts/trending-now',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT oi.menu_item_id, oi.name_snapshot AS name, mi.image_url, mi.price_paise,
+              mi.veg, r.id AS restaurant_id, r.name AS restaurant_name, COUNT(*) AS orders
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
+       LEFT JOIN restaurants r ON r.id = o.restaurant_id
+       WHERE o.status IN ('placed','accepted','preparing','ready','picked_up','on_way','delivered')
+         AND o.placed_at > now() - interval '3 hours'
+       GROUP BY oi.menu_item_id, oi.name_snapshot, mi.image_url, mi.price_paise, mi.veg, r.id, r.name
+       ORDER BY orders DESC LIMIT 10`
+    );
+    res.json({ trending: rows.map((x) => ({ ...x, orders: Number(x.orders) })) });
+  })
+);
+
 // GET /api/restaurants/:id/rating-summary -> public rating distribution
 router.get(
   '/:id/rating-summary',

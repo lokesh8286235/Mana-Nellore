@@ -89,6 +89,26 @@ router.get(
   })
 );
 
+// GET /api/dishes/budget — dishes under a price cap (default ₹150)
+router.get(
+  '/budget',
+  ah(async (req, res) => {
+    const maxPaise = Math.min(Number(req.query.max_paise) || 15000, 50000);
+    const limit = Math.min(Number(req.query.limit) || 10, 30);
+    const { rows } = await db.query(
+      `SELECT mi.id, mi.name, mi.image_url, mi.price_paise, mi.veg, mi.restaurant_id,
+              r.name AS restaurant_name, r.is_open AS restaurant_open
+       FROM menu_items mi
+       JOIN restaurants r ON r.id = mi.restaurant_id
+       WHERE mi.available = true AND r.status = 'approved' AND r.is_open = true
+         AND mi.price_paise <= $1
+       ORDER BY mi.price_paise ASC LIMIT $2`,
+      [maxPaise, limit]
+    );
+    res.json({ dishes: rows });
+  })
+);
+
 router.use(authenticate);
 
 // POST /api/dishes/:id/rate { rating: 1-5, order_id }
