@@ -29,7 +29,7 @@ try { fetchBackendConfig(); } catch (e) {}
    cached app.js self-reloads to the live build (same mechanism as the
    customer app). Bump this + version.txt + the ?v= queries in index.html
    on every rider build. */
-const APP_V = '20261017r69';
+const APP_V = '20261017r70';
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || null,
@@ -259,6 +259,32 @@ function checkCameraKill() {
   if (pending) setTimeout(() => toast('The camera closed the page before the photo was saved — please take the photo once more.'), 800);
 }
 
+/* Ask for foreground location right after login so the home map works
+   on first open. Asks ONCE (flagged in localStorage) and never blocks:
+   if the rider denies, the app still works — map just stays empty until
+   they go online. Background ("allow all the time") is asked separately
+   at first Go Online, as Android + Play policy require. */
+async function requestLocationPermission() {
+  try {
+    if (localStorage.getItem('floop_loc_asked')) return;
+    localStorage.setItem('floop_loc_asked', '1');
+  } catch (e) { return; }
+  try {
+    // Native shell: Capacitor Geolocation plugin shows the system dialog.
+    const CapGeo = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Geolocation;
+    if (CapGeo && CapGeo.requestPermissions) {
+      await CapGeo.requestPermissions();
+      return;
+    }
+  } catch (e) { /* fall through to web geolocation */ }
+  try {
+    // Web / WebView: a getCurrentPosition call triggers the permission prompt.
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(function () {}, function () {}, { timeout: 8000, maximumAge: 60000 });
+    }
+  } catch (e) {}
+}
+
 async function boot() {
   if (!state.token) { location.hash = '#/login'; route(); return; }
   checkCameraKill(); // the camera may have killed the tab before a photo was chosen
@@ -278,6 +304,7 @@ async function boot() {
     renderBootError(e);
     return;
   }
+  requestLocationPermission(); /* one-time foreground location prompt after login */
   route();
 }
 
