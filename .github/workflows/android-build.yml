@@ -33,7 +33,18 @@ jobs:
         run: |
           ls -la node_modules/.bin/cap || (echo "FATAL: cap binary not installed" && exit 1)
           node --version && npm --version
-          ./node_modules/.bin/cap sync android
+          ./node_modules/.bin/cap sync android > sync.log 2>&1
+          echo "SYNC_EXIT=$?" | tee -a sync.log
+          cat sync.log
+          grep -q "SYNC_EXIT=0" sync.log
+
+      - name: Upload sync log (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-log
+          path: floop-captain/sync.log
+          retention-days: 7
 
       - name: Verify background-location capability in manifest
         run: |
