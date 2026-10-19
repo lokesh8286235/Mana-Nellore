@@ -218,6 +218,28 @@ async function migrate() {
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS trip_payout_breakdown JSONB');
   await q('CREATE INDEX IF NOT EXISTS orders_trip_id_idx ON orders(trip_id)');
 
+  // Group orders (user 2026-10-18)
+  await q(`CREATE TABLE IF NOT EXISTS group_orders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code VARCHAR(8) UNIQUE NOT NULL,
+    restaurant_id UUID NOT NULL REFERENCES restaurants(id),
+    host_user_id UUID NOT NULL,
+    host_name VARCHAR(100),
+    status VARCHAR(20) DEFAULT 'open',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    closed_at TIMESTAMPTZ
+  )`);
+  await q(`CREATE TABLE IF NOT EXISTS group_order_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    group_id UUID NOT NULL REFERENCES group_orders(id) ON DELETE CASCADE,
+    dish_id UUID NOT NULL REFERENCES menu_items(id),
+    qty INT NOT NULL DEFAULT 1,
+    person_name VARCHAR(50) NOT NULL,
+    added_at TIMESTAMPTZ DEFAULT now()
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_go_code ON group_orders(code)');
+  await q('CREATE INDEX IF NOT EXISTS idx_goi_group ON group_order_items(group_id)');
+
   // Backfill share tokens for old orders
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
            WHERE share_token IS NULL`);
