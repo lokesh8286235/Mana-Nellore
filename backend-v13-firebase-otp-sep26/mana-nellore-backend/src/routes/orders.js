@@ -864,7 +864,7 @@ router.get(
       `SELECT o.*, r.name AS restaurant_name, r.image_url AS restaurant_image, r.phone AS restaurant_phone,
               r.verified AS restaurant_verified, r.lat AS rest_lat, r.lng AS rest_lng,
               rd.lat AS rider_lat, rd.lng AS rider_lng,
-              a.line1, a.line2, a.city,
+              a.line1, a.line2, a.city, a.lat AS addr_lat, a.lng AS addr_lng,
               ru.name AS rider_name, ru.phone AS rider_phone,
               rd.profile_photo AS rider_photo, rd.rating_avg AS rider_rating,
               (SELECT COUNT(*) FROM orders od
@@ -944,7 +944,31 @@ router.get(
         reached: ['picked_up','on_way','delivered'].includes(order.status),
       });
     }
-    res.json({ order: { ...order, items: items.rows, queue_ahead: queueAhead, no_response: noResponse, stops } });
+    // Live ETA: based on rider's real position (not the static estimate)
+    let liveEta = null;
+    let riderClose = false;
+    if (order.rider_lat != null && order.rider_lng != null) {
+      const rLat = Number(order.rider_lat), rLng = Number(order.rider_lng);
+      let destLat = null, destLng = null;
+      if (['picked_up', 'on_way'].includes(order.status) && order.addr_lat != null && order.addr_lng != null) {
+        // Heading to customer
+        destLat = Number(order.addr_lat); destLng = Number(order.addr_lng);
+      } else if (['accepted', 'preparing', 'ready'].includes(order.status) && order.rest_lat != null && order.rest_lng != null) {
+        // Heading to restaurant
+        destLat = Number(order.rest_lat); destLng = Number(order.rest_lng);
+      }
+      if (destLat != null && destLng != null) {
+        const distKm = haversineKm(rLat, rLng, destLat, destLng);
+        // ~20 km/h average city speed
+        liveEta = Math.max(1, Math.round((distKm / 20) * 60));
+        // "Arriving now" when within 200m of the customer
+        if (['picked_up', 'on_way'].includes(order.status) && distKm < 0.2) {
+          riderClose = true;
+        }
+      }
+    }
+    res.json({ order: { ...order, items: items.rows, queue_ahead: queueAhead, no_response: noResponse, stops,
+      live_eta_minutes: liveEta, rider_arriving: riderClose } });
   })
 );
 
