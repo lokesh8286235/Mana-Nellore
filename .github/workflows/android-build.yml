@@ -1,11 +1,7 @@
 name: Build Floop Captain APK
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'floop-captain/**'
-      - '.github/workflows/android-build.yml'
+  # Automatic builds DISABLED per user (2026-10-19) — manual runs only.
   workflow_dispatch:
 
 defaults:
