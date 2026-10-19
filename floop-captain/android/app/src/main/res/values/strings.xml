@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Floop Captain</string>
+    <string name="title_activity_main">Floop Captain</string>
+    <string name="package_name">com.floop.captain</string>
+    <string name="custom_url_scheme">com.floop.captain</string>
+</resources>

@@ -1,0 +1,63 @@
+name: Build Floop Captain APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'floop-captain/**'
+      - '.github/workflows/android-build.yml'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: floop-captain
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: floop-captain/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
+      - name: Verify background-location capability in manifest
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          grep -q "ACCESS_BACKGROUND_LOCATION" "$MANIFEST" || (echo "MISSING: ACCESS_BACKGROUND_LOCATION" && exit 1)
+          grep -q "FOREGROUND_SERVICE_LOCATION" "$MANIFEST" || (echo "MISSING: FOREGROUND_SERVICE_LOCATION" && exit 1)
+          grep -q "transistorsoft" android/capacitor.settings.gradle || (echo "MISSING: background-geolocation plugin" && exit 1)
+          echo "Background location capability confirmed in manifest + plugin list"
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: cd android && ./gradlew assembleDebug --stacktrace
+
+      - name: Verify APK exists
+        run: ls -lh android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: floop-captain-apk
+          path: floop-captain/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
