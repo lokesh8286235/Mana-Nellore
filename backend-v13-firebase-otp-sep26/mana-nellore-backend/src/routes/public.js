@@ -135,7 +135,7 @@ router.get(
   '/config',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'customer_fee', 'budget_threshold_paise')"
+      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'customer_fee', 'budget_threshold_paise', 'referral_reward_paise', 'tip_min_paise', 'tip_max_paise')"
     );
     const m = Object.fromEntries(rows.map((r) => [r.key, r.value]));
     // Customer delivery fee tiers (user 2026-10-15): backend-configurable, nothing hardcoded in apps
@@ -151,12 +151,20 @@ router.get(
     };
     // Budget section threshold (user 2026-10-19): backend-driven, nothing hardcoded in apps
     const budgetThreshold = m.budget_threshold_paise ? parseInt(m.budget_threshold_paise, 10) : 15000;
+    // Referral reward (user 2026-10-20): backend-driven, nothing hardcoded in apps
+    const referralReward = m.referral_reward_paise ? parseInt(m.referral_reward_paise, 10) : 5000;
+    // Tip limits (user 2026-10-20): backend-driven, nothing hardcoded in apps
+    const tipMin = m.tip_min_paise ? parseInt(m.tip_min_paise, 10) : 1000;
+    const tipMax = m.tip_max_paise ? parseInt(m.tip_max_paise, 10) : 50000;
     res.json({
       call_to_order_phone: (m.call_to_order_phone) || '',
       maps_key: process.env.GOOGLE_MAPS_KEY || '',
       razorpay_key: process.env.RAZORPAY_KEY_ID || '',
       customer_fee: customerFee,
-      budget_threshold_paise: budgetThreshold
+      budget_threshold_paise: budgetThreshold,
+      referral_reward_paise: referralReward,
+      tip_min_paise: tipMin,
+      tip_max_paise: tipMax
     });
   })
 );
