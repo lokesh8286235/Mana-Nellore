@@ -135,7 +135,7 @@ router.get(
   '/config',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'customer_fee', 'budget_threshold_paise', 'referral_reward_paise', 'tip_min_paise', 'tip_max_paise')"
+      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'customer_fee', 'budget_threshold_paise', 'referral_reward_paise', 'tip_min_paise', 'tip_max_paise', 'prep_lead_minutes')"
     );
     const m = Object.fromEntries(rows.map((r) => [r.key, r.value]));
     // Customer delivery fee tiers (user 2026-10-15): backend-configurable, nothing hardcoded in apps
@@ -156,6 +156,8 @@ router.get(
     // Tip limits (user 2026-10-20): backend-driven, nothing hardcoded in apps
     const tipMin = m.tip_min_paise ? parseInt(m.tip_min_paise, 10) : 1000;
     const tipMax = m.tip_max_paise ? parseInt(m.tip_max_paise, 10) : 50000;
+    // Prep lead time (user 2026-10-20): backend-driven, nothing hardcoded in apps
+    const prepLead = m.prep_lead_minutes ? parseInt(m.prep_lead_minutes, 10) : 30;
     res.json({
       call_to_order_phone: (m.call_to_order_phone) || '',
       maps_key: process.env.GOOGLE_MAPS_KEY || '',
@@ -164,7 +166,8 @@ router.get(
       budget_threshold_paise: budgetThreshold,
       referral_reward_paise: referralReward,
       tip_min_paise: tipMin,
-      tip_max_paise: tipMax
+      tip_max_paise: tipMax,
+      prep_lead_minutes: prepLead
     });
   })
 );
