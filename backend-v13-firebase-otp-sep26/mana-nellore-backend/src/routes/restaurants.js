@@ -162,7 +162,7 @@ router.get(
     const { rows } = await db.query(
       `SELECT r.*,
               COALESCE(ao.cnt, 0)::int AS active_orders,
-              COALESCE(ap.avg_min, 0)::int AS avg_pack_minutes,
+              NULLIF(ap.avg_min, 0)::int AS avg_pack_minutes,
               COALESCE(hv.has_veg, false) AS has_veg,
               COALESCE(o7.cnt, 0)::int AS orders_7d,
               COALESCE(rn.cnt, 0)::int AS rating_n${scoreCols}
