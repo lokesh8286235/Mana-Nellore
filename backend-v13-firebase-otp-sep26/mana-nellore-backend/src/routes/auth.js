@@ -137,6 +137,94 @@ router.post(
   })
 );
 
+// ---------- Firebase Phone Auth (floop-d2ffa) ----------
+// Restored 2026-10-29 (was removed 2026-09-27, see OTP_SPEC.md). Rider +
+// customer login ONLY (user scope 2026-10-28); restaurant/admin do not use it.
+// Flow: app signs in with Firebase Phone Auth (SMS) -> POSTs the Firebase ID
+// token here -> backend verifies it against Google's certs and issues the app
+// JWT. No firebase-admin dependency: RS256 is verified manually, same as the
+// original implementation. Project comes from FIREBASE_PROJECT_ID (default
+// floop-d2ffa); the Firebase web config itself lives in the apps, not here.
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'floop-d2ffa';
+
+function b64urlDecode(str) {
+  let s = String(str).replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return Buffer.from(s, 'base64');
+}
+
+function fetchGoogleCerts() {
+  return new Promise((resolve, reject) => {
+    require('https').get('https://www.googleapis.com/oauth2/v3/certs', (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(body)); }
+        catch (e) { reject(new Error('Bad cert response')); }
+      });
+    }).on('error', reject);
+  });
+}
+
+// Returns the decoded claims, or throws. Checks signature, audience, issuer,
+// expiry, and that the token carries a phone number (Phone Auth only).
+async function verifyFirebaseIdToken(idToken) {
+  const parts = String(idToken || '').split('.');
+  if (parts.length !== 3) throw new Error('Malformed token');
+  const [headerB64, payloadB64, signatureB64] = parts;
+  const header = JSON.parse(b64urlDecode(headerB64).toString('utf8'));
+  const claims = JSON.parse(b64urlDecode(payloadB64).toString('utf8'));
+  const certs = await fetchGoogleCerts();
+  const cert = certs[header.kid];
+  if (!cert) throw new Error('Unknown signing key');
+  const ok = require('crypto').createVerify('RSA-SHA256')
+    .update(headerB64 + '.' + payloadB64)
+    .verify(cert, b64urlDecode(signatureB64));
+  if (!ok) throw new Error('Bad signature');
+  if (claims.aud !== FIREBASE_PROJECT_ID) throw new Error('Wrong project');
+  if (claims.iss !== 'https://securetoken.google.com/' + FIREBASE_PROJECT_ID) throw new Error('Wrong issuer');
+  if (!claims.exp || claims.exp * 1000 <= Date.now()) throw new Error('Token expired');
+  if (!claims.phone_number) throw new Error('No phone number in token');
+  return claims;
+}
+
+// POST /api/auth/firebase { idToken, name?, role? }
+// role: customer | rider only. Creates the user on first login, same as verify-otp.
+router.post(
+  '/firebase',
+  ah(async (req, res) => {
+    const { idToken, name } = req.body;
+    let role = req.body.role || 'customer';
+    if (!['customer', 'rider'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+    let claims;
+    try {
+      claims = await verifyFirebaseIdToken(idToken);
+    } catch (e) {
+      return res.status(401).json({ error: 'Invalid Firebase token' });
+    }
+    const phone = normalizePhone(claims.phone_number);
+    if (!phone) return res.status(400).json({ error: 'Invalid phone number in token' });
+
+    const user = await findOrCreateUserByPhone(phone, role, name);
+    const token = signToken(user);
+    let isNewRider = false;
+    if (role === 'rider' && user._isNew) {
+      isNewRider = true;
+    } else if (role === 'rider') {
+      const { rows: rrows } = await db.query(
+        'SELECT registration_completed FROM riders WHERE user_id = $1', [user.id]);
+      isNewRider = rrows.length > 0 && !rrows[0].registration_completed;
+    }
+    res.json({
+      token,
+      user: { id: user.id, phone: user.phone, name: user.name, role: user.role },
+      is_new_rider: isNewRider
+    });
+  })
+);
+
 // POST /api/auth/admin-login { phone, password }
 router.post(
   '/admin-login',

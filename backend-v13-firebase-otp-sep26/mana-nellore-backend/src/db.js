@@ -243,6 +243,17 @@ async function migrate() {
   await q('CREATE INDEX IF NOT EXISTS idx_go_code ON group_orders(code)');
   await q('CREATE INDEX IF NOT EXISTS idx_goi_group ON group_order_items(group_id)');
 
+  // Push device tokens (FCM). One row per device token; re-login reassigns it.
+  await q(`CREATE TABLE IF NOT EXISTS push_tokens (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role text NOT NULL,
+    token text NOT NULL UNIQUE,
+    platform text NOT NULL CHECK (platform IN ('android','ios','web')),
+    updated_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id)');
+
   // Backfill share tokens for old orders
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
            WHERE share_token IS NULL`);
@@ -267,7 +278,7 @@ function defaultPricingRows() {
       slab3_base_rate_paise_per_km: 800,  // 8+ km: first 8 km @ Rs 8/km
       slab3_extra_rate_paise_per_km: 1000 // + extra km @ Rs 10/km
     },
-    platform_fee_paise: 800, // Rs 8
+    platform_fee_paise: 700, // Rs 7
     default_commission_pct: 12,
     free_delivery_rules: {
       rules: [

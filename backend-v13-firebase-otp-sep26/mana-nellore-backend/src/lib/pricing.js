@@ -50,7 +50,7 @@ async function loadPricingConfig(db) {
         { min_order_paise: 130100, free_km: 8 }   // Rs 1301+: 8km free
       ]
     },
-    platformFeePaise: Number(m.platform_fee_paise != null ? m.platform_fee_paise : 800),
+    platformFeePaise: Number(m.platform_fee_paise != null ? m.platform_fee_paise : 700),
     defaultCommissionPct: Number(
       m.default_commission_pct != null ? m.default_commission_pct : 12
     ),
