@@ -304,14 +304,14 @@ router.get(
   '/charts/top-dishes',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      `SELECT oi.menu_item_id, oi.name_snapshot AS name, mi.image_url,
+      `SELECT oi.menu_item_id, oi.name_snapshot AS name, mi.image_url, mi.veg,
               r.name AS restaurant_name, COUNT(*) AS orders
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
        LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
        LEFT JOIN restaurants r ON r.id = o.restaurant_id
        WHERE o.status = 'delivered' AND o.placed_at > now() - interval '7 days'
-       GROUP BY oi.menu_item_id, oi.name_snapshot, mi.image_url, r.name
+       GROUP BY oi.menu_item_id, oi.name_snapshot, mi.image_url, mi.veg, r.name
        ORDER BY orders DESC LIMIT 20`
     );
     res.json({ top_dishes: rows.map((x) => ({ ...x, orders: Number(x.orders) })) });

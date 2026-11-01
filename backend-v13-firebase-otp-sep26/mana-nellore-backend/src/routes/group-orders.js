@@ -35,7 +35,7 @@ router.get(
     if (!rows.length) return res.status(404).json({ error: 'Group not found' });
     const g = rows[0];
     const items = await db.query(
-      `SELECT gi.*, mi.name AS dish_name, mi.price_paise
+      `SELECT gi.*, mi.name AS dish_name, mi.price_paise, mi.veg
        FROM group_order_items gi
        LEFT JOIN menu_items mi ON mi.id = gi.dish_id
        WHERE gi.group_id = $1 ORDER BY gi.added_at`,
@@ -88,7 +88,7 @@ router.post(
     if (String(g.host_user_id) !== String(req.user.id)) return res.status(403).json({ error: 'Only host can close' });
     await db.query("UPDATE group_orders SET status = 'closed' WHERE id = $1", [g.id]);
     const items = await db.query(
-      `SELECT gi.dish_id, gi.qty, gi.person_name, mi.name AS dish_name, mi.price_paise
+      `SELECT gi.dish_id, gi.qty, gi.person_name, mi.name AS dish_name, mi.price_paise, mi.veg
        FROM group_order_items gi
        LEFT JOIN menu_items mi ON mi.id = gi.dish_id
        WHERE gi.group_id = $1`,
