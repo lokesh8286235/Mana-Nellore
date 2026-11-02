@@ -318,6 +318,24 @@ router.get(
   })
 );
 
+// GET /api/restaurants/charts/trending-searches — most-searched terms, last 7 days
+router.get(
+  '/charts/trending-searches',
+  ah(async (req, res) => {
+    try { await ensureSearchLogs(); } catch (e) { /* table may not exist yet */ }
+    let rows = [];
+    try {
+      const r = await db.query(
+        `SELECT q AS term, COUNT(*)::int AS searches FROM search_logs
+         WHERE created_at >= now() - interval '7 days'
+         GROUP BY q ORDER BY searches DESC, q ASC LIMIT 8`
+      );
+      rows = r.rows;
+    } catch (e) { rows = []; }
+    res.json({ trending_searches: rows });
+  })
+);
+
 // GET /api/restaurants/charts/trending-now — dishes ordered in the last 3 hours
 router.get(
   '/charts/trending-now',
@@ -432,6 +450,20 @@ router.get(
   })
 );
 
+// Search-query logging for trending searches (last 7 days). Table is created
+// lazily on first use; logging failures never break search.
+let searchLogsReady = false;
+async function ensureSearchLogs() {
+  if (searchLogsReady) return;
+  await db.query(`CREATE TABLE IF NOT EXISTS search_logs (
+    id SERIAL PRIMARY KEY,
+    q TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
+  await db.query('CREATE INDEX IF NOT EXISTS idx_search_logs_created ON search_logs (created_at)');
+  searchLogsReady = true;
+}
+
 // GET /api/restaurants/dishes/search?q=&max_price_paise= — Ask Floop dish search
 // Spelling-tolerant via ILIKE; accepts missing q (returns popular available dishes).
 router.get(
@@ -439,6 +471,14 @@ router.get(
   ah(async (req, res) => {
     const q = String(req.query.q || '').trim();
     const maxPrice = req.query.max_price_paise ? Number(req.query.max_price_paise) : null;
+    // Log submitted searches for trending-searches (never breaks search on failure).
+    if (q) {
+      try {
+        await ensureSearchLogs();
+        const nq = q.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 100);
+        if (nq.length >= 2) await db.query('INSERT INTO search_logs (q) VALUES ($1)', [nq]);
+      } catch (e) { /* ignore logging errors */ }
+    }
     const params = [];
     const conditions = [
       'mi.available = true',
