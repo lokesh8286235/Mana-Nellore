@@ -172,4 +172,22 @@ router.get(
   })
 );
 
+// GET /api/banner-promotions — active banner promotions only. A promotion
+// is active while now is between starts_at and ends_at (ends_at null =
+// no expiry). Expired promotions stop appearing on their own — no code,
+// no manual removal. The customer app renders these as hero banner slides.
+router.get(
+  '/banner-promotions',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT bp.id, bp.restaurant_id, r.name AS restaurant_name, bp.title, bp.image_url,
+              bp.starts_at, bp.ends_at
+       FROM banner_promotions bp JOIN restaurants r ON r.id = bp.restaurant_id
+       WHERE bp.starts_at <= now() AND (bp.ends_at IS NULL OR bp.ends_at > now())
+       ORDER BY bp.starts_at DESC, bp.created_at DESC`
+    );
+    res.json({ promotions: rows });
+  })
+);
+
 module.exports = router;

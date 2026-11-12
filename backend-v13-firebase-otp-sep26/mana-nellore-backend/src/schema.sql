@@ -69,6 +69,16 @@ CREATE TABLE IF NOT EXISTS restaurants (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS banner_promotions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  restaurant_id uuid NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  title text NOT NULL,
+  image_url text,
+  starts_at timestamptz NOT NULL DEFAULT now(),
+  ends_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS categories (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   restaurant_id uuid NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,

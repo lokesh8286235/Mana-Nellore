@@ -257,6 +257,19 @@ async function migrate() {
   // Backfill share tokens for old orders
   await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
            WHERE share_token IS NULL`);
+
+  // Banner promotions (customer-app hero banners, managed no-code from admin).
+  await q(`CREATE TABLE IF NOT EXISTS banner_promotions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    restaurant_id uuid NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+    title text NOT NULL,
+    image_url text,
+    starts_at timestamptz NOT NULL DEFAULT now(),
+    ends_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_banner_promotions_restaurant ON banner_promotions(restaurant_id)');
+  await q('CREATE INDEX IF NOT EXISTS idx_banner_promotions_active ON banner_promotions(starts_at, ends_at)');
 }
 
 // Default pricing rules (paise). Admin can edit these live via /api/admin/pricing.

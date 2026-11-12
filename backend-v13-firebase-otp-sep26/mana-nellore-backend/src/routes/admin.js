@@ -1256,6 +1256,83 @@ router.delete(
   })
 );
 
+// ---- Banner promotions (customer-app hero banners, managed no-code) ----
+router.get(
+  '/banner-promotions',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT bp.*, r.name AS restaurant_name
+       FROM banner_promotions bp JOIN restaurants r ON r.id = bp.restaurant_id
+       ORDER BY bp.created_at DESC`
+    );
+    res.json({ promotions: rows });
+  })
+);
+
+router.post(
+  '/banner-promotions',
+  ah(async (req, res) => {
+    const { restaurant_id, title, image_url, starts_at, ends_at } = req.body || {};
+    if (!restaurant_id) return res.status(400).json({ error: 'restaurant_id is required' });
+    if (!title || !String(title).trim()) return res.status(400).json({ error: 'title is required' });
+    const rest = await db.query('SELECT id, image_url FROM restaurants WHERE id = $1', [restaurant_id]);
+    if (!rest.rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    const start = starts_at ? new Date(starts_at) : new Date();
+    if (isNaN(start.getTime())) return res.status(400).json({ error: 'Invalid starts_at' });
+    // No end date given -> runs 1 week from the start (the admin presets
+    // always send one; this is only a safety default).
+    const end = ends_at ? new Date(ends_at) : new Date(start.getTime() + 7 * 86400000);
+    if (isNaN(end.getTime())) return res.status(400).json({ error: 'Invalid ends_at' });
+    if (end <= start) return res.status(400).json({ error: 'ends_at must be after starts_at' });
+    // No picture given -> fall back to the restaurant's own photo so the
+    // banner always has an image.
+    const img = (image_url && String(image_url).trim()) || rest.rows[0].image_url || null;
+    const { rows } = await db.query(
+      `INSERT INTO banner_promotions (restaurant_id, title, image_url, starts_at, ends_at)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [restaurant_id, String(title).trim(), img, start.toISOString(), end.toISOString()]
+    );
+    await audit(req, 'banner_promotion_create', 'banner_promotion', rows[0].id, { restaurant_id, title: rows[0].title });
+    res.status(201).json({ promotion: rows[0] });
+  })
+);
+
+router.put(
+  '/banner-promotions/:id',
+  ah(async (req, res) => {
+    const { restaurant_id, title, image_url, starts_at, ends_at } = req.body || {};
+    const cur = await db.query('SELECT * FROM banner_promotions WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Promotion not found' });
+    if (restaurant_id) {
+      const rest = await db.query('SELECT id FROM restaurants WHERE id = $1', [restaurant_id]);
+      if (!rest.rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    const start = starts_at ? new Date(starts_at) : new Date(cur.rows[0].starts_at);
+    const end = ends_at ? new Date(ends_at) : (cur.rows[0].ends_at ? new Date(cur.rows[0].ends_at) : null);
+    if (isNaN(start.getTime())) return res.status(400).json({ error: 'Invalid starts_at' });
+    if (end && isNaN(end.getTime())) return res.status(400).json({ error: 'Invalid ends_at' });
+    if (end && end <= start) return res.status(400).json({ error: 'ends_at must be after starts_at' });
+    const { rows } = await db.query(
+      `UPDATE banner_promotions SET restaurant_id = COALESCE($1, restaurant_id), title = COALESCE($2, title),
+         image_url = COALESCE($3, image_url), starts_at = COALESCE($4, starts_at), ends_at = $5
+       WHERE id = $6 RETURNING *`,
+      [restaurant_id || null, title ? String(title).trim() : null, (image_url && String(image_url).trim()) || null,
+       starts_at ? start.toISOString() : null, end ? end.toISOString() : null, req.params.id]
+    );
+    await audit(req, 'banner_promotion_update', 'banner_promotion', req.params.id, {});
+    res.json({ promotion: rows[0] });
+  })
+);
+
+router.delete(
+  '/banner-promotions/:id',
+  ah(async (req, res) => {
+    await db.query('DELETE FROM banner_promotions WHERE id = $1', [req.params.id]);
+    await audit(req, 'banner_promotion_delete', 'banner_promotion', req.params.id, {});
+    res.json({ ok: true });
+  })
+);
+
 // ---- Verify a restaurant (✓ badge) ----
 router.put(
   '/restaurants/:id/verify',
