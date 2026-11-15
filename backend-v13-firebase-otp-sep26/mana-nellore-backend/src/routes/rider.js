@@ -6,6 +6,7 @@ const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, riderPayoutPaise } = require('../lib/pricing');
 const { dispatchOrder, sweepExpiredOffers, dispatchPendingOrders, clearRiderOffer } = require('../lib/dispatch');
+const { pushToUser } = require('../lib/fcm');
 
 const router = express.Router();
 router.use(authenticate, requireRole('rider'));
@@ -1217,6 +1218,11 @@ router.put(
     await transition(detail.id, 'picked_up', 'rider');
     await notify(detail.customer_id, 'Your rider is on the way',
       `Your rider has picked up the order. Share your delivery OTP to receive it.`);
+    pushToUser(detail.customer_id, {
+      title: 'Your rider is on the way',
+      body: 'Your rider has picked up the order. Share your delivery OTP to receive it.',
+      data: { type: 'order_status', order_id: detail.id, status: 'picked_up' },
+    });
     res.json({ ok: true, status: 'picked_up' });
   })
 );
@@ -1231,6 +1237,11 @@ router.put(
     if (!detail) return res.status(404).json({ error: 'Delivery not found' });
     if (detail.status !== 'picked_up') return res.status(409).json({ error: `Invalid status ${detail.status}` });
     await transition(detail.id, 'on_way', 'rider');
+    pushToUser(detail.customer_id, {
+      title: 'On the way 🛵',
+      body: 'Your order is on its way to you.',
+      data: { type: 'order_status', order_id: detail.id, status: 'on_way' },
+    });
     res.json({ ok: true, status: 'on_way' });
   })
 );
@@ -1323,6 +1334,11 @@ router.post(
 
     await notify(order.customer_id, 'Delivered! 🍽️',
       'Wash your hands — your food is here! Enjoy every bite. Loved it? Tap to rate ⭐');
+    pushToUser(order.customer_id, {
+      title: 'Delivered! 🍽️',
+      body: 'Wash your hands — your food is here! Enjoy every bite. Loved it? Tap to rate ⭐',
+      data: { type: 'order_status', order_id: order.id, status: 'delivered' },
+    });
     await checkQuests(rider.id);
     res.json({ ok: true, status: 'delivered', payout_paise: payout });
   })

@@ -6,6 +6,7 @@ const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, computeQuote, otwSecondaryFeePaise, tripPayoutPaise } = require('../lib/pricing');
 const { pointToSegKm } = require('../lib/otw');
+const { pushToUser } = require('../lib/fcm');
 
 const router = express.Router();
 router.use(authenticate);
@@ -494,6 +495,12 @@ async function placeMultiGroupOrder(req, res) {
       if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
         await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
           `Delivery order worth Rs ${(finalTotal / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
+        // Push: items total only (restaurants see item prices, never fees).
+        pushToUser(ownerRes.rows[0].owner_id, {
+          title: `New order #${orderNumber}`,
+          body: `${restaurant.name} — new delivery order worth Rs ${(subtotal / 100).toFixed(2)}`,
+          data: { type: 'new_order', order_id: order.id, status: 'placed' },
+        });
       }
     }
 
@@ -753,6 +760,12 @@ router.post(
       if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
         await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
           `${dineIn ? 'Dine-in table order' : 'Delivery order'} worth Rs ${(order.total_paise / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
+        // Push: items total only (restaurants see item prices, never fees).
+        pushToUser(ownerRes.rows[0].owner_id, {
+          title: `New order #${orderNumber}`,
+          body: `${restaurant.name} — new ${dineIn ? 'dine-in' : 'delivery'} order worth Rs ${(subtotal / 100).toFixed(2)}`,
+          data: { type: 'new_order', order_id: order.id, status: 'placed' },
+        });
       }
       await notify(req.user.id, 'Order placed ✅',
         `${restaurant.name} (${orderNumber}) got your order and the kitchen is firing up! 🔥 Your delivery OTP is ${deliveryOtp} — share it with your rider at handover.`);

@@ -22,6 +22,7 @@
 
 const db = require('../db');
 const { haversineKm } = require('./pricing');
+const { pushToUser } = require('./fcm');
 
 const OFFER_WINDOW_SEC = 30;   // how long one rider holds the offer
 const RETRY_THROTTLE_SEC = 30; // min gap between dispatch retries for queued orders
@@ -138,13 +139,16 @@ async function placeOffer(orderIds, rider) {
     [rider.id, expiresAt, orderIds]
   );
   const n = orderIds.length;
-  await notifyUser(
-    rider.user_id,
-    n > 1 ? `New trip offer \u{1F6F5}` : `New delivery offer \u{1F6F5}`,
-    n > 1
-      ? `${n} orders ready nearby — tap to view. Offer expires in ${OFFER_WINDOW_SEC}s.`
-      : `A delivery near you is ready — tap to view. Offer expires in ${OFFER_WINDOW_SEC}s.`
-  );
+  const offerTitle = n > 1 ? `New trip offer \u{1F6F5}` : `New delivery offer \u{1F6F5}`;
+  const offerBody = n > 1
+    ? `${n} orders ready nearby — tap to view. Offer expires in ${OFFER_WINDOW_SEC}s.`
+    : `A delivery near you is ready — tap to view. Offer expires in ${OFFER_WINDOW_SEC}s.`;
+  await notifyUser(rider.user_id, offerTitle, offerBody);
+  pushToUser(rider.user_id, {
+    title: offerTitle,
+    body: offerBody,
+    data: { type: 'rider_offer', order_id: orderIds[0], status: 'ready' },
+  });
   return { offeredTo: rider.id, expiresAt };
 }
 

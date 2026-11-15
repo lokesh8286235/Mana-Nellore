@@ -8,6 +8,7 @@ const router = express.Router();
 router.use(authenticate, requireRole('restaurant_owner'));
 
 const { dispatchOrder } = require('../lib/dispatch');
+const { pushToUser } = require('../lib/fcm');
 
 async function ownRestaurantId(userId) {
   const { rows } = await db.query('SELECT id FROM restaurants WHERE owner_id = $1', [userId]);
@@ -541,13 +542,24 @@ router.put(
       await db.query('UPDATE orders SET delivered_at = now() WHERE id = $1', [order.id]);
       await notify(db, order.customer_id, 'Enjoy your meal! 🍽️',
         'Your food is served fresh at your table. Loved it? Tap to rate ⭐');
+      pushToUser(order.customer_id, {
+        title: 'Enjoy your meal! 🍽️',
+        body: 'Your food is served fresh at your table. Loved it? Tap to rate ⭐',
+        data: { type: 'order_status', order_id: order.id, status: 'delivered' },
+      });
     } else {
       const copy = {
         accepted: ['Order accepted ✅', `is firing up the kitchen for you! 🔥`],
         preparing: ['On the flame! 👨‍🍳', 'is preparing your food fresh right now.'],
         ready: ['Packed fresh! 📦', 'packed your order fresh — a rider is on the way to pick it up. 🛵']
       }[rule.to];
-      await notify(db, order.customer_id, copy[0], `${(await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name} ${copy[1]}`);
+      const restName = (await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name;
+      await notify(db, order.customer_id, copy[0], `${restName} ${copy[1]}`);
+      pushToUser(order.customer_id, {
+        title: copy[0],
+        body: `${restName} ${copy[1]}`,
+        data: { type: 'order_status', order_id: order.id, status: rule.to },
+      });
     }
     res.json({ ok: true, status: rule.to });
   })

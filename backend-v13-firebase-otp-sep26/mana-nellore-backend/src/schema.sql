@@ -450,6 +450,19 @@ CREATE INDEX IF NOT EXISTS idx_restaurant_photos_rest ON restaurant_photos(resta
 CREATE INDEX IF NOT EXISTS idx_orders_placed_at ON orders(placed_at);
 CREATE INDEX IF NOT EXISTS idx_ratings_ratee ON ratings(ratee_type, ratee_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+
+-- Push device tokens (FCM). Registered by apps via POST /api/push/token;
+-- sending reads them in src/lib/fcm.js. Unique on token so a device
+-- re-registering updates its row instead of duplicating it.
+CREATE TABLE IF NOT EXISTS push_tokens (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role text NOT NULL,
+  token text NOT NULL UNIQUE,
+  platform text NOT NULL CHECK (platform IN ('android','ios','web')),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_categories_restaurant ON categories(restaurant_id);
 CREATE INDEX IF NOT EXISTS idx_cust_groups_item ON customization_groups(menu_item_id);
 CREATE INDEX IF NOT EXISTS idx_cust_opts_group ON customization_options(group_id);

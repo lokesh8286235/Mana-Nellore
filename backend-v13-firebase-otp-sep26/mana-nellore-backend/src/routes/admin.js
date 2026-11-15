@@ -68,6 +68,42 @@ async function transition(orderId, status, by) {
 
 const ACTIVE_STATUSES = ['placed', 'accepted', 'preparing', 'ready', 'picked_up', 'on_way'];
 
+// POST /api/admin/test-push — send a test notification to the calling admin's
+// own registered device tokens. This is how delivery is verified once
+// FIREBASE_SERVICE_ACCOUNT is set in Railway: register a token from an app,
+// then call this. Never exposes any credential value.
+router.post(
+  '/test-push',
+  ah(async (req, res) => {
+    const { isConfigured, configError, sendToUser } = require('../lib/fcm');
+    if (!isConfigured()) {
+      const { rows } = await db.query('SELECT COUNT(*) AS n FROM push_tokens WHERE user_id = $1', [req.user.id]);
+      return res.json({
+        ok: false,
+        configured: false,
+        reason: configError() || 'FCM sender not configured',
+        tokens: Number(rows[0].n),
+        sent: 0,
+        failed: 0,
+        results: [],
+      });
+    }
+    const result = await sendToUser(req.user.id, {
+      title: 'Floop test notification',
+      body: 'Push notifications are working.',
+      data: { type: 'test' },
+    });
+    res.json({
+      ok: result.sent > 0,
+      configured: true,
+      tokens: result.tokens,
+      sent: result.sent,
+      failed: result.failed,
+      results: result.results || [],
+    });
+  })
+);
+
 // GET /api/admin/dashboard
 router.get(
   '/dashboard',
