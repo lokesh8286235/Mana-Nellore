@@ -231,8 +231,10 @@ router.put(
     const b = req.body || {};
     // Empty strings -> null (so time columns don't get invalid "")
     const clean = v => (v === '' || v === undefined ? null : v);
-    const name = clean(b.name), address = clean(b.address), fssai = clean(b.fssai_license);
+    const name = clean(b.name), address = clean(b.address);
+    const fssai = clean(b.fssai_license) != null ? clean(b.fssai_license) : clean(b.fssai);
     const opens_at = clean(b.opens_at), closes_at = clean(b.closes_at);
+    const opens_at_we = clean(b.opens_at_we), closes_at_we = clean(b.closes_at_we);
     const lat = clean(b.lat), lng = clean(b.lng);
     const { rows } = await db.query(
       `UPDATE restaurants SET 
@@ -243,9 +245,11 @@ router.put(
         closes_at = COALESCE($5, closes_at),
         lat = COALESCE($6, lat),
         lng = COALESCE($7, lng),
+        opens_at_we = COALESCE($8, opens_at_we),
+        closes_at_we = COALESCE($9, closes_at_we),
         updated_at = NOW()
-       WHERE id = $8 RETURNING *`,
-      [name, address, fssai, opens_at, closes_at, lat, lng, req.params.id]
+       WHERE id = $10 RETURNING *`,
+      [name, address, fssai, opens_at, closes_at, lat, lng, opens_at_we, closes_at_we, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, 'restaurant_update', 'restaurant', req.params.id, req.body);
@@ -1484,11 +1488,25 @@ router.post(
     if (imageUrl && imageUrl.startsWith('data:image/')) {
       imageUrl = await uploadToCloudinary(imageUrl, 'menu');
     }
+    let calories = null;
+    if (b.calories !== undefined && b.calories !== null && b.calories !== '') {
+      calories = parseInt(b.calories, 10);
+      if (!Number.isFinite(calories) || calories < 0 || calories > 5000) {
+        return res.status(400).json({ error: 'Calories must be a whole number 0–5000' });
+      }
+    }
+    let protein = null;
+    if (b.protein !== undefined && b.protein !== null && b.protein !== '') {
+      protein = parseFloat(b.protein);
+      if (!Number.isFinite(protein) || protein < 0 || protein > 500) {
+        return res.status(400).json({ error: 'Protein must be a number 0–500' });
+      }
+    }
     const { rows } = await db.query(
-      `INSERT INTO menu_items (restaurant_id, name, price_paise, category_id, description, veg, available, image_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [req.params.id, b.name, b.price_paise, categoryId, b.description || null, 
-       b.veg !== false, b.available !== false, imageUrl]
+      `INSERT INTO menu_items (restaurant_id, name, price_paise, category_id, description, veg, available, image_url, calories, protein_g)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [req.params.id, b.name, b.price_paise, categoryId, b.description || null,
+       b.veg !== false, b.available !== false, imageUrl, calories, protein]
     );
     await audit(req, 'menu_item_create', 'menu_item', rows[0].id, { restaurant_id: req.params.id });
     res.json({ item: rows[0] });
@@ -1527,6 +1545,26 @@ router.put(
     if (b.veg !== undefined) { fields.push(`veg = $${i++}`); params.push(b.veg); }
     if (b.available !== undefined) { fields.push(`available = $${i++}`); params.push(b.available); }
     if (imageUrl !== undefined) { fields.push(`image_url = $${i++}`); params.push(imageUrl); }
+    if (b.calories !== undefined) {
+      let cal = null;
+      if (b.calories !== null && b.calories !== '') {
+        cal = parseInt(b.calories, 10);
+        if (!Number.isFinite(cal) || cal < 0 || cal > 5000) {
+          return res.status(400).json({ error: 'Calories must be a whole number 0–5000' });
+        }
+      }
+      fields.push(`calories = $${i++}`); params.push(cal);
+    }
+    if (b.protein !== undefined) {
+      let prot = null;
+      if (b.protein !== null && b.protein !== '') {
+        prot = parseFloat(b.protein);
+        if (!Number.isFinite(prot) || prot < 0 || prot > 500) {
+          return res.status(400).json({ error: 'Protein must be a number 0–500' });
+        }
+      }
+      fields.push(`protein_g = $${i++}`); params.push(prot);
+    }
     if (!fields.length) return res.status(400).json({ error: 'No fields to update' });
     params.push(req.params.itemId, req.params.id);
     const { rows } = await db.query(

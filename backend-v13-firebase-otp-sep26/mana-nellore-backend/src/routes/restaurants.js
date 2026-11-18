@@ -505,6 +505,8 @@ router.get(
     }
     const { rows } = await db.query(
       `SELECT mi.id, mi.name, mi.price_paise, mi.image_url, mi.veg, mi.description,
+              mi.calories AS calories_kcal,
+              mi.protein_g,
               mi.restaurant_id, r.name AS restaurant_name, r.image_url AS restaurant_image,
               r.rating_avg AS restaurant_rating, r.is_open AS restaurant_open,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
@@ -527,6 +529,7 @@ router.get(
         rating_avg: Number(d.rating_avg) || 0,
         rating_count: Number(d.rating_count) || 0,
         restaurant_rating: d.restaurant_rating == null ? null : Number(d.restaurant_rating),
+        protein_g: d.protein_g != null ? Number(d.protein_g) : null,
       })),
     });
   })
@@ -573,7 +576,7 @@ router.get(
       mealCond = ` AND ('all' = ANY(meal_slot) OR $${itemParams.length} = ANY(meal_slot))`;
     }
     const items = await db.query(
-      `SELECT mi.*,
+      `SELECT mi.*, mi.calories AS calories_kcal,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count
        FROM menu_items mi

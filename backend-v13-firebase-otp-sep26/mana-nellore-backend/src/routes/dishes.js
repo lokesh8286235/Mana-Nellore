@@ -49,6 +49,8 @@ router.get(
 
     const { rows } = await db.query(
       `SELECT mi.id, mi.name, mi.description, mi.image_url, mi.price_paise, mi.veg,
+              mi.calories AS calories_kcal,
+              mi.protein_g,
               mi.restaurant_id,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count,
@@ -76,6 +78,8 @@ router.get(
       image_url: d.image_url,
       price_paise: d.price_paise,
       veg: !!d.veg,
+      calories_kcal: d.calories_kcal != null ? Number(d.calories_kcal) : null,
+      protein_g: d.protein_g != null ? Number(d.protein_g) : null,
       rating_avg: d.rating_avg,
       rating_count: d.rating_count,
       restaurant_id: d.restaurant_id,
@@ -97,6 +101,8 @@ router.get(
     const limit = Math.min(Number(req.query.limit) || 10, 30);
     const { rows } = await db.query(
       `SELECT mi.id, mi.name, mi.image_url, mi.price_paise, mi.veg, mi.restaurant_id,
+              mi.calories AS calories_kcal,
+              mi.protein_g,
               r.name AS restaurant_name, r.is_open AS restaurant_open,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count

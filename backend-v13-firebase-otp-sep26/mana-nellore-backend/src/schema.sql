@@ -8,7 +8,8 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- are two different users rows.
 CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  phone text NOT NULL,
+  phone text,
+  email text,
   name text,
   role text NOT NULL CHECK (role IN ('customer','restaurant_owner','rider','admin')),
   password_hash text,
@@ -26,6 +27,12 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS lng double precision;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS veg_only boolean NOT NULL DEFAULT false;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS healthy_default boolean NOT NULL DEFAULT false;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked boolean NOT NULL DEFAULT false;
+-- Google sign-in (2026-11-18): Google users have an email and NO phone.
+-- phone is nullable (NULLs are distinct under UNIQUE (phone, role)); email is
+-- unique per role so find-or-create by email cannot duplicate a profile.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email text;
+ALTER TABLE users ALTER COLUMN phone DROP NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_role_key ON users (email, role);
 
 -- OTP login codes (hashed, single-use, expiring)
 CREATE TABLE IF NOT EXISTS otp_codes (

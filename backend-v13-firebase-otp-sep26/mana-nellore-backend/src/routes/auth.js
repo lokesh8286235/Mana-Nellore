@@ -59,6 +59,32 @@ async function findOrCreateUserByPhone(phone, role, name) {
   return user;
 }
 
+// Same shape as findOrCreateUserByPhone, for Google sign-in: one email gets a
+// SEPARATE user profile per role. Google users have no phone (phone stays
+// NULL); the email is stored lowercase. Phone users keep email NULL.
+async function findOrCreateUserByEmail(email, role, name) {
+  const clean = String(email || '').trim().toLowerCase();
+  let userRes = await db.query(
+    'SELECT * FROM users WHERE email = $1 AND role = $2',
+    [clean, role]
+  );
+  let user = userRes.rows[0];
+  let isNew = false;
+  if (!user) {
+    isNew = true;
+    const created = await db.query(
+      'INSERT INTO users (phone, email, name, role, referral_code) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [null, clean, name || null, role, await makeReferralCode()]
+    );
+    user = created.rows[0];
+    if (role === 'rider') {
+      await db.query('INSERT INTO riders (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [user.id]);
+    }
+  }
+  user._isNew = isNew;
+  return user;
+}
+
 // POST /api/auth/send-otp { phone }
 // THE OTP API. With DEV_OTP=true the code is returned in the response for testing.
 // Otherwise a real SMS provider must send the code — WIRE IT HERE (see OTP_SPEC.md):
@@ -137,14 +163,15 @@ router.post(
   })
 );
 
-// ---------- Firebase Phone Auth (floop-d2ffa) ----------
+// ---------- Firebase Auth (Phone + Google sign-in, floop-d2ffa) ----------
 // Restored 2026-10-29 (was removed 2026-09-27, see OTP_SPEC.md). Rider +
 // customer login ONLY (user scope 2026-10-28); restaurant/admin do not use it.
-// Flow: app signs in with Firebase Phone Auth (SMS) -> POSTs the Firebase ID
-// token here -> backend verifies it against Google's certs and issues the app
-// JWT. No firebase-admin dependency: RS256 is verified manually, same as the
-// original implementation. Project comes from FIREBASE_PROJECT_ID (default
-// floop-d2ffa); the Firebase web config itself lives in the apps, not here.
+// Flow: app signs in with Firebase Phone Auth (SMS) or Google sign-in ->
+// POSTs the Firebase ID token here -> backend verifies it against Google's
+// certs and issues the app JWT. No firebase-admin dependency: RS256 is
+// verified manually, same as the original implementation. Project comes from
+// FIREBASE_PROJECT_ID (default floop-d2ffa); the Firebase web config itself
+// lives in the apps, not here.
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'floop-d2ffa';
 
 function b64urlDecode(str) {
@@ -167,7 +194,8 @@ function fetchGoogleCerts() {
 }
 
 // Returns the decoded claims, or throws. Checks signature, audience, issuer,
-// expiry, and that the token carries a phone number (Phone Auth only).
+// expiry, and that the token carries a phone number (Phone Auth) or an email
+// (Google sign-in). At least one of the two must be present.
 async function verifyFirebaseIdToken(idToken) {
   const parts = String(idToken || '').split('.');
   if (parts.length !== 3) throw new Error('Malformed token');
@@ -184,12 +212,14 @@ async function verifyFirebaseIdToken(idToken) {
   if (claims.aud !== FIREBASE_PROJECT_ID) throw new Error('Wrong project');
   if (claims.iss !== 'https://securetoken.google.com/' + FIREBASE_PROJECT_ID) throw new Error('Wrong issuer');
   if (!claims.exp || claims.exp * 1000 <= Date.now()) throw new Error('Token expired');
-  if (!claims.phone_number) throw new Error('No phone number in token');
+  if (!claims.phone_number && !claims.email) throw new Error('No phone number or email in token');
   return claims;
 }
 
 // POST /api/auth/firebase { idToken, name?, role? }
 // role: customer | rider only. Creates the user on first login, same as verify-otp.
+// Phone Auth tokens carry phone_number; Google sign-in tokens carry email.
+// Either is accepted (verifyFirebaseIdToken enforces at least one).
 router.post(
   '/firebase',
   ah(async (req, res) => {
@@ -204,10 +234,18 @@ router.post(
     } catch (e) {
       return res.status(401).json({ error: 'Invalid Firebase token' });
     }
-    const phone = normalizePhone(claims.phone_number);
-    if (!phone) return res.status(400).json({ error: 'Invalid phone number in token' });
-
-    const user = await findOrCreateUserByPhone(phone, role, name);
+    // Phone path: EXACT existing flow (unchanged).
+    // Google path: find/create by email; phone stays NULL for Google users.
+    let user;
+    if (claims.phone_number) {
+      const phone = normalizePhone(claims.phone_number);
+      if (!phone) return res.status(400).json({ error: 'Invalid phone number in token' });
+      user = await findOrCreateUserByPhone(phone, role, name);
+    } else {
+      const email = String(claims.email || '').trim().toLowerCase();
+      if (!email || !email.includes('@')) return res.status(400).json({ error: 'Invalid email in token' });
+      user = await findOrCreateUserByEmail(email, role, name || claims.name || null);
+    }
     const token = signToken(user);
     let isNewRider = false;
     if (role === 'rider' && user._isNew) {
@@ -219,7 +257,7 @@ router.post(
     }
     res.json({
       token,
-      user: { id: user.id, phone: user.phone, name: user.name, role: user.role },
+      user: { id: user.id, phone: user.phone || null, name: user.name, role: user.role },
       is_new_rider: isNewRider
     });
   })

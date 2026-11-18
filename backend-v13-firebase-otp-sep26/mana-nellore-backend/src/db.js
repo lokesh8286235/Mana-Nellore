@@ -50,6 +50,10 @@ async function migrate() {
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_student boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code text');
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by uuid');
+  // Google sign-in (2026-11-18): email column + phone nullable, unique per role.
+  await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS email text');
+  await q('ALTER TABLE users ALTER COLUMN phone DROP NOT NULL');
+  await q('CREATE UNIQUE INDEX IF NOT EXISTS users_email_role_key ON users (email, role)');
   await q(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_referred_by_fkey') THEN
       ALTER TABLE users ADD CONSTRAINT users_referred_by_fkey
