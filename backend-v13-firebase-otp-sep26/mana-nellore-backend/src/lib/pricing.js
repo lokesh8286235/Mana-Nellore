@@ -58,6 +58,11 @@ async function loadPricingConfig(db) {
     etaMinutes: Number(m.eta_minutes != null ? m.eta_minutes : 30),
     // On-the-way secondary fee: flat amount in paise (user-dictated 2026-10-13).
     otwFlatFeePaise: Number(m.otw_flat_fee_paise != null ? m.otw_flat_fee_paise : 500),
+    // Tip caps (user 2026-10-20): backend-driven via pricing_config keys
+    // 'tip_min_paise' / 'tip_max_paise', same values GET /api/config exposes.
+    // Order placement clamps the client-sent tip to tipMaxPaise.
+    tipMinPaise: Number(m.tip_min_paise != null ? m.tip_min_paise : 1000),
+    tipMaxPaise: Number(m.tip_max_paise != null ? m.tip_max_paise : 50000),
     // GST rates (user rule: food 5%, delivery 18%, platform 18%) — backend-driven
     // via pricing_config key 'tax_rates', admin-editable, exposed on GET /api/config.
     // Accepts both food_pct and food_gst_pct namings (the live row predates this
@@ -245,6 +250,11 @@ function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, co
     taxBreakdown: tax.breakdown,
     commissionPaise,
     riderPayoutPaise: payout,
+    // NOTE: totalPaise deliberately EXCLUDES tip. The tip is a rider gratuity
+    // added on top, not part of the priced quote: the quote-bill and the
+    // place-breakdown totals add tipPaise to this value themselves
+    // (total_paise = totalPaise + tipPaise). Do not "fix" this by adding tip
+    // here — it would double-count the tip in every bill.
     totalPaise: net + deliveryFee + platformFeePaise + tax.taxPaise
   };
 }

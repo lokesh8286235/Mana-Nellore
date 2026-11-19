@@ -144,6 +144,15 @@ router.get(
     if (open === 'true') {
       conditions.push('r.is_open = true');
     }
+    // meal=breakfast|lunch|dinner: only restaurants with an available dish
+    // served at that meal (meal_slot contains the meal, or 'all'). The param
+    // used to be parsed and cache-keyed but never filtered — a silent no-op.
+    if (['breakfast', 'lunch', 'dinner'].includes(meal)) {
+      params.push(meal);
+      const mp = '$' + params.length;
+      conditions.push(`EXISTS (SELECT 1 FROM menu_items mi WHERE mi.restaurant_id = r.id
+        AND mi.available = true AND ('all' = ANY(mi.meal_slot) OR ${mp} = ANY(mi.meal_slot)))`);
+    }
 
     // ---- Smart "Recommended" scoring inputs (all from the DB, one query) ----
     // Global mean rating across rated restaurants (Bayesian prior), computed once.
@@ -174,7 +183,8 @@ router.get(
               NULLIF(ap.avg_min, 0)::int AS avg_pack_minutes,
               COALESCE(hv.has_veg, false) AS has_veg,
               COALESCE(o7.cnt, 0)::int AS orders_7d,
-              COALESCE(rn.cnt, 0)::int AS rating_n${scoreCols}
+              COALESCE(rn.cnt, 0)::int AS rating_n,
+              rn.live_avg AS rating_avg_live${scoreCols}
        FROM restaurants r
        LEFT JOIN (SELECT restaurant_id, COUNT(*) AS cnt FROM orders
                   WHERE status IN ('placed','accepted','preparing','ready')
@@ -190,7 +200,8 @@ router.get(
                   WHERE status NOT IN ('cancelled', 'rejected')
                   AND placed_at > now() - interval '7 days'
                   GROUP BY restaurant_id) o7 ON o7.restaurant_id = r.id
-       LEFT JOIN (SELECT ratee_id, COUNT(*) AS cnt FROM ratings
+       LEFT JOIN (SELECT ratee_id, COUNT(*) AS cnt,
+                         ROUND(AVG(food_rating)::numeric, 1)::float AS live_avg FROM ratings
                   WHERE ratee_type = 'restaurant' AND food_rating IS NOT NULL
                   GROUP BY ratee_id) rn ON rn.ratee_id = r.id
        WHERE ${conditions.join(' AND ')} ${dbOrder}`,
@@ -255,7 +266,10 @@ router.get(
         name: r.name,
         description: r.description,
         image_url: r.image_url,
-        rating_avg: Number(r.rating_avg),
+        // Live recompute (rn.live_avg), same ROUND(AVG,1) as the detail
+        // endpoint — the stored r.rating_avg is only a fallback for
+        // restaurants with no ratings at all (live_avg NULL there).
+        rating_avg: r.rating_avg_live == null ? Number(r.rating_avg) : Number(r.rating_avg_live),
         rating_count: n,
         verified: !!r.verified,
         is_coming_soon: !!r.is_coming_soon,
@@ -298,14 +312,27 @@ router.get(
     const { rows } = await db.query(
       `SELECT c.* FROM collections c WHERE c.active = true ORDER BY c.sort_order, c.name`
     );
-    for (const c of rows) {
-      const rs = await db.query(
-        `SELECT r.id, r.name, r.image_url, r.rating_avg, r.verified
+    // One batched member query for ALL collections (the old code ran one
+    // query per collection — N+1).
+    let members = [];
+    if (rows.length) {
+      const mRes = await db.query(
+        `SELECT cr.collection_id, r.id, r.name, r.image_url, r.rating_avg, r.verified
          FROM collection_restaurants cr JOIN restaurants r ON r.id = cr.restaurant_id
-         WHERE cr.collection_id = $1 AND r.status = 'approved'`,
-        [c.id]
+         WHERE cr.collection_id = ANY($1) AND r.status = 'approved'`,
+        [rows.map((c) => c.id)]
       );
-      c.restaurants = rs.rows.map((r) => ({ ...r, rating_avg: Number(r.rating_avg) }));
+      members = mRes.rows;
+    }
+    const byCollection = {};
+    for (const m of members) {
+      (byCollection[m.collection_id] = byCollection[m.collection_id] || []).push(m);
+    }
+    for (const c of rows) {
+      c.restaurants = (byCollection[c.id] || []).map((r) => {
+        const { collection_id: _cid, ...rest } = r;
+        return { ...rest, rating_avg: Number(r.rating_avg) };
+      });
     }
     res.json({ collections: rows });
   })
@@ -323,6 +350,7 @@ router.get(
        LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
        LEFT JOIN restaurants r ON r.id = o.restaurant_id
        WHERE o.status = 'delivered' AND o.placed_at > now() - interval '7 days'
+         AND oi.menu_item_id IS NOT NULL
        GROUP BY oi.menu_item_id, oi.name_snapshot, mi.image_url, mi.veg, r.name
        ORDER BY orders DESC LIMIT 20`
     );
@@ -365,6 +393,7 @@ router.get(
                   FROM dish_ratings GROUP BY dish_id) dr ON dr.dish_id = oi.menu_item_id
        WHERE o.status IN ('placed','accepted','preparing','ready','picked_up','on_way','delivered')
          AND o.placed_at > now() - interval '3 hours'
+         AND oi.menu_item_id IS NOT NULL
        GROUP BY oi.menu_item_id, oi.name_snapshot, mi.image_url, mi.price_paise, mi.veg, r.id, r.name,
                 dr.avg_rating, dr.rating_count
        ORDER BY orders DESC LIMIT 10`
@@ -427,7 +456,7 @@ router.get(
     const { rows } = await db.query(
       `SELECT id, name, image_url, lat, lng, is_open, rating_avg AS rating
        FROM restaurants
-       WHERE status = 'approved' AND lat IS NOT NULL AND lng IS NOT NULL`
+       WHERE status = 'approved' AND is_open = true AND lat IS NOT NULL AND lng IS NOT NULL`
     );
 
     // Simple: within 500m (straight-line) of the X→Z segment → on the way.
@@ -483,6 +512,10 @@ router.get(
   ah(async (req, res) => {
     const q = String(req.query.q || '').trim();
     const maxPrice = req.query.max_price_paise ? Number(req.query.max_price_paise) : null;
+    // Pagination: limit (default 30, max 100) + offset, with a total count
+    // so the frontend can page instead of hitting a silent hard cap.
+    const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 100);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
     // Log submitted searches for trending-searches (never breaks search on failure).
     if (q) {
       try {
@@ -501,7 +534,8 @@ router.get(
     if (q) {
       // Split into words; every word must appear in the dish name (order-free,
       // spelling-tolerant-ish via ILIKE). Frontend also sends alias-normalized q.
-      const words = q.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 1);
+      // Digits are kept: "paneer 65" must search "65" too, not just "paneer".
+      const words = q.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 1);
       for (const w of words.slice(0, 5)) {
         params.push(`%${w}%`);
         conditions.push(`mi.name ILIKE $${params.length}`);
@@ -515,6 +549,15 @@ router.get(
       params.push(String(Math.round(maxPrice)));
       conditions.push(`mi.price_paise <= $${params.length}`);
     }
+    const whereSql = conditions.join(' AND ');
+    const totalRes = await db.query(
+      `SELECT COUNT(*)::int AS n
+       FROM menu_items mi
+       JOIN restaurants r ON r.id = mi.restaurant_id
+       WHERE ${whereSql}`,
+      params
+    );
+    const pageParams = [...params, limit, offset];
     const { rows } = await db.query(
       `SELECT mi.id, mi.name, mi.price_paise, mi.image_url, mi.veg, mi.description,
               mi.calories AS calories_kcal,
@@ -529,10 +572,10 @@ router.get(
          SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
          FROM dish_ratings GROUP BY dish_id
        ) dr ON dr.dish_id = mi.id
-       WHERE ${conditions.join(' AND ')}
+       WHERE ${whereSql}
        ORDER BY r.rating_avg DESC NULLS LAST, mi.price_paise ASC
-       LIMIT 30`,
-      params
+       LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
+      pageParams
     );
     res.json({
       dishes: rows.map((d) => ({
@@ -543,6 +586,9 @@ router.get(
         restaurant_rating: d.restaurant_rating == null ? null : Number(d.restaurant_rating),
         protein_g: d.protein_g != null ? Number(d.protein_g) : null,
       })),
+      total: totalRes.rows[0].n,
+      limit,
+      offset,
     });
   })
 );

@@ -24,38 +24,48 @@ function b64url(input) {
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-// ---- service-account config (parsed once, cached) ----
+// ---- service-account config (parsed once, cached on SUCCESS only) ----
 // { email, privateKey, keyId, projectId } | { error: string }
+// A failed parse is NOT cached: if FIREBASE_SERVICE_ACCOUNT is fixed without
+// a process restart, the next send re-reads it and pushes resume. A good
+// parse is cached forever (the key itself never changes under a process).
 let saCache = null;
-let warned = false;
+let warnedFor = null;
 
 function loadServiceAccount() {
-  if (saCache) return saCache;
+  if (saCache && !saCache.error) return saCache;
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  let parsed_sa;
   if (!raw || !String(raw).trim()) {
-    saCache = { error: 'FIREBASE_SERVICE_ACCOUNT is not set' };
+    parsed_sa = { error: 'FIREBASE_SERVICE_ACCOUNT is not set' };
   } else {
     try {
       const parsed = JSON.parse(raw);
       if (!parsed.client_email || !parsed.private_key) {
         throw new Error('service account is missing client_email or private_key');
       }
-      saCache = {
+      parsed_sa = {
         email: parsed.client_email,
         privateKey: parsed.private_key,
         keyId: parsed.private_key_id || null,
         projectId: parsed.project_id || FIREBASE_PROJECT_ID,
       };
     } catch (e) {
-      saCache = { error: 'FIREBASE_SERVICE_ACCOUNT is not valid JSON: ' + e.message };
+      parsed_sa = { error: 'FIREBASE_SERVICE_ACCOUNT is not valid JSON: ' + e.message };
     }
   }
-  if (saCache.error && !warned) {
-    warned = true;
-    // One line, once per process. Never log the credential itself.
-    console.warn('[fcm] Sender not configured: ' + saCache.error + ' — pushes will be skipped.');
+  if (!parsed_sa.error) {
+    saCache = parsed_sa;
+    warnedFor = null;
+    return saCache;
   }
-  return saCache;
+  // Error path: warn once per distinct error, but never cache the failure.
+  if (warnedFor !== parsed_sa.error) {
+    warnedFor = parsed_sa.error;
+    // One line per distinct error. Never log the credential itself.
+    console.warn('[fcm] Sender not configured: ' + parsed_sa.error + ' — pushes will be skipped.');
+  }
+  return parsed_sa;
 }
 
 function isConfigured() {
@@ -159,12 +169,21 @@ async function sendToToken(token, { title, body, data }) {
   if (res.ok) return { ok: true };
   const errText = await res.text().catch(() => '');
   let detail = errText.slice(0, 300);
-  try { const j = JSON.parse(errText); detail = JSON.stringify(j.error || j).slice(0, 300); } catch (_) { /* keep raw text */ }
-  if (/UNREGISTERED/.test(errText)) {
+  let fcmStatus = null;
+  try {
+    const j = JSON.parse(errText);
+    detail = JSON.stringify(j.error || j).slice(0, 300);
+    fcmStatus = (j.error && j.error.status) || null;
+  } catch (_) { /* keep raw text */ }
+  // Permanent token errors: the token will never deliver again. Delete it
+  // so we stop retrying it forever. Anything else (quota, 5xx, auth) is
+  // transient or config-level and the token is kept.
+  const permanent = ['UNREGISTERED', 'INVALID_ARGUMENT', 'SENDER_ID_MISMATCH'];
+  if (permanent.includes(fcmStatus) || /UNREGISTERED/.test(errText)) {
     try {
       await db.query('DELETE FROM push_tokens WHERE token = $1', [token]);
     } catch (e) { console.error('[fcm] dead-token cleanup failed:', e.message); }
-    return { ok: false, unregistered: true, error: detail };
+    return { ok: false, unregistered: fcmStatus === 'UNREGISTERED' || /UNREGISTERED/.test(errText), error: detail };
   }
   console.error('[fcm] send error:', res.status, detail);
   return { ok: false, error: detail };

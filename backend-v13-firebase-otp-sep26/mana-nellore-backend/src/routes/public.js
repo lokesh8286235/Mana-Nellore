@@ -191,6 +191,7 @@ router.get(
               bp.starts_at, bp.ends_at
        FROM banner_promotions bp JOIN restaurants r ON r.id = bp.restaurant_id
        WHERE bp.starts_at <= now() AND (bp.ends_at IS NULL OR bp.ends_at > now())
+         AND r.status = 'approved'
        ORDER BY bp.starts_at DESC, bp.created_at DESC`
     );
     res.json({ promotions: rows });

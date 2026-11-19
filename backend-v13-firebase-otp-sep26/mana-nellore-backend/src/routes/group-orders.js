@@ -1,6 +1,7 @@
 // Group orders: shared cart for multiple people, one delivery (user 2026-10-18).
 const express = require('express');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { authenticate, ah } = require('../middleware/auth');
 
@@ -8,6 +9,23 @@ const router = express.Router();
 
 function newCode() {
   return crypto.randomBytes(3).toString('hex').toUpperCase();
+}
+
+// Group joins are guest-friendly (no login required), so auth is OPTIONAL
+// here: when the caller sends a valid customer token we record who they are
+// (added_by_user_id) and enforce ownership on deletes; when they do not,
+// the guest flow works exactly as before. A bad/expired token never blocks
+// a guest — it is simply ignored.
+function optionalCustomer(req) {
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Bearer ')) return null;
+  try {
+    const payload = jwt.verify(header.slice(7), process.env.JWT_SECRET);
+    if (payload && payload.role === 'customer') return { id: payload.sub };
+    return null;
+  } catch (e) {
+    return null;
+  }
 }
 
 // POST /api/group-orders — create a group order (host must be logged in)
@@ -61,14 +79,28 @@ router.post(
       [req.params.code.toUpperCase()]
     );
     if (!rows.length) return res.status(404).json({ error: 'Group not found or closed' });
+    const group = rows[0];
     const { dish_id, qty, person_name } = req.body || {};
     if (!dish_id || !person_name) return res.status(400).json({ error: 'dish_id and person_name required' });
-    await db.query(
-      `INSERT INTO group_order_items (group_id, dish_id, qty, person_name)
-       VALUES ($1, $2, $3, $4)`,
-      [rows[0].id, dish_id, Math.max(1, Math.min(20, qty || 1)), String(person_name).slice(0, 50)]
+    // The dish must exist AND belong to this group's restaurant. The old
+    // code inserted any dish_id unchecked — a dish from another restaurant
+    // landed in the group, and a nonexistent dish died with a raw FK 500.
+    const dish = await db.query(
+      'SELECT id, restaurant_id FROM menu_items WHERE id = $1',
+      [dish_id]
     );
-    res.json({ ok: true });
+    if (!dish.rows[0]) return res.status(404).json({ error: 'Dish not found' });
+    if (String(dish.rows[0].restaurant_id) !== String(group.restaurant_id)) {
+      return res.status(400).json({ error: 'Dish is not from this group\u2019s restaurant' });
+    }
+    const caller = optionalCustomer(req);
+    const { rows: inserted } = await db.query(
+      `INSERT INTO group_order_items (group_id, dish_id, qty, person_name, added_by_user_id)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [group.id, dish_id, Math.max(1, Math.min(20, qty || 1)), String(person_name).slice(0, 50),
+       caller ? caller.id : null]
+    );
+    res.json({ ok: true, item: inserted[0] });
   })
 );
 
@@ -76,9 +108,33 @@ router.post(
 router.delete(
   '/:code/items/:itemId',
   ah(async (req, res) => {
-    const { rows } = await db.query('SELECT id, status FROM group_orders WHERE code = $1', [req.params.code.toUpperCase()]);
+    const { rows } = await db.query('SELECT id, status, host_user_id FROM group_orders WHERE code = $1', [req.params.code.toUpperCase()]);
     if (!rows.length) return res.status(404).json({ error: 'Group not found' });
     if (rows[0].status !== 'open') return res.status(409).json({ error: 'Group is closed' });
+    const item = await db.query(
+      'SELECT id, person_name, added_by_user_id FROM group_order_items WHERE id = $1 AND group_id = $2',
+      [req.params.itemId, rows[0].id]
+    );
+    if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
+    // Ownership: the host may remove any item; anyone else may remove only
+    // their own. Guests (no token) keep the old behaviour — they joined
+    // without an account, so there is nothing to check against. A signed-in
+    // caller who is neither the host nor the item's person gets a 403.
+    const caller = optionalCustomer(req);
+    if (caller) {
+      const isHost = String(rows[0].host_user_id) === String(caller.id);
+      const isOwner = item.rows[0].added_by_user_id != null
+        && String(item.rows[0].added_by_user_id) === String(caller.id);
+      let isNamedPerson = false;
+      if (!isHost && !isOwner) {
+        const u = await db.query('SELECT name FROM users WHERE id = $1', [caller.id]);
+        isNamedPerson = !!u.rows[0] && !!u.rows[0].name
+          && String(u.rows[0].name).trim().toLowerCase() === String(item.rows[0].person_name).trim().toLowerCase();
+      }
+      if (!isHost && !isOwner && !isNamedPerson) {
+        return res.status(403).json({ error: 'You can only remove your own items' });
+      }
+    }
     const del = await db.query('DELETE FROM group_order_items WHERE id = $1 AND group_id = $2', [req.params.itemId, rows[0].id]);
     if (!del.rowCount) return res.status(404).json({ error: 'Item not found' });
     res.json({ ok: true });

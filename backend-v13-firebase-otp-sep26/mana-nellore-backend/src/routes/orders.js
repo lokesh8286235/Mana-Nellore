@@ -26,6 +26,18 @@ async function transition(orderId, status, by) {
   ]);
 }
 
+// Transactional variant of transition(): same SELECT-then-UPDATE, but on a
+// client already inside BEGIN so a multi-order cancel is atomic — a failure
+// mid-loop rolls the whole trip back instead of leaving it half-cancelled.
+async function transitionTx(client, orderId, status, by) {
+  const { rows } = await client.query('SELECT timeline FROM orders WHERE id = $1', [orderId]);
+  const timeline = (rows[0] && rows[0].timeline) || [];
+  timeline.push({ status, at: new Date().toISOString(), by });
+  await client.query('UPDATE orders SET status = $1, timeline = $2::jsonb WHERE id = $3', [
+    status, JSON.stringify(timeline), orderId
+  ]);
+}
+
 function newDeliveryOtp() {
   // Use cryptographically secure RNG (not Math.random which is predictable)
   const crypto = require('crypto');
@@ -51,6 +63,37 @@ async function freshDeliveryOtp() {
   return { code, hash };
 }
 
+// Ratings are 1–5 integers only. Anything else (0, 6, -5, "great", 4.5) is a
+// 400 — unvalidated values would flow straight into AVG() rating aggregates.
+// Returns the validated integer, or null when the field was not supplied.
+function validateRatingValue(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 5) return undefined;
+  return n;
+}
+
+// Payment methods the apps actually offer. Free text is rejected — an
+// invented value stored verbatim would break invoices, rider COD handling
+// and payment reconciliation downstream. Returns the normalized value, or
+// null when the input is not an allowed method ('online' is the generic
+// label for a gateway payment; the server itself stores 'razorpay' once a
+// gateway payment verifies — see razorpay-verify).
+const ALLOWED_PAYMENT_METHODS = ['cod', 'upi', 'card', 'online'];
+function normalizePaymentMethod(pm) {
+  if (pm == null || pm === '') return 'upi';
+  const v = String(pm).trim().toLowerCase();
+  return ALLOWED_PAYMENT_METHODS.includes(v) ? v : null;
+}
+
+// Tip is capped at the configured tip_max_paise (default Rs 500 —
+// pricing_config key 'tip_max_paise', same value GET /api/config exposes).
+// An uncapped tip let a client attach an arbitrary amount to an order.
+function capTip(rawTip, config) {
+  const max = Number(config && config.tipMaxPaise != null ? config.tipMaxPaise : 50000);
+  return Math.min(Math.max(0, Math.round(Number(rawTip) || 0)), max);
+}
+
 // Shared item validation + pricing — quote and place MUST agree.
 // An unknown item, an unavailable item, or a non-positive-integer qty is a
 // 400 (never silently skipped, never coerced). Returns { subtotal, snapshots }
@@ -64,7 +107,7 @@ async function validateItems(dbClient, menuById, items) {
     const qty = Number(it.qty);
     if (!m) throw { status: 400, message: 'A menu item is not from this restaurant' };
     if (!m.available) throw { status: 400, message: `"${m.name}" is currently unavailable` };
-    if (!Number.isInteger(qty) || qty <= 0) throw { status: 400, message: 'Quantity must be a positive integer' };
+    if (!Number.isInteger(qty) || qty <= 0 || qty > 99) throw { status: 400, message: 'Quantity must be between 1 and 99' };
     let custExtra = 0;
     const custNames = [];
     if (Array.isArray(it.customizations) && it.customizations.length) {
@@ -197,7 +240,7 @@ router.post(
       );
     }
     const config = await loadPricingConfig(db);
-    const tipPaise = Math.max(0, Math.round(Number(tip_paise) || 0));
+    const tipPaise = capTip(tip_paise, config);
     const quote = computeQuote({
       config,
       distanceKm: dineIn ? 0 : distanceKm,
@@ -348,6 +391,10 @@ async function placeMultiGroupOrder(req, res) {
   try {
     await client.query('BEGIN');
 
+    // Reject invented payment methods before any order is written.
+    const payMethod = normalizePaymentMethod(payment_method);
+    if (payMethod === null) throw { status: 400, message: 'Invalid payment_method' };
+
     // Address (delivery only — groups path never handles dine-in)
     const aRes = await client.query(
       'SELECT * FROM addresses WHERE id = $1 AND user_id = $2',
@@ -458,7 +505,7 @@ async function placeMultiGroupOrder(req, res) {
         : isOffRoute ? normalFee
         : otwSecondaryFeePaise(normalFee, config);
       const platformFee = isPrimary ? quote.platformFeePaise : 0;
-      const tipPaise = isPrimary ? Math.max(0, Math.round(Number(tip_paise) || 0)) : 0;
+      const tipPaise = isPrimary ? capTip(tip_paise, config) : 0;
       // GST on the fees actually charged (flat Rs 5 for on-the-way secondaries).
       const tax = computeTax(config.taxRates, subtotal - discount, deliveryFee, platformFee);
       const finalTotal = (subtotal - discount) + deliveryFee + platformFee + tipPaise + tax.taxPaise;
@@ -484,7 +531,7 @@ async function placeMultiGroupOrder(req, res) {
          subtotal, discount, deliveryFee, platformFee,
          tax.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
-         payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
+         payMethod, JSON.stringify(timeline), String(etaMinutes), shareToken,
          orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, tripId, isPrimary]
       );
       const order = oRes.rows[0];
@@ -620,6 +667,10 @@ router.post(
     try {
       await client.query('BEGIN');
 
+      // Reject invented payment methods before any order is written.
+      const payMethod = normalizePaymentMethod(payment_method);
+      if (payMethod === null) throw { status: 400, message: 'Invalid payment_method' };
+
       const rRes = await client.query(
         "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
         [restaurant_id]
@@ -669,7 +720,7 @@ router.post(
         distanceKm = haversineKm(restaurant.lat, restaurant.lng, address.lat, address.lng);
       }
       const config = await loadPricingConfig(client);
-      const tipPaise = Math.max(0, Math.round(Number(tip_paise) || 0));
+      const tipPaise = capTip(tip_paise, config);
       const quote = computeQuote({
         config,
         distanceKm: dineIn ? 0 : distanceKm,
@@ -703,7 +754,7 @@ router.post(
          subtotal, discount, deliveryFee, quote.platformFeePaise,
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
-         payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
+         payMethod, JSON.stringify(timeline), String(etaMinutes), shareToken,
          orderNumber, deliveryOtpHash, deliveryOtp]
       );
       const order = oRes.rows[0];
@@ -929,49 +980,66 @@ router.get(
 );
 
 // POST /api/orders/:id/cancel { reason } — only before the restaurant accepts
+// Trip cancels are ONE transaction: every order in the trip is cancelled
+// together (transition + payment_status update per order). A failure
+// mid-loop rolls the whole trip back — never a half-cancelled trip.
 router.post(
   '/:id/cancel',
   ah(async (req, res) => {
-    const { rows } = await db.query(
-      'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
-      [req.params.id, req.user.id]
-    );
-    const order = rows[0];
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status !== 'placed') {
-      return res.status(409).json({ error: 'Order can no longer be cancelled' });
-    }
-    // For trips: cancel ALL orders in the trip (bulletproof - no partial trips)
-    const cancelIds = [order.id];
-    if (order.trip_id) {
-      const tripRes = await db.query(
-        "SELECT id, payment_status FROM orders WHERE trip_id = $1 AND status = 'placed'",
-        [order.trip_id]
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
+        [req.params.id, req.user.id]
       );
-      for (const to of tripRes.rows) {
-        if (to.id !== order.id) {
-          await transition(to.id, 'cancelled', 'customer');
-          // Paid orders go to refund_pending — 'refunded' is only set once a
-          // real refund has happened (admin refund action).
-          const toRefundPending = to.payment_status === 'paid';
-          await db.query(
-            'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
-            [req.body.reason || 'Cancelled by customer (trip)', toRefundPending ? 'refund_pending' : to.payment_status, to.id]
-          );
-          cancelIds.push(to.id);
+      const order = rows[0];
+      if (!order) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Order not found' });
+      }
+      if (order.status !== 'placed') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Order can no longer be cancelled' });
+      }
+      // For trips: cancel ALL orders in the trip (bulletproof - no partial trips)
+      const cancelIds = [order.id];
+      if (order.trip_id) {
+        const tripRes = await client.query(
+          "SELECT id, payment_status FROM orders WHERE trip_id = $1 AND status = 'placed'",
+          [order.trip_id]
+        );
+        for (const to of tripRes.rows) {
+          if (to.id !== order.id) {
+            await transitionTx(client, to.id, 'cancelled', 'customer');
+            // Paid orders go to refund_pending — 'refunded' is only set once a
+            // real refund has happened (admin refund action).
+            const toRefundPending = to.payment_status === 'paid';
+            await client.query(
+              'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
+              [req.body.reason || 'Cancelled by customer (trip)', toRefundPending ? 'refund_pending' : to.payment_status, to.id]
+            );
+            cancelIds.push(to.id);
+          }
         }
       }
+      await transitionTx(client, order.id, 'cancelled', 'customer');
+      const refundPending = order.payment_status === 'paid';
+      await client.query(
+        'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
+        [req.body.reason || 'Cancelled by customer', refundPending ? 'refund_pending' : order.payment_status, order.id]
+      );
+      await client.query('COMMIT');
+      // Bell notification: the customer must see the cancellation, not just "Order placed".
+      await notify(req.user.id, 'Order cancelled',
+        `Your order #${order.order_number || order.id} was cancelled.${refundPending ? ' Your refund is being processed.' : ''}`);
+      res.json({ ok: true, refund_pending: refundPending, cancelled_orders: cancelIds.length });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
     }
-    await transition(order.id, 'cancelled', 'customer');
-    const refundPending = order.payment_status === 'paid';
-    await db.query(
-      'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
-      [req.body.reason || 'Cancelled by customer', refundPending ? 'refund_pending' : order.payment_status, order.id]
-    );
-    // Bell notification: the customer must see the cancellation, not just "Order placed".
-    await notify(req.user.id, 'Order cancelled',
-      `Your order #${order.order_number || order.id} was cancelled.${refundPending ? ' Your refund is being processed.' : ''}`);
-    res.json({ ok: true, refund_pending: refundPending, cancelled_orders: cancelIds.length });
   })
 );
 
@@ -1009,6 +1077,14 @@ router.post(
       }
       photo = photo_url;
     }
+    // Ratings are 1-5 integers only. Unvalidated values (100, -5, "great")
+    // would flow straight into AVG() and corrupt every restaurant/rider
+    // rating the app shows.
+    const foodRating = validateRatingValue(food_rating);
+    const deliveryRating = validateRatingValue(delivery_rating);
+    if (foodRating === undefined || deliveryRating === undefined) {
+      return res.status(400).json({ error: 'Ratings must be integers from 1 to 5' });
+    }
     const { rows } = await db.query(
       'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
       [req.params.id, req.user.id]
@@ -1018,47 +1094,73 @@ router.post(
     if (order.status !== 'delivered') {
       return res.status(409).json({ error: 'You can rate only delivered orders' });
     }
-    const existing = await db.query(
-      'SELECT id FROM ratings WHERE order_id = $1 AND rater_id = $2',
-      [order.id, req.user.id]
-    );
-    if (existing.rows[0]) return res.status(409).json({ error: 'Order already rated' });
+    // All three writes (restaurant rating, rider rating, stored aggregates)
+    // are ONE transaction: a failure anywhere rolls everything back instead
+    // of leaving a half-rated order (the old code inserted the restaurant
+    // rating, then threw on a missing rider user row before the rest).
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const existing = await client.query(
+        'SELECT id FROM ratings WHERE order_id = $1 AND rater_id = $2',
+        [order.id, req.user.id]
+      );
+      if (existing.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Order already rated' });
+      }
 
-    await db.query(
-      `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment, photo_url)
-       VALUES ($1,$2,'restaurant',$3,$4,$5,$6,$7)`,
-      [order.id, req.user.id, order.restaurant_id, food_rating || null, null, comment || null, photo]
-    );
-    if (order.rider_id && delivery_rating) {
-      const rp = await db.query('SELECT user_id FROM riders WHERE id = $1', [order.rider_id]);
-      await db.query(
-        `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment)
-         VALUES ($1,$2,'rider',$3,$4,$5,$6)`,
-        [order.id, req.user.id, rp.rows[0].user_id, null, delivery_rating, comment || null]
+      await client.query(
+        `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment, photo_url)
+         VALUES ($1,$2,'restaurant',$3,$4,$5,$6,$7)`,
+        [order.id, req.user.id, order.restaurant_id, foodRating, null, comment || null, photo]
       );
-      await db.query(
-        `UPDATE riders SET rating_avg = (
-           SELECT COALESCE(AVG(delivery_rating), 0) FROM ratings
-           WHERE ratee_type = 'rider' AND ratee_id = riders.user_id AND delivery_rating IS NOT NULL
-         ) WHERE id = $1`,
-        [order.rider_id]
-      );
-    }
-    if (food_rating) {
-      // Keep the stored columns in sync so nothing drifts from the live ratings table
-      await db.query(
-        `UPDATE restaurants SET
-           rating_avg = (
-             SELECT COALESCE(AVG(food_rating), 0) FROM ratings
-             WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
-           ),
-           rating_count = (
-             SELECT COUNT(*) FROM ratings
-             WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
-           )
-         WHERE id = $1`,
-        [order.restaurant_id]
-      );
+      if (order.rider_id && deliveryRating != null) {
+        const rp = await client.query('SELECT user_id FROM riders WHERE id = $1', [order.rider_id]);
+        if (rp.rows[0] && rp.rows[0].user_id) {
+          await client.query(
+            `INSERT INTO ratings (order_id, rater_id, ratee_type, ratee_id, food_rating, delivery_rating, comment)
+             VALUES ($1,$2,'rider',$3,$4,$5,$6)`,
+            [order.id, req.user.id, rp.rows[0].user_id, null, deliveryRating, comment || null]
+          );
+          await client.query(
+            `UPDATE riders SET rating_avg = (
+               SELECT COALESCE(AVG(delivery_rating), 0) FROM ratings
+               WHERE ratee_type = 'rider' AND ratee_id = riders.user_id AND delivery_rating IS NOT NULL
+             ) WHERE id = $1`,
+            [order.rider_id]
+          );
+        } else {
+          // Rider row exists on the order but its user row is gone: the
+          // restaurant rating still counts; the rider rating is skipped
+          // rather than crashing the whole rating.
+          console.warn('[rate] rider user row missing for rider', order.rider_id, '- rider rating skipped');
+        }
+      }
+      if (foodRating != null) {
+        // Keep the stored columns in sync so nothing drifts from the live ratings table.
+        // ROUND to 1 decimal, exactly like the live recompute on the
+        // restaurant detail endpoint, so list and detail can never disagree.
+        await client.query(
+          `UPDATE restaurants SET
+             rating_avg = (
+               SELECT COALESCE(ROUND(AVG(food_rating)::numeric, 1), 0) FROM ratings
+               WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
+             ),
+             rating_count = (
+               SELECT COUNT(*) FROM ratings
+               WHERE ratee_type = 'restaurant' AND ratee_id = $1 AND food_rating IS NOT NULL
+             )
+           WHERE id = $1`,
+          [order.restaurant_id]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
     }
     res.json({ ok: true });
   })

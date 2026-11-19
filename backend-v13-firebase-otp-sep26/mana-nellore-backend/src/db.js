@@ -32,8 +32,15 @@ async function initDb() {
 }
 
 // Idempotent migrations for databases created before these columns existed.
+// The whole migrate runs inside ONE transaction: a failure midway used to
+// leave a half-migrated DB (later steps applied, earlier ones not); now it
+// rolls back and the next boot retries from a clean state. Postgres DDL is
+// transactional, so BEGIN/COMMIT covers every ALTER/CREATE below.
 async function migrate() {
-  const q = (t) => pool.query(t);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const q = (t) => client.query(t);
 
   // Role-splitting: one phone -> separate profile per role.
   await q(`DO $$ BEGIN
@@ -82,7 +89,11 @@ async function migrate() {
   await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS calories INT');
   await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS protein_g NUMERIC(5,1)');
   await q('ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS is_jain BOOLEAN DEFAULT false');
-  // meal_slot was single text before multi-select — convert legacy values to text[]
+  // meal_slot was single text before multi-select — convert legacy values to text[].
+  // Conversion and CHECK are separate idempotent blocks: if an earlier run
+  // converted the type but died before adding the CHECK, a retry used to
+  // skip the whole block (data_type was no longer 'text') and the constraint
+  // was lost forever. Now the CHECK block has its own guard and completes.
   await q(`DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns
                WHERE table_name = 'menu_items' AND column_name = 'meal_slot' AND data_type = 'text') THEN
@@ -90,6 +101,10 @@ async function migrate() {
       ALTER TABLE menu_items DROP CONSTRAINT IF EXISTS menu_items_meal_slot_check;
       ALTER TABLE menu_items ALTER COLUMN meal_slot TYPE text[] USING ARRAY[meal_slot]::text[];
       ALTER TABLE menu_items ALTER COLUMN meal_slot SET DEFAULT '{all}';
+    END IF;
+  END $$`);
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'menu_items_meal_slot_check') THEN
       ALTER TABLE menu_items ADD CONSTRAINT menu_items_meal_slot_check
         CHECK (meal_slot <@ ARRAY['all','breakfast','lunch','dinner']);
     END IF;
@@ -108,7 +123,17 @@ async function migrate() {
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_photo text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS packed_at timestamptz');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_photo text');
-  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS share_token text');
+  // Backfill share tokens ONLY when the column was just added. The old code
+  // ran a full-table UPDATE on every boot — a full scan of orders on every
+  // deploy — even though every order written since has a token already.
+  await q(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'orders' AND column_name = 'share_token') THEN
+      ALTER TABLE orders ADD COLUMN share_token text;
+      UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
+        WHERE share_token IS NULL;
+    END IF;
+  END $$`);
   await q(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_share_token_key') THEN
       ALTER TABLE orders ADD CONSTRAINT orders_share_token_key UNIQUE (share_token);
@@ -247,6 +272,7 @@ async function migrate() {
   )`);
   await q('CREATE INDEX IF NOT EXISTS idx_go_code ON group_orders(code)');
   await q('CREATE INDEX IF NOT EXISTS idx_goi_group ON group_order_items(group_id)');
+  await q('ALTER TABLE group_order_items ADD COLUMN IF NOT EXISTS added_by_user_id uuid');
 
   // Push device tokens (FCM). One row per device token; re-login reassigns it.
   await q(`CREATE TABLE IF NOT EXISTS push_tokens (
@@ -259,9 +285,8 @@ async function migrate() {
   )`);
   await q('CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id)');
 
-  // Backfill share tokens for old orders
-  await q(`UPDATE orders SET share_token = substr(md5(random()::text || id::text), 1, 12)
-           WHERE share_token IS NULL`);
+  // (Share-token backfill moved up to the column-add block above so it runs
+  // only when the column is new — no per-boot full-table UPDATE anymore.)
 
   // Banner promotions (customer-app hero banners, managed no-code from admin).
   await q(`CREATE TABLE IF NOT EXISTS banner_promotions (
@@ -275,6 +300,14 @@ async function migrate() {
   )`);
   await q('CREATE INDEX IF NOT EXISTS idx_banner_promotions_restaurant ON banner_promotions(restaurant_id)');
   await q('CREATE INDEX IF NOT EXISTS idx_banner_promotions_active ON banner_promotions(starts_at, ends_at)');
+
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 // Default pricing rules (paise). Admin can edit these live via /api/admin/pricing.
@@ -289,6 +322,24 @@ function defaultPricingRows() {
     },
     tax_rates: { food_pct: 5, delivery_pct: 18, platform_pct: 18 },
     otw_flat_fee_paise: 500,
+    // Customer delivery fee tiers (user 2026-10-15, FINAL) — same values as
+    // the loadPricingConfig() and GET /api/config fallbacks (50100/90100/
+    // 130100). Seeded here so a fresh DB carries them as real config rows.
+    customer_fee: {
+      base_paise: 2000,
+      base_km: 2,
+      per_km_paise: 800,
+      tiers: [
+        { min_order_paise: 50100, free_km: 3 },
+        { min_order_paise: 90100, free_km: 5 },
+        { min_order_paise: 130100, free_km: 8 }
+      ]
+    },
+    tip_min_paise: 1000,
+    tip_max_paise: 50000,
+    budget_threshold_paise: 15000,
+    referral_reward_paise: 5000,
+    prep_lead_minutes: 30,
     rider_payout_tiers: {
       slab1_up_to_km: 5,
       slab1_rate_paise_per_km: 800,   // 0-5 km: Rs 8/km

@@ -101,9 +101,10 @@ router.delete(
   '/addresses/:id',
   
   ah(async (req, res) => {
-    await db.query('DELETE FROM addresses WHERE id = $1 AND user_id = $2', [
+    const del = await db.query('DELETE FROM addresses WHERE id = $1 AND user_id = $2', [
       req.params.id, req.user.id
     ]);
+    if (!del.rowCount) return res.status(404).json({ error: 'Address not found' });
     res.json({ ok: true });
   })
 );
@@ -116,16 +117,21 @@ router.get(
       'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
       [req.user.id]
     );
-    res.json({ notifications: rows });
+    const unread = await db.query(
+      'SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = $1 AND COALESCE(read, false) = false',
+      [req.user.id]
+    );
+    res.json({ notifications: rows, unread_count: unread.rows[0].n });
   })
 );
 
 router.put(
   '/notifications/:id/read',
   ah(async (req, res) => {
-    await db.query('UPDATE notifications SET read = true WHERE id = $1 AND user_id = $2', [
+    const upd = await db.query('UPDATE notifications SET read = true WHERE id = $1 AND user_id = $2', [
       req.params.id, req.user.id
     ]);
+    if (!upd.rowCount) return res.status(404).json({ error: 'Notification not found' });
     res.json({ ok: true });
   })
 );
@@ -178,7 +184,7 @@ router.get(
   '/profile',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      'SELECT id, phone, name, role, dob, is_student, referral_code, created_at FROM users WHERE id = $1',
+      'SELECT id, phone, email, name, role, dob, is_student, referral_code, created_at FROM users WHERE id = $1',
       [req.user.id]
     );
     const stats = await db.query(
@@ -197,6 +203,15 @@ router.put(
   '/profile',
   ah(async (req, res) => {
     const { name, dob } = req.body;
+    // dob must be a real YYYY-MM-DD date: Postgres threw a 500 on garbage
+    // like "tomorrow" or "12/31/1990" instead of a clean 400.
+    if (dob != null && dob !== '') {
+      const m = /^\d{4}-\d{2}-\d{2}$/.exec(String(dob));
+      const d = m ? new Date(String(dob) + 'T00:00:00Z') : null;
+      const real = !!d && !Number.isNaN(d.getTime())
+        && d.toISOString().slice(0, 10) === String(dob);
+      if (!real) return res.status(400).json({ error: 'Invalid dob — use YYYY-MM-DD' });
+    }
     const { rows } = await db.query(
       `UPDATE users SET name = COALESCE($1, name), dob = COALESCE($2, dob)
        WHERE id = $3
@@ -207,21 +222,9 @@ router.put(
   })
 );
 
-// ---- Call me back ----
-router.post(
-  '/callbacks',
-  ah(async (req, res) => {
-    const { order_id, reason } = req.body;
-    const u = await db.query('SELECT phone FROM users WHERE id = $1', [req.user.id]);
-    const { rows } = await db.query(
-      `INSERT INTO callback_requests (user_id, phone, order_id, reason)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [req.user.id, u.rows[0].phone, order_id || null, reason || null]
-    );
-    res.status(201).json({ callback: rows[0] });
-  })
-);
-
+// ---- Call me back: CUT (user 2026-09-28, permanent). The POST route is
+// removed — customers can no longer file callbacks. The GET below is kept
+// as read-only history for requests filed before the cut.
 router.get(
   '/callbacks',
   ah(async (req, res) => {
@@ -284,44 +287,82 @@ router.get(
 
 // POST /api/customer/referral/apply { code } — new customer applies a friend's code,
 // both get a Rs 50 off coupon.
+// NOTE (hardcoded, user decision needed): the Rs 50 value (5000 paise) and
+// Rs 199 minimum (19900 paise) in mkCoupon are literals, not config —
+// flagged, not changed (see b776 report).
+// The whole apply is ONE transaction: the old code did ~6 sequential writes
+// with no transaction and no ON CONFLICT on the coupon insert, so a failure
+// or a code collision mid-apply left one side rewarded and the other not.
 router.post(
   '/referral/apply',
   ah(async (req, res) => {
     const code = String(req.body.code || '').toUpperCase().trim();
     if (!code) return res.status(400).json({ error: 'Referral code is required' });
     const me = await db.query('SELECT referred_by FROM users WHERE id = $1', [req.user.id]);
-    if (me.rows[0].referred_by) return res.status(409).json({ error: 'You already used a referral code' });
+    if (me.rows[0] && me.rows[0].referred_by) return res.status(409).json({ error: 'You already used a referral code' });
     const friend = await db.query('SELECT id FROM users WHERE referral_code = $1', [code]);
     if (!friend.rows[0]) return res.status(400).json({ error: 'Invalid referral code' });
     if (friend.rows[0].id === req.user.id) {
       return res.status(400).json({ error: 'You are entering your own referral code 🙂' });
     }
-    const mkCoupon = async (suffix) => {
-      const c = 'REF' + suffix + require('crypto').randomBytes(4).toString('hex').toUpperCase();
-      await db.query(
-        `INSERT INTO coupons (code, discount_type, value, min_order_paise, max_discount_paise, active)
-         VALUES ($1, 'flat', 5000, 19900, 5000, true)`, [c]
+    const friendId = friend.rows[0].id;
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Re-check under lock: two simultaneous applies must not both win.
+      const locked = await client.query(
+        'SELECT referred_by FROM users WHERE id = $1 FOR UPDATE', [req.user.id]
       );
-      return c;
-    };
-    const myCoupon = await mkCoupon('ME');
-    const friendCoupon = await mkCoupon('FR');
-    await db.query('UPDATE users SET referred_by = $1 WHERE id = $2', [friend.rows[0].id, req.user.id]);
-    // Record issuance so GET /api/customer/coupons can list them (survives reinstalls)
-    await db.query(
-      `INSERT INTO coupon_issuances (user_id, coupon_code, source) VALUES ($1, $2, 'referral')
-       ON CONFLICT (user_id, coupon_code) DO NOTHING`,
-      [req.user.id, myCoupon]
-    );
-    await db.query(
-      `INSERT INTO coupon_issuances (user_id, coupon_code, source) VALUES ($1, $2, 'referral')
-       ON CONFLICT (user_id, coupon_code) DO NOTHING`,
-      [friend.rows[0].id, friendCoupon]
-    );
-    await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
-      [friend.rows[0].id, '🎉 Your friend joined Mana Nellore!',
-       `Thanks for spreading the word! Here's Rs 50 off your next order: ${friendCoupon}`]);
-    res.json({ ok: true, coupon: myCoupon, message: 'Rs 50 off coupon added to your account!' });
+      if (locked.rows[0] && locked.rows[0].referred_by) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'You already used a referral code' });
+      }
+      // Coupon codes are random hex; a collision retries with a fresh code
+      // instead of dying on the UNIQUE(code) constraint.
+      const mkCoupon = async (suffix) => {
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const c = 'REF' + suffix + require('crypto').randomBytes(4).toString('hex').toUpperCase();
+          const ins = await client.query(
+            `INSERT INTO coupons (code, discount_type, value, min_order_paise, max_discount_paise, active)
+             VALUES ($1, 'flat', 5000, 19900, 5000, true)
+             ON CONFLICT (code) DO NOTHING RETURNING code`, [c]
+          );
+          if (ins.rows[0]) return ins.rows[0].code;
+        }
+        throw { status: 500, message: 'Could not generate a referral coupon, please retry' };
+      };
+      const myCoupon = await mkCoupon('ME');
+      const friendCoupon = await mkCoupon('FR');
+      const upd = await client.query(
+        'UPDATE users SET referred_by = $1 WHERE id = $2 AND referred_by IS NULL',
+        [friendId, req.user.id]
+      );
+      if (!upd.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'You already used a referral code' });
+      }
+      // Record issuance so GET /api/customer/coupons can list them (survives reinstalls)
+      await client.query(
+        `INSERT INTO coupon_issuances (user_id, coupon_code, source) VALUES ($1, $2, 'referral')
+         ON CONFLICT (user_id, coupon_code) DO NOTHING`,
+        [req.user.id, myCoupon]
+      );
+      await client.query(
+        `INSERT INTO coupon_issuances (user_id, coupon_code, source) VALUES ($1, $2, 'referral')
+         ON CONFLICT (user_id, coupon_code) DO NOTHING`,
+        [friendId, friendCoupon]
+      );
+      await client.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
+        [friendId, '🎉 Your friend joined Mana Nellore!',
+         `Thanks for spreading the word! Here's Rs 50 off your next order: ${friendCoupon}`]);
+      await client.query('COMMIT');
+      res.json({ ok: true, coupon: myCoupon, message: 'Rs 50 off coupon added to your account!' });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
   })
 );
 
@@ -360,6 +401,20 @@ router.post(
       return res.status(400).json({ error: 'entity_type must be restaurant or dish' });
     }
     if (!entity_id) return res.status(400).json({ error: 'entity_id is required' });
+    // A favorite must point at something real — the old code accepted any
+    // string, so hearts on deleted dishes/restaurants piled up as dead rows.
+    // A non-UUID id can never exist, so it is a 404, not a Postgres 500.
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRe.test(String(entity_id))) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+    const exists = await db.query(
+      entity_type === 'restaurant'
+        ? 'SELECT 1 FROM restaurants WHERE id = $1'
+        : 'SELECT 1 FROM menu_items WHERE id = $1',
+      [entity_id]
+    );
+    if (!exists.rows[0]) return res.status(404).json({ error: 'Item not found' });
     await db.query(
       `INSERT INTO favorites (customer_id, entity_type, entity_id)
        VALUES ($1, $2, $3) ON CONFLICT (customer_id, entity_type, entity_id) DO NOTHING`,

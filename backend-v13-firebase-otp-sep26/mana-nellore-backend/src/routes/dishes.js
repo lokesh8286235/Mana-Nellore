@@ -20,13 +20,17 @@ router.get(
   '/by-category',
   ah(async (req, res) => {
     const rawQ = String(req.query.q || '').toLowerCase().trim();
-    if (!rawQ) return res.json({ dishes: [] });
+    if (!rawQ) return res.json({ dishes: [], total: 0, limit: 0, offset: 0 });
     const words = rawQ.split(/[^a-z0-9]+/).filter((w) => w.length > 1);
+    // Pagination: limit (default 300, max 300) + offset, with a total count
+    // so category pages can page instead of hitting a silent hard cap.
+    const limit = Math.min(Math.max(Number(req.query.limit) || 300, 1), 300);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
 
-    const cacheKey = 'bc|' + rawQ;
+    const cacheKey = 'bc|' + rawQ + '|' + limit + '|' + offset;
     const hit = byCatCache.get(cacheKey);
     if (hit && Date.now() - hit.at < BYCAT_CACHE_MS) {
-      return res.json({ dishes: hit.dishes, cached: true });
+      return res.json({ dishes: hit.dishes, total: hit.total, limit, offset, cached: true });
     }
     if (hit) byCatCache.delete(cacheKey);
 
@@ -47,6 +51,21 @@ router.get(
       conds.push(`((${catWords}) OR (${dishWords}))`);
     }
 
+    const whereSql = `mi.available = true
+         AND r.status = 'approved'
+         AND r.is_open = true
+         AND COALESCE(r.is_coming_soon, false) = false
+         AND (${conds.join(' OR ')})`;
+    const totalRes = await db.query(
+      `SELECT COUNT(*)::int AS n
+       FROM menu_items mi
+       JOIN restaurants r ON r.id = mi.restaurant_id
+       LEFT JOIN categories c ON c.id = mi.category_id
+       WHERE ${whereSql}`,
+      params
+    );
+    const total = totalRes.rows[0].n;
+    const pageParams = [...params, limit, offset];
     const { rows } = await db.query(
       `SELECT mi.id, mi.name, mi.description, mi.image_url, mi.price_paise, mi.veg,
               mi.calories AS calories_kcal,
@@ -64,14 +83,10 @@ router.get(
          SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
          FROM dish_ratings GROUP BY dish_id
        ) dr ON dr.dish_id = mi.id
-       WHERE mi.available = true
-         AND r.status = 'approved'
-         AND r.is_open = true
-         AND COALESCE(r.is_coming_soon, false) = false
-         AND (${conds.join(' OR ')})
+       WHERE ${whereSql}
        ORDER BY r.rating_avg DESC NULLS LAST, r.name ASC, mi.sort_order ASC, mi.name ASC
-       LIMIT 300`,
-      params
+       LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
+      pageParams
     );
     const dishes = rows.map((d) => ({
       id: d.id,
@@ -90,8 +105,8 @@ router.get(
       restaurant_rating: d.restaurant_rating,
     }));
     if (byCatCache.size > 50) byCatCache.clear();
-    byCatCache.set(cacheKey, { at: Date.now(), dishes });
-    res.json({ dishes });
+    byCatCache.set(cacheKey, { at: Date.now(), dishes, total });
+    res.json({ dishes, total, limit, offset });
   })
 );
 
