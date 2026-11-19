@@ -96,7 +96,7 @@ router.post(
     const { rows } = await db.query(
       `INSERT INTO restaurant_applications
          (restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, status`,
       [restaurant_name, owner_name, digits, address || null, lat || null, lng || null,
        fssai || null, String(aadhar).replace(/\D/g, ''), photo_url]
     );
@@ -135,7 +135,7 @@ router.get(
   '/config',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'customer_fee', 'budget_threshold_paise', 'referral_reward_paise', 'tip_min_paise', 'tip_max_paise', 'prep_lead_minutes')"
+      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'customer_fee', 'budget_threshold_paise', 'referral_reward_paise', 'tip_min_paise', 'tip_max_paise', 'prep_lead_minutes', 'tax_rates', 'otw_flat_fee_paise')"
     );
     const m = Object.fromEntries(rows.map((r) => [r.key, r.value]));
     // Customer delivery fee tiers (user 2026-10-15): backend-configurable, nothing hardcoded in apps
@@ -158,6 +158,10 @@ router.get(
     const tipMax = m.tip_max_paise ? parseInt(m.tip_max_paise, 10) : 50000;
     // Prep lead time (user 2026-10-20): backend-driven, nothing hardcoded in apps
     const prepLead = m.prep_lead_minutes ? parseInt(m.prep_lead_minutes, 10) : 30;
+    // GST rates (user rule: food 5%, delivery 18%, platform 18%) + on-the-way
+    // flat fee — backend-driven, admin-editable, single source of truth.
+    const taxRates = m.tax_rates || { food_pct: 5, delivery_pct: 18, platform_pct: 18 };
+    const otwFlatFeePaise = m.otw_flat_fee_paise != null ? Number(m.otw_flat_fee_paise) : 500;
     res.json({
       call_to_order_phone: (m.call_to_order_phone) || '',
       maps_key: process.env.GOOGLE_MAPS_KEY || '',
@@ -167,7 +171,9 @@ router.get(
       referral_reward_paise: referralReward,
       tip_min_paise: tipMin,
       tip_max_paise: tipMax,
-      prep_lead_minutes: prepLead
+      prep_lead_minutes: prepLead,
+      tax_rates: taxRates,
+      otw_flat_fee_paise: otwFlatFeePaise
     });
   })
 );

@@ -73,6 +73,7 @@ async function migrate() {
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS chef_story text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS gstin text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS birthday_dessert boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS is_coming_soon boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS opens_at_we time');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS closes_at_we time');
 
@@ -144,7 +145,7 @@ async function migrate() {
   // COD 'collected' status
   await q('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_status_check');
   await q(`ALTER TABLE orders ADD CONSTRAINT orders_payment_status_check
-    CHECK (payment_status IN ('pending','paid','failed','refunded','collected'))`);
+    CHECK (payment_status IN ('pending','paid','failed','refunded','collected','refund_pending'))`);
   // Remove wallet/credit remnants
   await q('ALTER TABLE orders DROP COLUMN IF EXISTS credits_used_paise');
   await q('DROP TABLE IF EXISTS customer_credits');
@@ -286,6 +287,8 @@ function defaultPricingRows() {
         { up_to_km: null, rate_paise_per_km: 800 } // 8+ km: Rs 8/km
       ]
     },
+    tax_rates: { food_pct: 5, delivery_pct: 18, platform_pct: 18 },
+    otw_flat_fee_paise: 500,
     rider_payout_tiers: {
       slab1_up_to_km: 5,
       slab1_rate_paise_per_km: 800,   // 0-5 km: Rs 8/km
@@ -297,13 +300,6 @@ function defaultPricingRows() {
     },
     platform_fee_paise: 700, // Rs 7
     default_commission_pct: 12,
-    free_delivery_rules: {
-      rules: [
-        { min_order_paise: 49900, max_distance_km: 3 },   // Rs 499+ up to 3 km
-        { min_order_paise: 89900, max_distance_km: 5 },   // Rs 899+ up to 5 km
-        { min_order_paise: 129900, max_distance_km: 8 }   // Rs 1299+ up to 8 km
-      ]
-    },
     eta_minutes: 30,              // Honest ETA estimate shown to customers (not a guarantee)
     call_to_order_phone: ''       // support / phone-order line shown in the customer app
   };

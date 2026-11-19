@@ -65,17 +65,35 @@ router.put(
       }
     }
     if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
-    if (req.body.is_default) {
-      await db.query('UPDATE addresses SET is_default = false WHERE user_id = $1', [req.user.id]);
+    // Scoped update FIRST, in one transaction: the old code cleared every
+    // default flag before the update, so a 404 left the user with no default.
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      params.push(req.params.id, req.user.id);
+      const { rows } = await client.query(
+        `UPDATE addresses SET ${sets.join(', ')}
+         WHERE id = $${params.length - 1} AND user_id = $${params.length} RETURNING *`,
+        params
+      );
+      if (!rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Address not found' });
+      }
+      if (req.body.is_default) {
+        await client.query(
+          'UPDATE addresses SET is_default = false WHERE user_id = $1 AND id <> $2',
+          [req.user.id, rows[0].id]
+        );
+      }
+      await client.query('COMMIT');
+      res.json({ address: rows[0] });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
     }
-    params.push(req.params.id, req.user.id);
-    const { rows } = await db.query(
-      `UPDATE addresses SET ${sets.join(', ')}
-       WHERE id = $${params.length - 1} AND user_id = $${params.length} RETURNING *`,
-      params
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Address not found' });
-    res.json({ address: rows[0] });
   })
 );
 

@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS restaurants (
   status text NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','approved','suspended','rejected')),
   is_open boolean NOT NULL DEFAULT true,
+  is_coming_soon boolean NOT NULL DEFAULT false,
   opens_at time,
   closes_at time,
   opens_at_we time,
@@ -162,7 +163,7 @@ CREATE TABLE IF NOT EXISTS orders (
   total_paise int NOT NULL,
   payment_method text,
   payment_status text NOT NULL DEFAULT 'pending'
-    CHECK (payment_status IN ('pending','paid','failed','refunded','collected')),
+    CHECK (payment_status IN ('pending','paid','failed','refunded','collected','refund_pending')),
   delivery_otp_hash text,
   order_number text UNIQUE,
   cancel_reason text,

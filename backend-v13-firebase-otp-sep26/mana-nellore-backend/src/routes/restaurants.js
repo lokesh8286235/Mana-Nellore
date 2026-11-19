@@ -3,7 +3,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { ah } = require('../middleware/auth');
-const { haversineKm, loadPricingConfig, deliveryFeePaise, otwSecondaryFeePaise } = require('../lib/pricing');
+const { haversineKm, loadPricingConfig, deliveryFeePaise, customerDeliveryFeePaise, otwSecondaryFeePaise } = require('../lib/pricing');
 const { pointToSegKm } = require('../lib/otw');
 
 const router = express.Router();
@@ -111,21 +111,30 @@ router.get(
     const cached = cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
-    const conditions = ["r.status = 'approved'"];
+    const conditions = ["r.status = 'approved'", "COALESCE(r.is_coming_soon, false) = false"];
     const params = [];
 
     if (q) {
-      params.push(`%${q}%`);
-      const qp = `$${params.length}`;
-      conditions.push(`(r.name ILIKE ${qp} OR r.description ILIKE ${qp} OR EXISTS (
-        SELECT 1 FROM menu_items mi
-        WHERE mi.restaurant_id = r.id AND mi.available = true AND mi.name ILIKE ${qp}
-      ) OR EXISTS (
-        SELECT 1 FROM categories c
-        WHERE c.restaurant_id = r.id AND c.name ILIKE ${qp}
-          AND EXISTS (SELECT 1 FROM menu_items mi2
-                      WHERE mi2.category_id = c.id AND mi2.available = true)
-      ))`);
+      // Word-split matcher (same as dish search): every word must match, and
+      // %/_ wildcards in user input are escaped so they match literally.
+      const escLike = (s) => s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+      const words = String(q).toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 1).slice(0, 5);
+      const terms = words.length ? words : [String(q).toLowerCase()];
+      for (const w of terms) {
+        const pat = `%${escLike(w)}%`;
+        params.push(pat, pat);
+        const p1 = `$${params.length - 1}`;
+        const p2 = `$${params.length}`;
+        conditions.push(`(r.name ILIKE ${p1} ESCAPE '\\' OR r.description ILIKE ${p1} ESCAPE '\\' OR EXISTS (
+          SELECT 1 FROM menu_items mi
+          WHERE mi.restaurant_id = r.id AND mi.available = true AND mi.name ILIKE ${p2} ESCAPE '\\'
+        ) OR EXISTS (
+          SELECT 1 FROM categories c
+          WHERE c.restaurant_id = r.id AND c.name ILIKE ${p2} ESCAPE '\\'
+            AND EXISTS (SELECT 1 FROM menu_items mi2
+                        WHERE mi2.category_id = c.id AND mi2.available = true)
+        ))`);
+      }
     }
     if (veg === 'true') {
       conditions.push(
@@ -205,7 +214,9 @@ router.get(
       let eta = null; // null = hidden, never invented
       if (hasLoc && r.lat != null && r.lng != null) {
         distanceKm = haversineKm(custLat, custLng, r.lat, r.lng);
-        fee = deliveryFeePaise(config.deliveryTiers, distanceKm, 0, []);
+        // Customer fee model (Rs 20 base + Rs 8/km + free-km tiers) — the same
+        // model checkout uses. Unknown distance leaves fee null, never wrong.
+        fee = customerDeliveryFeePaise(config.customerFee, distanceKm, 0).fee_paise;
         eta = Math.round(20 + distanceKm * 3); // estimate; replaced by Matrix data when available
       }
       const real = realETAs && realETAs[r.id];
@@ -247,6 +258,7 @@ router.get(
         rating_avg: Number(r.rating_avg),
         rating_count: n,
         verified: !!r.verified,
+        is_coming_soon: !!r.is_coming_soon,
         is_open: isOpenNow(r),
         opens_at: r.opens_at,
         closes_at: r.closes_at,
@@ -430,7 +442,7 @@ router.get(
       );
       if (distKm > THRESHOLD_KM) continue;
       const yzKm = haversineKm(Number(r.lat), Number(r.lng), toLat, toLng);
-      const normalFee = deliveryFeePaise(config.deliveryTiers, yzKm, 0, []);
+      const normalFee = deliveryFeePaise(config.deliveryTiers, yzKm);
       const feePaise = otwSecondaryFeePaise(normalFee, config);
       out.push({
         id: r.id,
@@ -631,7 +643,7 @@ router.get(
       detailDist = Math.round(haversineKm(dLat, dLng, Number(restaurant.lat), Number(restaurant.lng)) * 10) / 10;
     }
     // Strip PII/sensitive fields before sending to client
-    const { aadhar, gstin, owner_id, commission_pct, bank_account, ifsc, ...safeRestaurant } = restaurant;
+    const { aadhar, gstin, owner_id, commission_pct, bank_account, ifsc, phone, fssai, fssai_license, ...safeRestaurant } = restaurant;
     res.json({
       restaurant: { ...safeRestaurant, rating_avg: Number(restaurant.rating_avg), is_open: isOpenNow(restaurant),
         verified: !!restaurant.verified, distance_km: detailDist },

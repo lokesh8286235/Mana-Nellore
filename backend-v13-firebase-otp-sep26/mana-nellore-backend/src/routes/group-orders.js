@@ -17,6 +17,12 @@ router.post(
   ah(async (req, res) => {
     const { restaurant_id, host_name } = req.body || {};
     if (!restaurant_id) return res.status(400).json({ error: 'restaurant_id required' });
+    // A group can only start at a restaurant that exists and can take orders.
+    const rRes = await db.query(
+      "SELECT id FROM restaurants WHERE id = $1 AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
+      [restaurant_id]
+    );
+    if (!rRes.rows[0]) return res.status(400).json({ error: 'Restaurant is not available for ordering' });
     const code = newCode();
     const { rows } = await db.query(
       `INSERT INTO group_orders (code, restaurant_id, host_user_id, host_name, status)
@@ -70,9 +76,11 @@ router.post(
 router.delete(
   '/:code/items/:itemId',
   ah(async (req, res) => {
-    const { rows } = await db.query('SELECT id FROM group_orders WHERE code = $1', [req.params.code.toUpperCase()]);
+    const { rows } = await db.query('SELECT id, status FROM group_orders WHERE code = $1', [req.params.code.toUpperCase()]);
     if (!rows.length) return res.status(404).json({ error: 'Group not found' });
-    await db.query('DELETE FROM group_order_items WHERE id = $1 AND group_id = $2', [req.params.itemId, rows[0].id]);
+    if (rows[0].status !== 'open') return res.status(409).json({ error: 'Group is closed' });
+    const del = await db.query('DELETE FROM group_order_items WHERE id = $1 AND group_id = $2', [req.params.itemId, rows[0].id]);
+    if (!del.rowCount) return res.status(404).json({ error: 'Item not found' });
     res.json({ ok: true });
   })
 );
@@ -86,7 +94,13 @@ router.post(
     if (!rows.length) return res.status(404).json({ error: 'Group not found' });
     const g = rows[0];
     if (String(g.host_user_id) !== String(req.user.id)) return res.status(403).json({ error: 'Only host can close' });
-    await db.query("UPDATE group_orders SET status = 'closed' WHERE id = $1", [g.id]);
+    if (g.status !== 'open') return res.status(409).json({ error: 'Group is already closed' });
+    // UPDATE ... RETURNING * so the response carries the FRESH row (the old
+    // code returned the pre-UPDATE row, still "open") and closed_at is set.
+    const closed = await db.query(
+      "UPDATE group_orders SET status = 'closed', closed_at = now() WHERE id = $1 RETURNING *",
+      [g.id]
+    );
     const items = await db.query(
       `SELECT gi.dish_id, gi.qty, gi.person_name, mi.name AS dish_name, mi.price_paise, mi.veg
        FROM group_order_items gi
@@ -94,7 +108,7 @@ router.post(
        WHERE gi.group_id = $1`,
       [g.id]
     );
-    res.json({ group: g, items: items.rows });
+    res.json({ group: closed.rows[0], items: items.rows });
   })
 );
 

@@ -66,6 +66,8 @@ router.get(
        ) dr ON dr.dish_id = mi.id
        WHERE mi.available = true
          AND r.status = 'approved'
+         AND r.is_open = true
+         AND COALESCE(r.is_coming_soon, false) = false
          AND (${conds.join(' OR ')})
        ORDER BY r.rating_avg DESC NULLS LAST, r.name ASC, mi.sort_order ASC, mi.name ASC
        LIMIT 300`,

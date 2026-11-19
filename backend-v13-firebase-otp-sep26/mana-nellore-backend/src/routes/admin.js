@@ -477,7 +477,7 @@ router.put(
   '/pricing',
   ah(async (req, res) => {
     const { key, value } = req.body;
-    const allowed = ['delivery_tiers', 'rider_payout_tiers', 'platform_fee_paise', 'default_commission_pct', 'free_delivery_rules', 'eta_minutes', 'call_to_order_phone'];
+    const allowed = ['delivery_tiers', 'rider_payout_tiers', 'platform_fee_paise', 'default_commission_pct', 'eta_minutes', 'call_to_order_phone', 'tax_rates', 'otw_flat_fee_paise', 'customer_fee'];
     if (!allowed.includes(key)) return res.status(400).json({ error: 'Unknown pricing key' });
     const { rows } = await db.query(
       'UPDATE pricing_config SET value = $1::jsonb WHERE key = $2 RETURNING *',

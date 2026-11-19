@@ -4,12 +4,12 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
-const { haversineKm, loadPricingConfig, computeQuote, otwSecondaryFeePaise, tripPayoutPaise } = require('../lib/pricing');
+const { haversineKm, loadPricingConfig, computeQuote, computeTax, otwSecondaryFeePaise, tripPayoutPaise } = require('../lib/pricing');
 const { pointToSegKm } = require('../lib/otw');
 const { pushToUser } = require('../lib/fcm');
 
 const router = express.Router();
-router.use(authenticate);
+router.use(authenticate, requireRole('customer'));
 
 async function notify(userId, title, body) {
   await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [
@@ -51,28 +51,79 @@ async function freshDeliveryOtp() {
   return { code, hash };
 }
 
-// Subtotal for a list of items against a menu lookup, including customization extras.
-async function itemsSubtotal(db, menuById, items) {
-  let sub = 0;
+// Shared item validation + pricing — quote and place MUST agree.
+// An unknown item, an unavailable item, or a non-positive-integer qty is a
+// 400 (never silently skipped, never coerced). Returns { subtotal, snapshots }
+// with customization extras priced in. Thrown { status, message } objects are
+// answered by the central error handler.
+async function validateItems(dbClient, menuById, items) {
+  let subtotal = 0;
+  const snapshots = [];
   for (const it of items) {
     const m = menuById[it.menu_item_id];
-    if (!m || !m.available) continue;
+    const qty = Number(it.qty);
+    if (!m) throw { status: 400, message: 'A menu item is not from this restaurant' };
+    if (!m.available) throw { status: 400, message: `"${m.name}" is currently unavailable` };
+    if (!Number.isInteger(qty) || qty <= 0) throw { status: 400, message: 'Quantity must be a positive integer' };
     let custExtra = 0;
+    const custNames = [];
     if (Array.isArray(it.customizations) && it.customizations.length) {
       const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
       if (optIds.length) {
-        const oRes = await db.query(
-          `SELECT o.id, o.price_paise FROM customization_options o
+        const oRes = await dbClient.query(
+          `SELECT o.id, o.name, o.price_paise FROM customization_options o
            JOIN customization_groups g ON g.id = o.group_id
            WHERE o.id = ANY($1) AND g.menu_item_id = $2`,
           [optIds, m.id]
         );
-        for (const o of oRes.rows) custExtra += Number(o.price_paise) || 0;
+        for (const o of oRes.rows) { custExtra += Number(o.price_paise) || 0; custNames.push(o.name); }
       }
     }
-    sub += (m.price_paise + custExtra) * (Number(it.qty) || 1);
+    subtotal += (m.price_paise + custExtra) * qty;
+    snapshots.push({
+      menu_item_id: m.id,
+      name_snapshot: m.name + (custNames.length ? ' (' + custNames.join(', ') + ')' : ''),
+      unit_price_paise: m.price_paise + custExtra,
+      qty,
+      instructions: it.instructions || null
+    });
   }
-  return sub;
+  return { subtotal, snapshots };
+}
+
+// Shared coupon validation — quote and place MUST agree. The code must exist,
+// be active and in-window, meet the minimum, pass the student check, AND be
+// issued to the caller (coupon_issuances). Coupons have no public flag, so
+// issuance-only: a code issued to user A cannot be redeemed by user B.
+// Returns { discount, couponId, error } — quote reports the error softly,
+// place throws it.
+async function validateCoupon(dbClient, couponCode, subtotal, userId) {
+  const code = String(couponCode).toUpperCase();
+  const cRes = await dbClient.query('SELECT * FROM coupons WHERE code = $1 AND active = true', [code]);
+  const coupon = cRes.rows[0];
+  const now = new Date();
+  if (!coupon) return { discount: 0, couponId: null, error: 'Invalid coupon code' };
+  if (coupon.valid_from && new Date(coupon.valid_from) > now) return { discount: 0, couponId: null, error: 'Coupon not yet valid' };
+  if (coupon.valid_to && new Date(coupon.valid_to) < now) return { discount: 0, couponId: null, error: 'Coupon expired' };
+  if (subtotal < coupon.min_order_paise) {
+    return { discount: 0, couponId: null, error: `Coupon needs a minimum order of Rs ${(coupon.min_order_paise / 100).toFixed(0)}` };
+  }
+  if (coupon.requires_student) {
+    const uRes = await dbClient.query('SELECT is_student FROM users WHERE id = $1', [userId]);
+    if (!uRes.rows[0] || !uRes.rows[0].is_student) return { discount: 0, couponId: null, error: 'This coupon is for verified students only' };
+  }
+  const issued = await dbClient.query(
+    'SELECT 1 FROM coupon_issuances WHERE user_id = $1 AND coupon_code = $2 LIMIT 1',
+    [userId, code]
+  );
+  if (!issued.rows[0]) return { discount: 0, couponId: null, error: 'This coupon was not issued to you' };
+  let discount =
+    coupon.discount_type === 'flat'
+      ? coupon.value
+      : Math.round((subtotal * coupon.value) / 100);
+  if (coupon.max_discount_paise != null) discount = Math.min(discount, coupon.max_discount_paise);
+  discount = Math.min(discount, subtotal);
+  return { discount, couponId: coupon.id, error: null };
 }
 
 // POST /api/orders/quote { restaurant_id, address_id?, items, coupon_code?, order_type?, table_id?, tip_paise? }
@@ -90,11 +141,12 @@ router.post(
       return res.status(400).json({ error: 'address_id is required for delivery orders' });
     }
     const rRes = await db.query(
-      "SELECT id, lat, lng, commission_pct FROM restaurants WHERE id = $1 AND status = 'approved'",
+      "SELECT id, lat, lng, commission_pct, is_open FROM restaurants WHERE id = $1 AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
       [restaurant_id]
     );
     const restaurant = rRes.rows[0];
     if (!restaurant) return res.status(404).json({ error: 'Restaurant not available' });
+    if (!restaurant.is_open) return res.status(400).json({ error: 'Restaurant is currently closed' });
 
     let address = null;
     if (!dineIn) {
@@ -113,39 +165,19 @@ router.post(
 
     const ids = items.map((i) => i.menu_item_id);
     const mRes = await db.query(
-      'SELECT id, price_paise, available FROM menu_items WHERE id = ANY($1) AND restaurant_id = $2',
+      'SELECT id, name, price_paise, available FROM menu_items WHERE id = ANY($1) AND restaurant_id = $2',
       [ids, restaurant_id]
     );
     const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
-    const subtotal = await itemsSubtotal(db, menuById, items);
+    const { subtotal } = await validateItems(db, menuById, items);
 
-    // Coupon
+    // Coupon (same checks as place; quote reports problems softly)
     let discount = 0;
     let couponError = null;
     if (coupon_code) {
-      const cRes = await db.query(
-        'SELECT * FROM coupons WHERE code = $1 AND active = true',
-        [String(coupon_code).toUpperCase()]
-      );
-      const coupon = cRes.rows[0];
-      const now = new Date();
-      if (!coupon) couponError = 'Invalid coupon code';
-      else if (coupon.valid_from && new Date(coupon.valid_from) > now) couponError = 'Coupon not yet valid';
-      else if (coupon.valid_to && new Date(coupon.valid_to) < now) couponError = 'Coupon expired';
-      else if (subtotal < coupon.min_order_paise) {
-        couponError = `Coupon needs a minimum order of Rs ${(coupon.min_order_paise / 100).toFixed(0)}`;
-      } else if (coupon.requires_student) {
-        const uRes = await db.query('SELECT is_student FROM users WHERE id = $1', [req.user.id]);
-        if (!uRes.rows[0] || !uRes.rows[0].is_student) couponError = 'This coupon is for verified students only';
-      }
-      if (!couponError) {
-        discount =
-          coupon.discount_type === 'flat'
-            ? coupon.value
-            : Math.round((subtotal * coupon.value) / 100);
-        if (coupon.max_discount_paise != null) discount = Math.min(discount, coupon.max_discount_paise);
-        discount = Math.min(discount, subtotal);
-      }
+      const checked = await validateCoupon(db, coupon_code, subtotal, req.user.id);
+      discount = checked.discount;
+      couponError = checked.error;
     }
 
     let distanceKm = null;
@@ -164,7 +196,8 @@ router.post(
       distanceKm: dineIn ? 0 : distanceKm,
       subtotalPaise: subtotal,
       discountPaise: discount,
-      commissionPct: restaurant.commission_pct
+      commissionPct: restaurant.commission_pct,
+      deliveryFeePaiseOverride: dineIn ? 0 : undefined
     });
 
     // Multi-restaurant on-the-way quote: group items by restaurant_id (item-level).
@@ -184,7 +217,7 @@ router.post(
         const primaryRid = String(restaurant_id);
         const ordered = [primaryRid, ...rids.filter((r) => r !== primaryRid)];
         const rAll = await db.query(
-          "SELECT id, lat, lng, commission_pct FROM restaurants WHERE id = ANY($1) AND status = 'approved'",
+          "SELECT id, lat, lng, commission_pct FROM restaurants WHERE id = ANY($1) AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
           [ordered]
         );
         const rMap = Object.fromEntries(rAll.rows.map((r) => [String(r.id), r]));
@@ -197,11 +230,11 @@ router.post(
           const gItems = byRest[rid];
           const gIds = gItems.map((i) => i.menu_item_id);
           const gmRes = await db.query(
-            'SELECT id, price_paise, available FROM menu_items WHERE id = ANY($1) AND restaurant_id = $2',
+            'SELECT id, name, price_paise, available FROM menu_items WHERE id = ANY($1) AND restaurant_id = $2',
             [gIds, rid]
           );
           const gmById = Object.fromEntries(gmRes.rows.map((m) => [m.id, m]));
-          const gSub = await itemsSubtotal(db, gmById, gItems);
+          const { subtotal: gSub } = await validateItems(db, gmById, gItems);
           let gDist = null;
           if (rr.lat != null && rr.lng != null && address.lat != null && address.lng != null) {
             gDist = haversineKm(Number(rr.lat), Number(rr.lng), Number(address.lat), Number(address.lng));
@@ -232,6 +265,14 @@ router.post(
           const secFee = isPrim ? gQuote.deliveryFeePaise
             : onTheWay ? otwSecondaryFeePaise(gQuote.deliveryFeePaise, config)
             : gQuote.deliveryFeePaise;
+          // GST is charged on the ACTUAL fee (flat Rs 5 for on-the-way
+          // secondaries, full fee otherwise), not the normal fee.
+          const gTax = computeTax(
+            config.taxRates,
+            gSub - (gi === 0 ? discount : 0),
+            secFee,
+            isPrim ? gQuote.platformFeePaise : 0
+          );
           groupsOut.push({
             restaurant_id: rid,
             is_primary: isPrim,
@@ -240,7 +281,8 @@ router.post(
             normal_fee_paise: gQuote.deliveryFeePaise,
             delivery_fee_paise: secFee,
             platform_fee_paise: isPrim ? gQuote.platformFeePaise : 0,
-            true_detour_km: detourKm == null ? null : Math.round(detourKm * 1000) / 1000,
+            tax_paise: gTax.taxPaise,
+            tax_breakdown: gTax.breakdown,
           });
         }
       }
@@ -250,10 +292,18 @@ router.post(
     const billPlatform = quote.platformFeePaise;
     // When groups exist, the bill sums across ALL groups (not just the primary)
     let billSubtotal = subtotal, totalDelivery = billDelivery, totalPlatform = billPlatform;
+    let billTax = quote.taxPaise;
+    let billTaxBreakdown = quote.taxBreakdown;
     if (groupsOut) {
       billSubtotal = groupsOut.reduce((s, g) => s + g.subtotal_paise, 0);
       totalDelivery = groupsOut.reduce((s, g) => s + g.delivery_fee_paise, 0);
       totalPlatform = groupsOut.reduce((s, g) => s + g.platform_fee_paise, 0);
+      billTax = groupsOut.reduce((s, g) => s + g.tax_paise, 0);
+      billTaxBreakdown = groupsOut.reduce((acc, g) => ({
+        food_paise: acc.food_paise + (g.tax_breakdown.food_paise || 0),
+        delivery_paise: acc.delivery_paise + (g.tax_breakdown.delivery_paise || 0),
+        platform_paise: acc.platform_paise + (g.tax_breakdown.platform_paise || 0)
+      }), { food_paise: 0, delivery_paise: 0, platform_paise: 0 });
     }
 
     res.json({
@@ -262,9 +312,10 @@ router.post(
         discount_paise: discount,
         delivery_fee_paise: dineIn ? 0 : totalDelivery,
         platform_fee_paise: totalPlatform,
-        tax_paise: quote.taxPaise,
+        tax_paise: billTax,
+        tax_breakdown: billTaxBreakdown,
         tip_paise: tipPaise,
-        total_paise: (dineIn ? 0 : totalDelivery) + totalPlatform + tipPaise + (billSubtotal - discount)
+        total_paise: (dineIn ? 0 : totalDelivery) + totalPlatform + billTax + tipPaise + (billSubtotal - discount)
       },
       groups: groupsOut,
       coupon_error: couponError,
@@ -302,7 +353,7 @@ async function placeMultiGroupOrder(req, res) {
     const restIds = groups.map((g) => g.restaurant_id).filter(Boolean);
     if (!restIds.length) throw { status: 400, message: 'groups with restaurant_id are required' };
     const rRes = await client.query(
-      "SELECT * FROM restaurants WHERE id = ANY($1) AND status = 'approved'",
+      "SELECT * FROM restaurants WHERE id = ANY($1) AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
       [restIds]
     );
     const restById = Object.fromEntries(rRes.rows.map((r) => [String(r.id), r]));
@@ -360,66 +411,21 @@ async function placeMultiGroupOrder(req, res) {
       const items = Array.isArray(g.items) ? g.items : [];
       if (!items.length) continue;
 
-      // Menu validation + subtotal
+      // Menu validation + subtotal (same checks as quote)
       const ids = items.map((it) => it.menu_item_id);
       const mRes = await client.query(
         'SELECT id, name, price_paise, available FROM menu_items WHERE id = ANY($1) AND restaurant_id = $2',
         [ids, restaurant.id]
       );
       const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
-      let subtotal = 0;
-      const snapshots = [];
-      for (const it of items) {
-        const m = menuById[it.menu_item_id];
-        const qty = Number(it.qty);
-        if (!m) throw { status: 400, message: 'A menu item is not from this restaurant' };
-        if (!m.available) throw { status: 400, message: `"${m.name}" is currently unavailable` };
-        if (!Number.isInteger(qty) || qty <= 0) throw { status: 400, message: 'Quantity must be a positive integer' };
-        let custExtra = 0;
-        const custNames = [];
-        if (Array.isArray(it.customizations) && it.customizations.length) {
-          const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
-          if (optIds.length) {
-            const oRes = await client.query(
-              `SELECT o.id, o.name, o.price_paise FROM customization_options o
-               JOIN customization_groups gg ON gg.id = o.group_id
-               WHERE o.id = ANY($1) AND gg.menu_item_id = $2`,
-              [optIds, m.id]
-            );
-            for (const o of oRes.rows) { custExtra += Number(o.price_paise) || 0; custNames.push(o.name); }
-          }
-        }
-        subtotal += (m.price_paise + custExtra) * qty;
-        snapshots.push({
-          menu_item_id: m.id,
-          name_snapshot: m.name + (custNames.length ? ' (' + custNames.join(', ') + ')' : ''),
-          unit_price_paise: m.price_paise + custExtra,
-          qty,
-          instructions: it.instructions || null
-        });
-      }
+      const { subtotal, snapshots } = await validateItems(client, menuById, items);
 
-      // Coupon only on primary
+      // Coupon only on primary (same checks as quote; place enforces them)
       let discount = 0;
       if (isPrimary && coupon_code) {
-        const cRes = await client.query('SELECT * FROM coupons WHERE code = $1 AND active = true',
-          [String(coupon_code).toUpperCase()]);
-        const coupon = cRes.rows[0];
-        const now = new Date();
-        if (coupon && !(coupon.valid_from && new Date(coupon.valid_from) > now) &&
-            !(coupon.valid_to && new Date(coupon.valid_to) < now) &&
-            subtotal >= coupon.min_order_paise) {
-          let studentOk = true;
-          if (coupon.requires_student) {
-            const uRes = await client.query('SELECT is_student FROM users WHERE id = $1', [req.user.id]);
-            studentOk = !!(uRes.rows[0] && uRes.rows[0].is_student);
-          }
-          if (studentOk) {
-            discount = coupon.discount_type === 'flat' ? coupon.value : Math.round((subtotal * coupon.value) / 100);
-            if (coupon.max_discount_paise != null) discount = Math.min(discount, coupon.max_discount_paise);
-            discount = Math.min(discount, subtotal);
-          }
-        }
+        const checked = await validateCoupon(client, coupon_code, subtotal, req.user.id);
+        if (checked.error) throw { status: 400, message: checked.error };
+        discount = checked.discount;
       }
 
       // Fees: primary = 100% of its own normal fee, platform fee applies.
@@ -446,7 +452,9 @@ async function placeMultiGroupOrder(req, res) {
         : otwSecondaryFeePaise(normalFee, config);
       const platformFee = isPrimary ? quote.platformFeePaise : 0;
       const tipPaise = isPrimary ? Math.max(0, Math.round(Number(tip_paise) || 0)) : 0;
-      const finalTotal = (subtotal - discount) + deliveryFee + platformFee + tipPaise;
+      // GST on the fees actually charged (flat Rs 5 for on-the-way secondaries).
+      const tax = computeTax(config.taxRates, subtotal - discount, deliveryFee, platformFee);
+      const finalTotal = (subtotal - discount) + deliveryFee + platformFee + tipPaise + tax.taxPaise;
 
       const timeline = [{ status: 'placed', at: new Date().toISOString(), by: 'customer' }];
       const etaMinutes = Number(config.etaMinutes) || 30;
@@ -467,7 +475,7 @@ async function placeMultiGroupOrder(req, res) {
          RETURNING *`,
         [req.user.id, restaurant.id, address_id,
          subtotal, discount, deliveryFee, platformFee,
-         quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
+         tax.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payment_method || 'upi', JSON.stringify(timeline), String(etaMinutes), shareToken,
          orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, tripId, isPrimary]
@@ -559,10 +567,10 @@ async function placeMultiGroupOrder(req, res) {
     }
 
     await client.query('COMMIT');
-    // Single shared delivery OTP for the entire trip
-    const sharedOtp = orders[0]?.order?.delivery_otp;
+    // The shared delivery OTP is returned once in each order's place response
+    // below — never in a notification body.
     await notify(req.user.id, 'Order placed ✅',
-      `Your restaurants got the orders and kitchens are firing up! 🔥 Delivery OTP: ${sharedOtp} — share with your rider at handover.`);
+      'Your restaurants got the orders and kitchens are firing up! 🔥');
 
     res.status(201).json({
       orders,
@@ -606,7 +614,7 @@ router.post(
       await client.query('BEGIN');
 
       const rRes = await client.query(
-        "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'",
+        "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
         [restaurant_id]
       );
       const restaurant = rRes.rows[0];
@@ -635,72 +643,17 @@ router.post(
         [ids, restaurant_id]
       );
       const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
+      // Same item checks as quote (unavailable / bad qty is a 400, never skipped)
+      const { subtotal, snapshots } = await validateItems(client, menuById, items);
 
-      let subtotal = 0;
-      const snapshots = [];
-      for (const it of items) {
-        const m = menuById[it.menu_item_id];
-        const qty = Number(it.qty);
-        if (!m) throw { status: 400, message: 'A menu item is not from this restaurant' };
-        if (!m.available) throw { status: 400, message: `"${m.name}" is currently unavailable` };
-        if (!Number.isInteger(qty) || qty <= 0) throw { status: 400, message: 'Quantity must be a positive integer' };
-        // Customization price additions
-        let custExtra = 0;
-        let custNames = [];
-        if (Array.isArray(it.customizations) && it.customizations.length) {
-          const optIds = it.customizations.map((c) => c.option_id).filter(Boolean);
-          if (optIds.length) {
-            const oRes = await client.query(
-              `SELECT o.id, o.name, o.price_paise FROM customization_options o
-               JOIN customization_groups g ON g.id = o.group_id
-               WHERE o.id = ANY($1) AND g.menu_item_id = $2`,
-              [optIds, m.id]
-            );
-            for (const o of oRes.rows) {
-              custExtra += Number(o.price_paise) || 0;
-              custNames.push(o.name);
-            }
-          }
-        }
-        subtotal += (m.price_paise + custExtra) * qty;
-        snapshots.push({
-          menu_item_id: m.id,
-          name_snapshot: m.name + (custNames.length ? ' (' + custNames.join(', ') + ')' : ''),
-          unit_price_paise: m.price_paise + custExtra,
-          qty,
-          instructions: it.instructions || null
-        });
-      }
-
-      // Coupon
+      // Coupon (same checks as quote; place enforces them)
       let discount = 0;
       let couponId = null;
       if (coupon_code) {
-        const cRes = await client.query(
-          'SELECT * FROM coupons WHERE code = $1 AND active = true',
-          [String(coupon_code).toUpperCase()]
-        );
-        const coupon = cRes.rows[0];
-        const now = new Date();
-        if (!coupon) throw { status: 400, message: 'Invalid coupon code' };
-        if (coupon.valid_from && new Date(coupon.valid_from) > now) throw { status: 400, message: 'Coupon not yet valid' };
-        if (coupon.valid_to && new Date(coupon.valid_to) < now) throw { status: 400, message: 'Coupon expired' };
-        if (subtotal < coupon.min_order_paise) {
-          throw { status: 400, message: `Coupon needs a minimum order of Rs ${(coupon.min_order_paise / 100).toFixed(0)}` };
-        }
-        if (coupon.requires_student) {
-          const uRes = await client.query('SELECT is_student FROM users WHERE id = $1', [req.user.id]);
-          if (!uRes.rows[0] || !uRes.rows[0].is_student) {
-            throw { status: 400, message: 'This coupon is for verified students only' };
-          }
-        }
-        discount =
-          coupon.discount_type === 'flat'
-            ? coupon.value
-            : Math.round((subtotal * coupon.value) / 100);
-        if (coupon.max_discount_paise != null) discount = Math.min(discount, coupon.max_discount_paise);
-        discount = Math.min(discount, subtotal);
-        couponId = coupon.id;
+        const checked = await validateCoupon(client, coupon_code, subtotal, req.user.id);
+        if (checked.error) throw { status: 400, message: checked.error };
+        discount = checked.discount;
+        couponId = checked.couponId;
       }
 
       // Distance + quote
@@ -715,10 +668,11 @@ router.post(
         distanceKm: dineIn ? 0 : distanceKm,
         subtotalPaise: subtotal,
         discountPaise: discount,
-        commissionPct: restaurant.commission_pct
+        commissionPct: restaurant.commission_pct,
+        deliveryFeePaiseOverride: dineIn ? 0 : undefined
       });
       const deliveryFee = dineIn ? 0 : quote.deliveryFeePaise;
-      const finalTotal = (subtotal - discount) + deliveryFee + quote.platformFeePaise + tipPaise;
+      const finalTotal = (subtotal - discount) + deliveryFee + quote.platformFeePaise + quote.taxPaise + tipPaise;
 
       const timeline = [{ status: 'placed', at: new Date().toISOString(), by: 'customer' }];
       const etaMinutes = Number(config.etaMinutes) || 30;
@@ -767,8 +721,10 @@ router.post(
           data: { type: 'new_order', order_id: order.id, status: 'placed' },
         });
       }
+      // The delivery OTP is returned once in the place response below —
+      // never in a notification body.
       await notify(req.user.id, 'Order placed ✅',
-        `${restaurant.name} (${orderNumber}) got your order and the kitchen is firing up! 🔥 Your delivery OTP is ${deliveryOtp} — share it with your rider at handover.`);
+        `${restaurant.name} (${orderNumber}) got your order and the kitchen is firing up! 🔥`);
 
       const { delivery_otp_hash: _h2, ...orderSafe2 } = order;
       res.status(201).json({
@@ -778,6 +734,8 @@ router.post(
           discount_paise: discount,
           delivery_fee_paise: deliveryFee,
           platform_fee_paise: quote.platformFeePaise,
+          tax_paise: quote.taxPaise,
+          tax_breakdown: quote.taxBreakdown,
           tip_paise: tipPaise,
           total_paise: finalTotal,
           eta_minutes: etaMinutes,
@@ -793,29 +751,6 @@ router.post(
     } finally {
       client.release();
     }
-  })
-);
-
-// POST /api/orders/:id/pay — simulates gateway success (replace with webhook later)
-router.post(
-  '/:id/pay',
-  ah(async (req, res) => {
-    const { rows } = await db.query(
-      'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
-      [req.params.id, req.user.id]
-    );
-    const order = rows[0];
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.payment_status !== 'pending') {
-      return res.status(409).json({ error: `Payment already ${order.payment_status}` });
-    }
-    await db.query("UPDATE orders SET payment_status = 'paid' WHERE id = $1", [order.id]);
-    const timeline = order.timeline || [];
-    timeline.push({ status: 'paid', at: new Date().toISOString(), by: 'customer' });
-    await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [
-      JSON.stringify(timeline), order.id
-    ]);
-    res.json({ ok: true, payment_status: 'paid' });
   })
 );
 
@@ -865,6 +800,8 @@ router.get(
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params
     );
+    // Never expose the delivery OTP (plain or hash) in list responses.
+    for (const o of rows) { delete o.delivery_otp_hash; delete o.delivery_otp_plain; }
     res.json({ orders: rows });
   })
 );
@@ -892,11 +829,10 @@ router.get(
     );
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    delete order.delivery_otp_hash; // never expose to clients
-    if (order.delivery_otp_plain) {
-      order.delivery_otp = order.delivery_otp_plain;
-      delete order.delivery_otp_plain;
-    }
+    // The plain delivery OTP is never exposed here — the customer gets it once
+    // in the place response, or re-issues it during delivery.
+    delete order.delivery_otp_hash;
+    delete order.delivery_otp_plain;
     const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
     // Queue transparency: orders at this restaurant placed before mine, still active
     let queueAhead = 0;
@@ -1008,22 +944,27 @@ router.post(
       for (const to of tripRes.rows) {
         if (to.id !== order.id) {
           await transition(to.id, 'cancelled', 'customer');
-          const toRefunded = to.payment_status === 'paid';
+          // Paid orders go to refund_pending — 'refunded' is only set once a
+          // real refund has happened (admin refund action).
+          const toRefundPending = to.payment_status === 'paid';
           await db.query(
             'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
-            [req.body.reason || 'Cancelled by customer (trip)', toRefunded ? 'refunded' : to.payment_status, to.id]
+            [req.body.reason || 'Cancelled by customer (trip)', toRefundPending ? 'refund_pending' : to.payment_status, to.id]
           );
           cancelIds.push(to.id);
         }
       }
     }
     await transition(order.id, 'cancelled', 'customer');
-    const refunded = order.payment_status === 'paid';
+    const refundPending = order.payment_status === 'paid';
     await db.query(
       'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
-      [req.body.reason || 'Cancelled by customer', refunded ? 'refunded' : order.payment_status, order.id]
+      [req.body.reason || 'Cancelled by customer', refundPending ? 'refund_pending' : order.payment_status, order.id]
     );
-    res.json({ ok: true, refunded, cancelled_orders: cancelIds.length });
+    // Bell notification: the customer must see the cancellation, not just "Order placed".
+    await notify(req.user.id, 'Order cancelled',
+      `Your order #${order.order_number || order.id} was cancelled.${refundPending ? ' Your refund is being processed.' : ''}`);
+    res.json({ ok: true, refund_pending: refundPending, cancelled_orders: cancelIds.length });
   })
 );
 
@@ -1042,9 +983,9 @@ router.post(
     }
     const code = newDeliveryOtp();
     const hash = await bcrypt.hash(code, 8);
-    await db.query('UPDATE orders SET delivery_otp_hash = $1 WHERE id = $2', [hash, order.id]);
-    await notify(req.user.id, 'Your delivery OTP', `Share this OTP with your rider to receive the order: ${code}`);
-    res.json({ ok: true, message: 'OTP re-sent to your notifications' });
+    await db.query('UPDATE orders SET delivery_otp_hash = $1, delivery_otp_plain = $2 WHERE id = $3', [hash, code, order.id]);
+    await notify(req.user.id, 'Your delivery OTP', 'A new delivery OTP was generated for your order.');
+    res.json({ ok: true, delivery_otp: code });
   })
 );
 

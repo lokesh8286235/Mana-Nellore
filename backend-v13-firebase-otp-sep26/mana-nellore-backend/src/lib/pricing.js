@@ -21,7 +21,7 @@ async function loadPricingConfig(db) {
       (m.delivery_tiers && m.delivery_tiers.tiers) || [
         { up_to_km: 3, rate_paise_per_km: 1000 },
         { up_to_km: 8, rate_paise_per_km: 900 },
-        { up_to_km: null, rate_paise_per_km: 900 }
+        { up_to_km: null, rate_paise_per_km: 800 }
       ],
     riderPayout: m.rider_payout_tiers || {
       slab1_up_to_km: 5,
@@ -54,28 +54,20 @@ async function loadPricingConfig(db) {
     defaultCommissionPct: Number(
       m.default_commission_pct != null ? m.default_commission_pct : 12
     ),
-    freeDeliveryRules:
-      (m.free_delivery_rules && m.free_delivery_rules.rules) || [],
     // Honest ETA estimate shown to customers ("Usually ~X min") — NOT a delivery promise.
     etaMinutes: Number(m.eta_minutes != null ? m.eta_minutes : 30),
     // On-the-way secondary fee: flat amount in paise (user-dictated 2026-10-13).
     otwFlatFeePaise: Number(m.otw_flat_fee_paise != null ? m.otw_flat_fee_paise : 500),
+    // GST rates (user rule: food 5%, delivery 18%, platform 18%) — backend-driven
+    // via pricing_config key 'tax_rates', admin-editable, exposed on GET /api/config.
+    taxRates: m.tax_rates || { food_pct: 5, delivery_pct: 18, platform_pct: 18 },
   };
 }
 
-// Marginal tiers: 0-3 km @ Rs 10/km, 3-8 km @ Rs 9/km, 8+ km @ Rs 9/km.
-// Free-delivery rules (order value + distance) zero the fee when matched.
-function deliveryFeePaise(tiers, distanceKm, orderValuePaise, freeRules) {
-  if (
-    Array.isArray(freeRules) &&
-    freeRules.some(
-      (r) =>
-        orderValuePaise >= Number(r.min_order_paise) &&
-        distanceKm <= Number(r.max_distance_km)
-    )
-  ) {
-    return 0;
-  }
+// Marginal tiers: 0-3 km @ Rs 10/km, 3-8 km @ Rs 9/km, 8+ km @ Rs 8/km.
+// Legacy list fee only (on-the-way normal-fee reference). The customer delivery
+// fee is customerDeliveryFeePaise (Rs 20 base + Rs 8/km + free-km tiers).
+function deliveryFeePaise(tiers, distanceKm) {
   let fee = 0;
   let prev = 0;
   for (const t of tiers) {
@@ -195,28 +187,52 @@ function otwSecondaryFeePaise(normalFeePaise, config) {
   return Math.round(flat);
 }
 
-function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct }) {
+// GST (user rule, component-wise): food 5% on net items, delivery 18% on the
+// delivery fee, platform 18% on the platform fee. Per-component rounding to
+// paise, then summed. Rates come from config.taxRates (pricing_config key
+// 'tax_rates'); defaults match the user rule.
+function computeTax(taxRates, netPaise, deliveryFeePaise, platformFeePaise) {
+  const rates = taxRates || {};
+  const foodPct = Number(rates.food_pct != null ? rates.food_pct : 5);
+  const deliveryPct = Number(rates.delivery_pct != null ? rates.delivery_pct : 18);
+  const platformPct = Number(rates.platform_pct != null ? rates.platform_pct : 18);
+  const foodPaise = Math.round((Math.max(0, Number(netPaise) || 0) * foodPct) / 100);
+  const deliveryTaxPaise = Math.round(((Number(deliveryFeePaise) || 0) * deliveryPct) / 100);
+  const platformTaxPaise = Math.round(((Number(platformFeePaise) || 0) * platformPct) / 100);
+  return {
+    taxPaise: foodPaise + deliveryTaxPaise + platformTaxPaise,
+    breakdown: { food_paise: foodPaise, delivery_paise: deliveryTaxPaise, platform_paise: platformTaxPaise }
+  };
+}
+
+function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct, deliveryFeePaiseOverride }) {
   const net = subtotalPaise - discountPaise;
   // If distance unknown, use base fee from config (never null — DB requires it)
   const baseFee = Number(config.customerFee && config.customerFee.base_paise) || 2000;
   // FINAL fee model (user 2026-10-15): free-km tiers by order value, Rs 8/km beyond.
   // This matches what the checkout nudge advertises — the bill must equal the promise.
+  // deliveryFeePaiseOverride (e.g. 0 for dine-in) charges GST on the fee actually
+  // charged, never on a fee that was waived.
   const deliveryFee =
-    distanceKm == null
-      ? baseFee
-      : customerDeliveryFeePaise(config.customerFee, distanceKm, net).fee_paise;
+    deliveryFeePaiseOverride != null
+      ? deliveryFeePaiseOverride
+      : distanceKm == null
+        ? baseFee
+        : customerDeliveryFeePaise(config.customerFee, distanceKm, net).fee_paise;
   const platformFeePaise = config.platformFeePaise;
   const pct = commissionPct != null ? Number(commissionPct) : config.defaultCommissionPct;
   const commissionPaise = Math.round((net * pct) / 100);
   const payout =
     distanceKm == null ? null : riderPayoutPaise(config.riderPayout, distanceKm);
+  const tax = computeTax(config.taxRates, net, deliveryFee, platformFeePaise);
   return {
     deliveryFeePaise: deliveryFee,
     platformFeePaise,
-    taxPaise: 0,
+    taxPaise: tax.taxPaise,
+    taxBreakdown: tax.breakdown,
     commissionPaise,
     riderPayoutPaise: payout,
-    totalPaise: net + deliveryFee + platformFeePaise
+    totalPaise: net + deliveryFee + platformFeePaise + tax.taxPaise
   };
 }
 
@@ -228,5 +244,6 @@ module.exports = {
   riderPayoutPaise,
   tripPayoutPaise,
   otwSecondaryFeePaise,
+  computeTax,
   computeQuote
 };
