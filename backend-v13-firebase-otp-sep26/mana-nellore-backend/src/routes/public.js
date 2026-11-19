@@ -3,6 +3,7 @@
 const express = require('express');
 const db = require('../db');
 const { ah } = require('../middleware/auth');
+const { normalizeTaxRates } = require('../lib/pricing');
 
 const router = express.Router();
 
@@ -160,7 +161,7 @@ router.get(
     const prepLead = m.prep_lead_minutes ? parseInt(m.prep_lead_minutes, 10) : 30;
     // GST rates (user rule: food 5%, delivery 18%, platform 18%) + on-the-way
     // flat fee — backend-driven, admin-editable, single source of truth.
-    const taxRates = m.tax_rates || { food_pct: 5, delivery_pct: 18, platform_pct: 18 };
+    const taxRates = normalizeTaxRates(m.tax_rates);
     const otwFlatFeePaise = m.otw_flat_fee_paise != null ? Number(m.otw_flat_fee_paise) : 500;
     res.json({
       call_to_order_phone: (m.call_to_order_phone) || '',

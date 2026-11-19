@@ -60,7 +60,9 @@ async function loadPricingConfig(db) {
     otwFlatFeePaise: Number(m.otw_flat_fee_paise != null ? m.otw_flat_fee_paise : 500),
     // GST rates (user rule: food 5%, delivery 18%, platform 18%) — backend-driven
     // via pricing_config key 'tax_rates', admin-editable, exposed on GET /api/config.
-    taxRates: m.tax_rates || { food_pct: 5, delivery_pct: 18, platform_pct: 18 },
+    // Accepts both food_pct and food_gst_pct namings (the live row predates this
+    // change and uses *_gst_pct); always normalized to food/delivery/platform_pct.
+    taxRates: normalizeTaxRates(m.tax_rates),
   };
 }
 
@@ -187,6 +189,17 @@ function otwSecondaryFeePaise(normalFeePaise, config) {
   return Math.round(flat);
 }
 
+// Normalize a tax_rates value to { food_pct, delivery_pct, platform_pct }.
+function normalizeTaxRates(t) {
+  const r = t || {};
+  const pick = (a, b, d) => Number(r[a] != null ? r[a] : r[b] != null ? r[b] : d);
+  return {
+    food_pct: pick('food_pct', 'food_gst_pct', 5),
+    delivery_pct: pick('delivery_pct', 'delivery_gst_pct', 18),
+    platform_pct: pick('platform_pct', 'platform_gst_pct', 18)
+  };
+}
+
 // GST (user rule, component-wise): food 5% on net items, delivery 18% on the
 // delivery fee, platform 18% on the platform fee. Per-component rounding to
 // paise, then summed. Rates come from config.taxRates (pricing_config key
@@ -245,5 +258,6 @@ module.exports = {
   tripPayoutPaise,
   otwSecondaryFeePaise,
   computeTax,
+  normalizeTaxRates,
   computeQuote
 };
