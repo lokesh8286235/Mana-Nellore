@@ -169,7 +169,14 @@ router.post(
       [ids, restaurant_id]
     );
     const menuById = Object.fromEntries(mRes.rows.map((m) => [m.id, m]));
-    const { subtotal } = await validateItems(db, menuById, items);
+    // First validation covers ONLY the primary restaurant's items. Items from
+    // secondary restaurants are validated per-group below (groupsOut block);
+    // validating ALL items against the primary's menu here would 400 any
+    // multi-restaurant quote before the grouping is ever reached.
+    const primaryItems = items.filter(
+      (i) => String(i.restaurant_id || restaurant_id) === String(restaurant_id)
+    );
+    const { subtotal } = await validateItems(db, menuById, primaryItems);
 
     // Coupon (same checks as place; quote reports problems softly)
     let discount = 0;
