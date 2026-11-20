@@ -855,7 +855,7 @@ router.get(
     const { rows } = await db.query(
       `SELECT o.*, r.name AS restaurant_name, r.image_url AS restaurant_image
        FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
-       WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
+       WHERE ${where} ORDER BY o.placed_at DESC LIMIT 200`,
       params
     );
     // Never expose the delivery OTP (plain or hash) in list responses.
