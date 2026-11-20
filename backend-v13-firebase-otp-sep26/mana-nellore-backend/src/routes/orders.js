@@ -169,18 +169,32 @@ async function validateCoupon(dbClient, couponCode, subtotal, userId) {
   return { discount, couponId: coupon.id, error: null };
 }
 
-// POST /api/orders/quote { restaurant_id, address_id?, items, coupon_code?, order_type?, table_id?, tip_paise? }
+// POST /api/orders/quote { restaurant_id, address_id?, lat?, lng?, items, coupon_code?, order_type?, table_id?, tip_paise? }
+// b816: optional lat/lng = live delivery location (dragged pin / picked address).
+// When valid they override the saved address row for the fee (distance).
 // Read-only bill preview: returns the exact fee breakdown the customer will
 // pay, computed with the same pricing engine as order placement. No order created.
 router.post(
   '/quote',
   ah(async (req, res) => {
-    const { restaurant_id, address_id, items, coupon_code, order_type, table_id, tip_paise } = req.body;
+    const { restaurant_id, address_id, lat, lng, items, coupon_code, order_type, table_id, tip_paise } = req.body;
     const dineIn = order_type === 'dinein';
     if (!restaurant_id || !Array.isArray(items) || !items.length) {
       return res.status(400).json({ error: 'restaurant_id and items are required' });
     }
-    if (!dineIn && !address_id) {
+    // b816: live delivery location override — the dragged pin / picked location
+    // (mn_lat/mn_lng) may differ from the saved address row. Valid coords are
+    // the delivery location: the fee follows the pin, not the saved row.
+    // Null Island (0,0) is never a real location — it is ignored.
+    let overrideLat = null;
+    let overrideLng = null;
+    const qLat = Number(lat);
+    const qLng = Number(lng);
+    if (Number.isFinite(qLat) && Number.isFinite(qLng) && !(qLat === 0 && qLng === 0)) {
+      overrideLat = qLat;
+      overrideLng = qLng;
+    }
+    if (!dineIn && !address_id && overrideLat == null) {
       return res.status(400).json({ error: 'address_id is required for delivery orders' });
     }
     const rRes = await db.query(
@@ -193,12 +207,18 @@ router.post(
 
     let address = null;
     if (!dineIn) {
-      const aRes = await db.query('SELECT lat, lng FROM addresses WHERE id = $1 AND user_id = $2', [
-        address_id,
-        req.user.id
-      ]);
-      address = aRes.rows[0];
-      if (!address) return res.status(400).json({ error: 'Delivery address not found' });
+      if (overrideLat != null) {
+        // Live location wins for the fee; the saved row (if any) is only a label.
+        // A stale address_id no longer 400s the quote when a live location exists.
+        address = { lat: overrideLat, lng: overrideLng };
+      } else {
+        const aRes = await db.query('SELECT lat, lng FROM addresses WHERE id = $1 AND user_id = $2', [
+          address_id,
+          req.user.id
+        ]);
+        address = aRes.rows[0];
+        if (!address) return res.status(400).json({ error: 'Delivery address not found' });
+      }
     } else if (table_id) {
       const tRes = await db.query('SELECT id FROM tables WHERE id = $1 AND restaurant_id = $2', [
         table_id, restaurant_id
@@ -369,6 +389,7 @@ router.post(
       },
       groups: groupsOut,
       coupon_error: couponError,
+      distance_km: distanceKm == null ? null : Math.round(distanceKm * 100) / 100,
       eta_minutes: Number(config.etaMinutes) || 30
     });
   })
