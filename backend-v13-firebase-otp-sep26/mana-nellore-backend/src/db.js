@@ -144,6 +144,9 @@ async function migrate() {
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS fssai_license text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_otp_plain text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lat double precision');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lng double precision');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_label text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS opens_at text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS closes_at text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number text');

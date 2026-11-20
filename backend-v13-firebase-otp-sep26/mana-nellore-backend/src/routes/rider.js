@@ -284,8 +284,8 @@ async function deliveryDetail(orderId, riderId) {
   const { rows } = await db.query(
     `SELECT o.*, r.name AS restaurant_name, r.address AS restaurant_address,
             r.lat AS rest_lat, r.lng AS rest_lng, r.phone AS restaurant_phone,
-            a.label AS addr_label, a.line1, a.line2, a.city,
-            a.lat AS addr_lat, a.lng AS addr_lng,
+            a.label AS addr_label, COALESCE(o.delivery_label, a.line1) AS line1, a.line2, a.city,
+            COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng,
             u.name AS customer_name, u.phone AS customer_phone
      FROM orders o
      JOIN restaurants r ON r.id = o.restaurant_id
@@ -318,7 +318,7 @@ router.get(
               o.is_primary, o.trip_payout_paise, o.trip_distance_km,
               o.trip_intermediate_stops, o.trip_payout_breakdown,
               r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
-              a.line1, a.city, a.lat AS addr_lat, a.lng AS addr_lng
+              COALESCE(o.delivery_label, a.line1) AS line1, a.city, COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
        LEFT JOIN addresses a ON a.id = o.address_id
@@ -715,8 +715,8 @@ router.get(
       `SELECT o.id, o.status, o.restaurant_id, o.placed_at, o.eta_at, o.total_paise, o.timeline,
               r.name AS restaurant_name, r.address AS restaurant_address,
               r.lat AS rest_lat, r.lng AS rest_lng, r.phone AS restaurant_phone,
-              a.label AS addr_label, a.line1, a.line2, a.city,
-              a.lat AS addr_lat, a.lng AS addr_lng,
+              a.label AS addr_label, COALESCE(o.delivery_label, a.line1) AS line1, a.line2, a.city,
+              COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng,
               u.name AS customer_name, u.phone AS customer_phone
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
@@ -927,7 +927,7 @@ router.post(
 
     const orderCols = `o.id, o.status, o.rider_id, o.restaurant_id, o.placed_at, o.eta_at, o.timeline,
       r.name AS restaurant_name, r.lat AS rest_lat, r.lng AS rest_lng,
-      a.lat AS addr_lat, a.lng AS addr_lng,
+      COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng,
       u.name AS customer_name`;
     const { rows: candRows } = await db.query(
       `SELECT ${orderCols} FROM orders o
@@ -1265,7 +1265,7 @@ router.post(
 
     // Compute payout from live pricing config
     const loc = await db.query(
-      `SELECT r.lat AS rest_lat, r.lng AS rest_lng, a.lat AS addr_lat, a.lng AS addr_lng
+      `SELECT r.lat AS rest_lat, r.lng AS rest_lng, COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng
        FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
        LEFT JOIN addresses a ON a.id = o.address_id WHERE o.id = $1`,
       [order.id]

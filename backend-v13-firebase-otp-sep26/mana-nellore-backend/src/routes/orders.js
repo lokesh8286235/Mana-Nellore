@@ -403,7 +403,7 @@ router.post(
 // (platform fee 0); beyond 500m = FULL normal fee (kept, not removed).
 // Unavailable/closed restaurants are reported in removed_off_route.
 async function placeMultiGroupOrder(req, res) {
-  const { groups, address_id, coupon_code, payment_method,
+  const { groups, address_id, coupon_code, payment_method, lat, lng, delivery_label,
           delivery_note, no_cutlery, tip_paise,
           recipient_name, recipient_phone } = req.body;
   const OFF_ROUTE_MSG = "You entered a new address, so the cart restaurants are not on the way and can't be delivered.";
@@ -423,6 +423,12 @@ async function placeMultiGroupOrder(req, res) {
     );
     const address = aRes.rows[0];
     if (!address) throw { status: 400, message: 'Delivery address not found' };
+    // b817: pinned delivery location (per-order override, confirmed on the checkout map).
+    // Fee, rider destination and stored location all follow the pin. Saved address row untouched.
+    const pinLat = Number(lat), pinLng = Number(lng);
+    const pinValid = Number.isFinite(pinLat) && Number.isFinite(pinLng) && !(pinLat === 0 && pinLng === 0);
+    const deliveryLoc = pinValid ? { lat: pinLat, lng: pinLng }
+      : (address && address.lat != null && address.lng != null ? { lat: Number(address.lat), lng: Number(address.lng) } : null);
 
     // Validate + load all restaurants
     const restIds = groups.map((g) => g.restaurant_id).filter(Boolean);
@@ -456,12 +462,12 @@ async function placeMultiGroupOrder(req, res) {
         continue;
       }
       let onRoute = false;
-      if (primary.lat != null && primary.lng != null && address.lat != null && address.lng != null &&
+      if (primary.lat != null && primary.lng != null && deliveryLoc &&
           r.lat != null && r.lng != null) {
         const distKm = pointToSegKm(
           Number(r.lng), Number(r.lat),
           Number(primary.lng), Number(primary.lat),
-          Number(address.lng), Number(address.lat)
+          Number(deliveryLoc.lng), Number(deliveryLoc.lat)
         );
         onRoute = distKm <= 0.5;
       }
@@ -507,8 +513,8 @@ async function placeMultiGroupOrder(req, res) {
       // Secondary on-the-way (validated ≤500m above):
       // flat on-the-way fee (Rs 5 default, config-driven). Platform 0.
       let distanceKm = null;
-      if (restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
-        distanceKm = haversineKm(Number(restaurant.lat), Number(restaurant.lng), Number(address.lat), Number(address.lng));
+      if (restaurant.lat != null && restaurant.lng != null && deliveryLoc) {
+        distanceKm = haversineKm(Number(restaurant.lat), Number(restaurant.lng), Number(deliveryLoc.lat), Number(deliveryLoc.lng));
       }
       const quote = computeQuote({
         config,
@@ -544,16 +550,16 @@ async function placeMultiGroupOrder(req, res) {
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash, delivery_otp_plain, trip_id, is_primary)
+            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label, trip_id, is_primary)
          VALUES ($1,$2,$3,'placed','delivery',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17::jsonb,
-                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22, $23, $24)
+                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22, $23, $24, $25, $26, $27)
          RETURNING *`,
         [req.user.id, restaurant.id, address_id,
          subtotal, discount, deliveryFee, platformFee,
          tax.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payMethod, JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, tripId, isPrimary]
+         orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null, tripId, isPrimary]
       );
       const order = oRes.rows[0];
       for (const s of snapshots) {
@@ -669,7 +675,7 @@ router.post(
     if (_blockCheck.rows[0] && _blockCheck.rows[0].is_blocked) {
       return res.status(403).json({ error: 'Your account has been blocked. Please contact support.' });
     }
-    const { restaurant_id, address_id, items, coupon_code, payment_method,
+    const { restaurant_id, address_id, items, coupon_code, payment_method, lat, lng, delivery_label,
             order_type, table_id, delivery_note, no_cutlery, tip_paise,
             recipient_name, recipient_phone, groups } = req.body;
     // Multi-restaurant on-the-way checkout: groups[0] = primary, rest = secondaries.
@@ -735,10 +741,17 @@ router.post(
         couponId = checked.couponId;
       }
 
+    // b817: pinned delivery location (per-order override, confirmed on the checkout map).
+    // When the customer drags the pin and confirms, the order delivers to the pin:
+    // fee, rider destination and stored location all follow it. The saved address row is untouched.
+    const pinLat = Number(lat), pinLng = Number(lng);
+    const pinValid = !dineIn && Number.isFinite(pinLat) && Number.isFinite(pinLng) && !(pinLat === 0 && pinLng === 0);
+    const deliveryLoc = pinValid ? { lat: pinLat, lng: pinLng }
+      : (address && address.lat != null && address.lng != null ? { lat: Number(address.lat), lng: Number(address.lng) } : null);
       // Distance + quote
       let distanceKm = null;
-      if (!dineIn && restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
-        distanceKm = haversineKm(restaurant.lat, restaurant.lng, address.lat, address.lng);
+      if (!dineIn && restaurant.lat != null && restaurant.lng != null && deliveryLoc) {
+        distanceKm = haversineKm(restaurant.lat, restaurant.lng, deliveryLoc.lat, deliveryLoc.lng);
       }
       const config = await loadPricingConfig(client);
       const tipPaise = capTip(tip_paise, config);
@@ -766,9 +779,9 @@ router.post(
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash, delivery_otp_plain)
+            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label)
          VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
-                 now() + ($20 || ' minutes')::interval, $21, $22, $23, $24)
+                 now() + ($20 || ' minutes')::interval, $21, $22, $23, $24, $25, $26, $27)
          RETURNING *`,
         [req.user.id, restaurant_id, dineIn ? null : address_id, dineIn ? 'dinein' : 'delivery',
          dineIn ? table_id : null,
@@ -776,7 +789,7 @@ router.post(
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payMethod, JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, deliveryOtpHash, deliveryOtp]
+         orderNumber, deliveryOtpHash, deliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null]
       );
       const order = oRes.rows[0];
 
@@ -893,7 +906,8 @@ router.get(
       `SELECT o.*, r.name AS restaurant_name, r.image_url AS restaurant_image, r.phone AS restaurant_phone,
               r.verified AS restaurant_verified, r.lat AS rest_lat, r.lng AS rest_lng,
               rd.lat AS rider_lat, rd.lng AS rider_lng,
-              a.line1, a.line2, a.city, a.lat AS addr_lat, a.lng AS addr_lng,
+              COALESCE(o.delivery_label, a.line1) AS line1, a.line2, a.city,
+              COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng,
               ru.name AS rider_name, ru.phone AS rider_phone,
               rd.profile_photo AS rider_photo, rd.rating_avg AS rider_rating,
               (SELECT COUNT(*) FROM orders od
@@ -978,9 +992,10 @@ router.get(
     if (order.rider_lat != null && order.rider_lng != null) {
       const rLat = Number(order.rider_lat), rLng = Number(order.rider_lng);
       let destLat = null, destLng = null;
-      if (['picked_up', 'on_way'].includes(order.status) && order.addr_lat != null && order.addr_lng != null) {
-        // Heading to customer
-        destLat = Number(order.addr_lat); destLng = Number(order.addr_lng);
+      if (['picked_up', 'on_way'].includes(order.status) && (order.delivery_lat != null || order.addr_lat != null)) {
+        // Heading to customer — a confirmed pin overrides the saved address
+        destLat = Number(order.delivery_lat != null ? order.delivery_lat : order.addr_lat);
+        destLng = Number(order.delivery_lng != null ? order.delivery_lng : order.addr_lng);
       } else if (['accepted', 'preparing', 'ready'].includes(order.status) && order.rest_lat != null && order.rest_lng != null) {
         // Heading to restaurant
         destLat = Number(order.rest_lat); destLng = Number(order.rest_lng);

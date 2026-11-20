@@ -165,6 +165,9 @@ CREATE TABLE IF NOT EXISTS orders (
   payment_status text NOT NULL DEFAULT 'pending'
     CHECK (payment_status IN ('pending','paid','failed','refunded','collected','refund_pending')),
   delivery_otp_hash text,
+  delivery_lat double precision,
+  delivery_lng double precision,
+  delivery_label text,
   order_number text UNIQUE,
   cancel_reason text,
   timeline jsonb NOT NULL DEFAULT '[]',

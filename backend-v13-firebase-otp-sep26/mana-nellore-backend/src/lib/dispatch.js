@@ -60,7 +60,7 @@ async function upcomingStopsByRider(riderIds) {
   if (!riderIds.length) return map;
   const { rows } = await db.query(
     `SELECT o.rider_id, o.status, r.lat AS rest_lat, r.lng AS rest_lng,
-            a.lat AS addr_lat, a.lng AS addr_lng
+            COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng
      FROM orders o
      JOIN restaurants r ON r.id = o.restaurant_id
      LEFT JOIN addresses a ON a.id = o.address_id
