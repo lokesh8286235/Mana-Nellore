@@ -565,13 +565,21 @@ router.get(
               mi.restaurant_id, r.name AS restaurant_name, r.image_url AS restaurant_image,
               r.rating_avg AS restaurant_rating, r.is_open AS restaurant_open,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
-              COALESCE(dr.rating_count, 0)::int AS rating_count
+              COALESCE(dr.rating_count, 0)::int AS rating_count,
+              COALESCE(po.people_ordered, 0)::int AS people_ordered
        FROM menu_items mi
        JOIN restaurants r ON r.id = mi.restaurant_id
        LEFT JOIN (
          SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
          FROM dish_ratings GROUP BY dish_id
        ) dr ON dr.dish_id = mi.id
+       LEFT JOIN (
+         SELECT oi.menu_item_id, COUNT(DISTINCT o.customer_id)::int AS people_ordered
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
+         GROUP BY oi.menu_item_id
+       ) po ON po.menu_item_id = mi.id
        WHERE ${whereSql}
        ORDER BY r.rating_avg DESC NULLS LAST, mi.price_paise ASC
        LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
@@ -636,12 +644,20 @@ router.get(
     const items = await db.query(
       `SELECT mi.*, mi.calories AS calories_kcal,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
-              COALESCE(dr.rating_count, 0)::int AS rating_count
+              COALESCE(dr.rating_count, 0)::int AS rating_count,
+              COALESCE(po.people_ordered, 0)::int AS people_ordered
        FROM menu_items mi
        LEFT JOIN (
          SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
          FROM dish_ratings GROUP BY dish_id
        ) dr ON dr.dish_id = mi.id
+       LEFT JOIN (
+         SELECT oi.menu_item_id, COUNT(DISTINCT o.customer_id)::int AS people_ordered
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
+         GROUP BY oi.menu_item_id
+       ) po ON po.menu_item_id = mi.id
        WHERE mi.restaurant_id = $1 AND mi.available = true${mealCond}
        ORDER BY mi.is_combo DESC, mi.sort_order, mi.name`,
       itemParams

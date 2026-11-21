@@ -73,6 +73,7 @@ router.get(
               mi.restaurant_id,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count,
+              COALESCE(po.people_ordered, 0)::int AS people_ordered,
               r.name AS restaurant_name,
               r.is_open AS restaurant_open,
               COALESCE(r.rating_avg, 0)::float AS restaurant_rating
@@ -83,6 +84,13 @@ router.get(
          SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
          FROM dish_ratings GROUP BY dish_id
        ) dr ON dr.dish_id = mi.id
+       LEFT JOIN (
+         SELECT oi.menu_item_id, COUNT(DISTINCT o.customer_id)::int AS people_ordered
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
+         GROUP BY oi.menu_item_id
+       ) po ON po.menu_item_id = mi.id
        WHERE ${whereSql}
        ORDER BY r.rating_avg DESC NULLS LAST, r.name ASC, mi.sort_order ASC, mi.name ASC
        LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
@@ -99,6 +107,7 @@ router.get(
       protein_g: d.protein_g != null ? Number(d.protein_g) : null,
       rating_avg: d.rating_avg,
       rating_count: d.rating_count,
+      people_ordered: d.people_ordered,
       restaurant_id: d.restaurant_id,
       restaurant_name: d.restaurant_name,
       restaurant_open: d.restaurant_open !== false,
@@ -122,11 +131,16 @@ router.get(
               mi.protein_g,
               r.name AS restaurant_name, r.is_open AS restaurant_open,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
-              COALESCE(dr.rating_count, 0)::int AS rating_count
+              COALESCE(dr.rating_count, 0)::int AS rating_count,
+              COALESCE(po.people_ordered, 0)::int AS people_ordered
        FROM menu_items mi
        JOIN restaurants r ON r.id = mi.restaurant_id
        LEFT JOIN (SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
                   FROM dish_ratings GROUP BY dish_id) dr ON dr.dish_id = mi.id
+       LEFT JOIN (SELECT oi.menu_item_id, COUNT(DISTINCT o.customer_id)::int AS people_ordered
+                  FROM order_items oi JOIN orders o ON o.id = oi.order_id
+                  WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
+                  GROUP BY oi.menu_item_id) po ON po.menu_item_id = mi.id
        WHERE mi.available = true AND r.status = 'approved' AND r.is_open = true
          AND mi.price_paise <= $1
        ORDER BY mi.price_paise ASC LIMIT $2`,
