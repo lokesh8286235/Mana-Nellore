@@ -185,6 +185,7 @@ router.get(
               COALESCE(o7.cnt, 0)::int AS orders_7d,
               COALESCE(rn.cnt, 0)::int AS rating_n,
               COALESCE(rpo.people_ordered, 0)::int AS people_ordered,
+              COALESCE(rpo7.people_ordered_7d, 0)::int AS people_ordered_7d,
               COALESCE(rsc.search_count, 0)::int AS search_count,
               rn.live_avg AS rating_avg_live${scoreCols}
        FROM restaurants r
@@ -209,6 +210,10 @@ router.get(
        LEFT JOIN (SELECT restaurant_id, COUNT(DISTINCT customer_id)::int AS people_ordered
                   FROM orders WHERE status = 'delivered'
                   GROUP BY restaurant_id) rpo ON rpo.restaurant_id = r.id
+       LEFT JOIN (SELECT restaurant_id, COUNT(DISTINCT customer_id)::int AS people_ordered_7d
+                  FROM orders WHERE status = 'delivered'
+                    AND placed_at > now() - interval '7 days'
+                  GROUP BY restaurant_id) rpo7 ON rpo7.restaurant_id = r.id
        LEFT JOIN (SELECT mi.restaurant_id, COUNT(*)::int AS search_count
                   FROM search_events se,
                        LATERAL jsonb_array_elements_text(se.dish_ids) AS dish_id
@@ -284,6 +289,7 @@ router.get(
         rating_avg: r.rating_avg_live == null ? Number(r.rating_avg) : Number(r.rating_avg_live),
         rating_count: n,
         people_ordered: Number(r.people_ordered) || 0,
+        people_ordered_7d: Number(r.people_ordered_7d) || 0,
         search_count: Number(r.search_count) || 0,
         verified: !!r.verified,
         is_coming_soon: !!r.is_coming_soon,
@@ -581,6 +587,7 @@ router.get(
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count,
               COALESCE(po.people_ordered, 0)::int AS people_ordered,
+              COALESCE(po7.people_ordered_7d, 0)::int AS people_ordered_7d,
               COALESCE(sc.search_count, 0)::int AS search_count
        FROM menu_items mi
        JOIN restaurants r ON r.id = mi.restaurant_id
@@ -595,6 +602,14 @@ router.get(
          WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
          GROUP BY oi.menu_item_id
        ) po ON po.menu_item_id = mi.id
+       LEFT JOIN (
+         SELECT oi.menu_item_id, COUNT(DISTINCT o.customer_id)::int AS people_ordered_7d
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
+           AND o.placed_at > now() - interval '7 days'
+         GROUP BY oi.menu_item_id
+       ) po7 ON po7.menu_item_id = mi.id
        LEFT JOIN (
          SELECT dish_id, COUNT(*)::int AS search_count
          FROM search_events se,
@@ -653,6 +668,9 @@ router.get(
         `SELECT
            (SELECT COUNT(DISTINCT customer_id)::int FROM orders
             WHERE restaurant_id = $1 AND status = 'delivered') AS people_ordered,
+           (SELECT COUNT(DISTINCT customer_id)::int FROM orders
+            WHERE restaurant_id = $1 AND status = 'delivered'
+              AND placed_at > now() - interval '7 days') AS people_ordered_7d,
            (SELECT COUNT(*)::int FROM search_events se,
               LATERAL jsonb_array_elements_text(se.dish_ids) AS dish_id
             JOIN menu_items mi ON mi.id::text = dish_id
@@ -681,6 +699,7 @@ router.get(
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count,
               COALESCE(po.people_ordered, 0)::int AS people_ordered,
+              COALESCE(po7.people_ordered_7d, 0)::int AS people_ordered_7d,
               COALESCE(sc.search_count, 0)::int AS search_count
        FROM menu_items mi
        LEFT JOIN (
@@ -694,6 +713,14 @@ router.get(
          WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
          GROUP BY oi.menu_item_id
        ) po ON po.menu_item_id = mi.id
+       LEFT JOIN (
+         SELECT oi.menu_item_id, COUNT(DISTINCT o.customer_id)::int AS people_ordered_7d
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
+           AND o.placed_at > now() - interval '7 days'
+         GROUP BY oi.menu_item_id
+       ) po7 ON po7.menu_item_id = mi.id
        LEFT JOIN (
          SELECT dish_id, COUNT(*)::int AS search_count
          FROM search_events se,
@@ -754,6 +781,7 @@ router.get(
       restaurant: { ...safeRestaurant, rating_avg: Number(restaurant.rating_avg), is_open: isOpenNow(restaurant),
         verified: !!restaurant.verified, distance_km: detailDist,
         people_ordered: Number(countsRes.rows[0].people_ordered) || 0,
+        people_ordered_7d: Number(countsRes.rows[0].people_ordered_7d) || 0,
         search_count: Number(countsRes.rows[0].search_count) || 0 },
       categories: cats.rows.map((c) => ({ ...c, items: byCat[c.id] || [] })),
       uncategorized: byCat.uncategorized || [],
