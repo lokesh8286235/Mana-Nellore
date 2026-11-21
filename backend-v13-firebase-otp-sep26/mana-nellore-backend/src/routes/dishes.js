@@ -74,6 +74,7 @@ router.get(
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count,
               COALESCE(po.people_ordered, 0)::int AS people_ordered,
+              COALESCE(sc.search_count, 0)::int AS search_count,
               r.name AS restaurant_name,
               r.is_open AS restaurant_open,
               COALESCE(r.rating_avg, 0)::float AS restaurant_rating
@@ -91,6 +92,14 @@ router.get(
          WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
          GROUP BY oi.menu_item_id
        ) po ON po.menu_item_id = mi.id
+       LEFT JOIN (
+         SELECT dish_id, COUNT(*)::int AS search_count
+         FROM search_events se,
+              LATERAL jsonb_array_elements_text(se.dish_ids) AS dish_id
+         WHERE se.created_at > now() - interval '7 days'
+           AND se.dish_ids IS NOT NULL AND jsonb_typeof(se.dish_ids) = 'array'
+         GROUP BY dish_id
+       ) sc ON sc.dish_id = mi.id::text
        WHERE ${whereSql}
        ORDER BY r.rating_avg DESC NULLS LAST, r.name ASC, mi.sort_order ASC, mi.name ASC
        LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
@@ -108,6 +117,7 @@ router.get(
       rating_avg: d.rating_avg,
       rating_count: d.rating_count,
       people_ordered: d.people_ordered,
+      search_count: d.search_count,
       restaurant_id: d.restaurant_id,
       restaurant_name: d.restaurant_name,
       restaurant_open: d.restaurant_open !== false,
@@ -132,7 +142,8 @@ router.get(
               r.name AS restaurant_name, r.is_open AS restaurant_open,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count,
-              COALESCE(po.people_ordered, 0)::int AS people_ordered
+              COALESCE(po.people_ordered, 0)::int AS people_ordered,
+              COALESCE(sc.search_count, 0)::int AS search_count
        FROM menu_items mi
        JOIN restaurants r ON r.id = mi.restaurant_id
        LEFT JOIN (SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
@@ -141,6 +152,11 @@ router.get(
                   FROM order_items oi JOIN orders o ON o.id = oi.order_id
                   WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
                   GROUP BY oi.menu_item_id) po ON po.menu_item_id = mi.id
+       LEFT JOIN (SELECT dish_id, COUNT(*)::int AS search_count
+                  FROM search_events se, LATERAL jsonb_array_elements_text(se.dish_ids) AS dish_id
+                  WHERE se.created_at > now() - interval '7 days'
+                    AND se.dish_ids IS NOT NULL AND jsonb_typeof(se.dish_ids) = 'array'
+                  GROUP BY dish_id) sc ON sc.dish_id = mi.id::text
        WHERE mi.available = true AND r.status = 'approved' AND r.is_open = true
          AND mi.price_paise <= $1
        ORDER BY mi.price_paise ASC LIMIT $2`,

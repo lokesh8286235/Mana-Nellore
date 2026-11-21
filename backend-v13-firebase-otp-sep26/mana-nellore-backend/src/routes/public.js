@@ -198,4 +198,32 @@ router.get(
   })
 );
 
+// POST /api/search-events — log one submitted search for trending.
+// Public (searches happen signed-out too); logging failures must never
+// break search. Body: { query: string (required, non-empty),
+// dish_ids: string[] (optional, max 50, UUIDs only — others dropped) }.
+router.post(
+  '/search-events',
+  ah(async (req, res) => {
+    const body = req.body || {};
+    const query = typeof body.query === 'string' ? body.query.trim().slice(0, 200) : '';
+    if (!query) {
+      return res.status(400).json({ error: 'query is required' });
+    }
+    if (body.dish_ids !== undefined && !Array.isArray(body.dish_ids)) {
+      return res.status(400).json({ error: 'dish_ids must be an array' });
+    }
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const ids = [...new Set(
+      (Array.isArray(body.dish_ids) ? body.dish_ids : [])
+        .filter((d) => typeof d === 'string' && uuidRe.test(d))
+    )].slice(0, 50);
+    await db.query(
+      'INSERT INTO search_events (query, dish_ids) VALUES ($1, $2::jsonb)',
+      [query, JSON.stringify(ids)]
+    );
+    res.status(201).json({ ok: true });
+  })
+);
+
 module.exports = router;

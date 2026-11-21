@@ -304,6 +304,17 @@ async function migrate() {
   await q('CREATE INDEX IF NOT EXISTS idx_banner_promotions_restaurant ON banner_promotions(restaurant_id)');
   await q('CREATE INDEX IF NOT EXISTS idx_banner_promotions_active ON banner_promotions(starts_at, ends_at)');
 
+  // Search events for trending: one row per submitted search, with the dish
+  // ids shown in that search's results. search_count per dish/restaurant is
+  // aggregated live (last 7 days) — no counters to keep in sync.
+  await q(`CREATE TABLE IF NOT EXISTS search_events (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    query text NOT NULL,
+    dish_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await q('CREATE INDEX IF NOT EXISTS idx_search_events_created ON search_events(created_at)');
+
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});

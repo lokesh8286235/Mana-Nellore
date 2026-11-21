@@ -184,6 +184,8 @@ router.get(
               COALESCE(hv.has_veg, false) AS has_veg,
               COALESCE(o7.cnt, 0)::int AS orders_7d,
               COALESCE(rn.cnt, 0)::int AS rating_n,
+              COALESCE(rpo.people_ordered, 0)::int AS people_ordered,
+              COALESCE(rsc.search_count, 0)::int AS search_count,
               rn.live_avg AS rating_avg_live${scoreCols}
        FROM restaurants r
        LEFT JOIN (SELECT restaurant_id, COUNT(*) AS cnt FROM orders
@@ -204,6 +206,16 @@ router.get(
                          ROUND(AVG(food_rating)::numeric, 1)::float AS live_avg FROM ratings
                   WHERE ratee_type = 'restaurant' AND food_rating IS NOT NULL
                   GROUP BY ratee_id) rn ON rn.ratee_id = r.id
+       LEFT JOIN (SELECT restaurant_id, COUNT(DISTINCT customer_id)::int AS people_ordered
+                  FROM orders WHERE status = 'delivered'
+                  GROUP BY restaurant_id) rpo ON rpo.restaurant_id = r.id
+       LEFT JOIN (SELECT mi.restaurant_id, COUNT(*)::int AS search_count
+                  FROM search_events se,
+                       LATERAL jsonb_array_elements_text(se.dish_ids) AS dish_id
+                  JOIN menu_items mi ON mi.id::text = dish_id
+                  WHERE se.created_at > now() - interval '7 days'
+                    AND se.dish_ids IS NOT NULL AND jsonb_typeof(se.dish_ids) = 'array'
+                  GROUP BY mi.restaurant_id) rsc ON rsc.restaurant_id = r.id
        WHERE ${conditions.join(' AND ')} ${dbOrder}`,
       params
     );
@@ -271,6 +283,8 @@ router.get(
         // restaurants with no ratings at all (live_avg NULL there).
         rating_avg: r.rating_avg_live == null ? Number(r.rating_avg) : Number(r.rating_avg_live),
         rating_count: n,
+        people_ordered: Number(r.people_ordered) || 0,
+        search_count: Number(r.search_count) || 0,
         verified: !!r.verified,
         is_coming_soon: !!r.is_coming_soon,
         is_open: isOpenNow(r),
@@ -566,7 +580,8 @@ router.get(
               r.rating_avg AS restaurant_rating, r.is_open AS restaurant_open,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count,
-              COALESCE(po.people_ordered, 0)::int AS people_ordered
+              COALESCE(po.people_ordered, 0)::int AS people_ordered,
+              COALESCE(sc.search_count, 0)::int AS search_count
        FROM menu_items mi
        JOIN restaurants r ON r.id = mi.restaurant_id
        LEFT JOIN (
@@ -580,6 +595,14 @@ router.get(
          WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
          GROUP BY oi.menu_item_id
        ) po ON po.menu_item_id = mi.id
+       LEFT JOIN (
+         SELECT dish_id, COUNT(*)::int AS search_count
+         FROM search_events se,
+              LATERAL jsonb_array_elements_text(se.dish_ids) AS dish_id
+         WHERE se.created_at > now() - interval '7 days'
+           AND se.dish_ids IS NOT NULL AND jsonb_typeof(se.dish_ids) = 'array'
+         GROUP BY dish_id
+       ) sc ON sc.dish_id = mi.id::text
        WHERE ${whereSql}
        ORDER BY r.rating_avg DESC NULLS LAST, mi.price_paise ASC
        LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
@@ -610,7 +633,7 @@ router.get(
       return res.status(404).json({ error: 'Restaurant not found' });
     }
     // Parallelize independent queries: restaurant + live ratings + categories
-    const [restRes, liveRatings, catsRes] = await Promise.all([
+    const [restRes, liveRatings, catsRes, countsRes] = await Promise.all([
       db.query(
         "SELECT * FROM restaurants WHERE id = $1 AND status = 'approved'",
         [req.params.id]
@@ -624,6 +647,18 @@ router.get(
       ),
       db.query(
         'SELECT * FROM categories WHERE restaurant_id = $1 ORDER BY sort_order, name',
+        [req.params.id]
+      ),
+      db.query(
+        `SELECT
+           (SELECT COUNT(DISTINCT customer_id)::int FROM orders
+            WHERE restaurant_id = $1 AND status = 'delivered') AS people_ordered,
+           (SELECT COUNT(*)::int FROM search_events se,
+              LATERAL jsonb_array_elements_text(se.dish_ids) AS dish_id
+            JOIN menu_items mi ON mi.id::text = dish_id
+            WHERE mi.restaurant_id = $1
+              AND se.created_at > now() - interval '7 days'
+              AND se.dish_ids IS NOT NULL AND jsonb_typeof(se.dish_ids) = 'array') AS search_count`,
         [req.params.id]
       ),
     ]);
@@ -645,7 +680,8 @@ router.get(
       `SELECT mi.*, mi.calories AS calories_kcal,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count,
-              COALESCE(po.people_ordered, 0)::int AS people_ordered
+              COALESCE(po.people_ordered, 0)::int AS people_ordered,
+              COALESCE(sc.search_count, 0)::int AS search_count
        FROM menu_items mi
        LEFT JOIN (
          SELECT dish_id, AVG(rating) AS avg_rating, COUNT(*) AS rating_count
@@ -658,6 +694,14 @@ router.get(
          WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
          GROUP BY oi.menu_item_id
        ) po ON po.menu_item_id = mi.id
+       LEFT JOIN (
+         SELECT dish_id, COUNT(*)::int AS search_count
+         FROM search_events se,
+              LATERAL jsonb_array_elements_text(se.dish_ids) AS dish_id
+         WHERE se.created_at > now() - interval '7 days'
+           AND se.dish_ids IS NOT NULL AND jsonb_typeof(se.dish_ids) = 'array'
+         GROUP BY dish_id
+       ) sc ON sc.dish_id = mi.id::text
        WHERE mi.restaurant_id = $1 AND mi.available = true${mealCond}
        ORDER BY mi.is_combo DESC, mi.sort_order, mi.name`,
       itemParams
@@ -708,7 +752,9 @@ router.get(
     const { aadhar, gstin, owner_id, commission_pct, bank_account, ifsc, phone, fssai, fssai_license, ...safeRestaurant } = restaurant;
     res.json({
       restaurant: { ...safeRestaurant, rating_avg: Number(restaurant.rating_avg), is_open: isOpenNow(restaurant),
-        verified: !!restaurant.verified, distance_km: detailDist },
+        verified: !!restaurant.verified, distance_km: detailDist,
+        people_ordered: Number(countsRes.rows[0].people_ordered) || 0,
+        search_count: Number(countsRes.rows[0].search_count) || 0 },
       categories: cats.rows.map((c) => ({ ...c, items: byCat[c.id] || [] })),
       uncategorized: byCat.uncategorized || [],
       review_photos: photos.rows
