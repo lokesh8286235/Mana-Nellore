@@ -51,4 +51,22 @@ function ah(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 }
 
-module.exports = { signToken, authenticate, requireRole, ah };
+// Optional auth: for public endpoints that personalize when the caller is
+// signed in (e.g. search logging) but must keep working signed-out. A valid
+// Bearer token sets req.user; a missing/invalid token leaves req.user
+// undefined and the request proceeds — never rejects. No blocked-account
+// lookup here: attribution only, the endpoint stays public and fast.
+async function optionalAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return next();
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = { id: payload.sub, role: payload.role };
+  } catch (e) {
+    // Signed-out behaviour: ignore a stale/bad token on a public endpoint.
+  }
+  next();
+}
+
+module.exports = { signToken, authenticate, requireRole, optionalAuth, ah };

@@ -59,6 +59,8 @@ async function migrate() {
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by uuid');
   // Google sign-in (2026-11-18): email column + phone nullable, unique per role.
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS email text');
+  // Welcome push (once per customer): timestamp of the first welcome sent.
+  await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS welcome_push_sent_at timestamptz');
   await q('ALTER TABLE users ALTER COLUMN phone DROP NOT NULL');
   await q('CREATE UNIQUE INDEX IF NOT EXISTS users_email_role_key ON users (email, role)');
   await q(`DO $$ BEGIN
@@ -317,9 +319,14 @@ async function migrate() {
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     query text NOT NULL,
     dish_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    user_id uuid REFERENCES users(id) ON DELETE SET NULL,
     created_at timestamptz NOT NULL DEFAULT now()
   )`);
   await q('CREATE INDEX IF NOT EXISTS idx_search_events_created ON search_events(created_at)');
+  // Per-user search history for recommendations: the signed-in searcher's id
+  // (null for guest searches, which stay anonymous as before).
+  await q('ALTER TABLE search_events ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES users(id) ON DELETE SET NULL');
+  await q('CREATE INDEX IF NOT EXISTS idx_search_events_user ON search_events(user_id, created_at)');
 
     await client.query('COMMIT');
   } catch (e) {

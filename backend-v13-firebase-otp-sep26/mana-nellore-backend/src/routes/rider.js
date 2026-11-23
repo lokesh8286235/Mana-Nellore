@@ -1115,6 +1115,11 @@ router.post(
       );
     }
     await notify(order.customer_id, 'Rider assigned', 'Your rider is on the way to the restaurant.');
+    pushToUser(order.customer_id, {
+      title: 'Rider assigned 🛵',
+      body: 'Your rider is on the way to the restaurant.',
+      data: { type: 'order_status', order_id: order.id, status: 'rider_assigned' },
+    });
     res.json({ ok: true, trip_id: order.trip_id || null });
   })
 );
@@ -1150,6 +1155,11 @@ router.post(
     );
     await notify(order.customer_id, 'Finding you another rider 🛵',
       'Your rider had to step away — we\u2019re assigning a new one right now.');
+    pushToUser(order.customer_id, {
+      title: 'Finding you another rider 🛵',
+      body: 'Your rider had to step away \u2014 we\u2019re assigning a new one right now.',
+      data: { type: 'order_status', order_id: order.id, status: 'rider_cancelled' },
+    });
     // Back to the pool: re-dispatch to the nearest available rider.
     try { await dispatchOrder(order.id); } catch (e) { console.error('[dispatch] re-dispatch failed', e.message); }
     res.json({ ok: true });

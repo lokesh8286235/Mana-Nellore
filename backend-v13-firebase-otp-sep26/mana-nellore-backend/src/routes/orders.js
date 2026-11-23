@@ -657,6 +657,11 @@ async function placeMultiGroupOrder(req, res) {
     // below — never in a notification body.
     await notify(req.user.id, 'Order placed ✅',
       'Your restaurants got the orders and kitchens are firing up! 🔥');
+    pushToUser(req.user.id, {
+      title: 'Thanks for your order! 🙏',
+      body: 'Your restaurants got the orders and kitchens are firing up! 🔥',
+      data: { type: 'order_status', status: 'placed' },
+    });
 
     res.status(201).json({
       orders,
@@ -829,6 +834,11 @@ router.post(
       // never in a notification body.
       await notify(req.user.id, 'Order placed ✅',
         `${restaurant.name} (${orderNumber}) got your order and the kitchen is firing up! 🔥`);
+      pushToUser(req.user.id, {
+        title: 'Thanks for your order! 🙏',
+        body: `${restaurant.name} (${orderNumber}) got your order and the kitchen is firing up! 🔥`,
+        data: { type: 'order_status', status: 'placed', order_id: order.id },
+      });
 
       const { delivery_otp_hash: _h2, delivery_otp_plain: _p2, ...orderSafe2 } = order;
       res.status(201).json({
@@ -1081,6 +1091,11 @@ router.post(
       // Bell notification: the customer must see the cancellation, not just "Order placed".
       await notify(req.user.id, 'Order cancelled',
         `Your order #${order.order_number || order.id} was cancelled.${refundPending ? ' Your refund is being processed.' : ''}`);
+      pushToUser(req.user.id, {
+        title: 'Order cancelled',
+        body: `Your order #${order.order_number || order.id} was cancelled.${refundPending ? ' Your refund is being processed.' : ''}`,
+        data: { type: 'order_status', status: 'cancelled', order_id: order.id },
+      });
       res.json({ ok: true, refund_pending: refundPending, cancelled_orders: cancelIds.length });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});

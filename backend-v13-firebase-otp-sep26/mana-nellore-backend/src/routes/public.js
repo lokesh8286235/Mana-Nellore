@@ -2,7 +2,7 @@
 // applications, and shareable order tracking links.
 const express = require('express');
 const db = require('../db');
-const { ah } = require('../middleware/auth');
+const { ah, optionalAuth } = require('../middleware/auth');
 const { normalizeTaxRates } = require('../lib/pricing');
 
 const router = express.Router();
@@ -204,6 +204,7 @@ router.get(
 // dish_ids: string[] (optional, max 50, UUIDs only — others dropped) }.
 router.post(
   '/search-events',
+  optionalAuth,
   ah(async (req, res) => {
     const body = req.body || {};
     const query = typeof body.query === 'string' ? body.query.trim().slice(0, 200) : '';
@@ -219,8 +220,8 @@ router.post(
         .filter((d) => typeof d === 'string' && uuidRe.test(d))
     )].slice(0, 50);
     await db.query(
-      'INSERT INTO search_events (query, dish_ids) VALUES ($1, $2::jsonb)',
-      [query, JSON.stringify(ids)]
+      'INSERT INTO search_events (query, dish_ids, user_id) VALUES ($1, $2::jsonb, $3)',
+      [query, JSON.stringify(ids), (req.user && req.user.id) || null]
     );
     res.status(201).json({ ok: true });
   })

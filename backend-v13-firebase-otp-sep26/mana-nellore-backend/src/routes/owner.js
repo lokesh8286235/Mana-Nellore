@@ -539,6 +539,11 @@ router.put(
       );
       await notify(db, order.customer_id, 'Order rejected',
         `Your order was rejected by the restaurant.${refunded ? ' Your payment will be refunded.' : ''}`);
+      pushToUser(order.customer_id, {
+        title: 'Order rejected',
+        body: `Your order was rejected by the restaurant.${refunded ? ' Your payment will be refunded.' : ''}`,
+        data: { type: 'order_status', order_id: order.id, status: 'rejected' },
+      });
     } else if (rule.to === 'delivered') {
       await db.query('UPDATE orders SET delivered_at = now() WHERE id = $1', [order.id]);
       const servedTitle = order.order_type === 'pickup' ? 'Picked up! Enjoy your meal! 🍽️' : 'Enjoy your meal! 🍽️';

@@ -68,39 +68,245 @@ async function transition(orderId, status, by) {
 
 const ACTIVE_STATUSES = ['placed', 'accepted', 'preparing', 'ready', 'picked_up', 'on_way'];
 
-// POST /api/admin/test-push — send a test notification to the calling admin's
-// own registered device tokens. This is how delivery is verified once
-// FIREBASE_SERVICE_ACCOUNT is set in Railway: register a token from an app,
-// then call this. Never exposes any credential value.
+// POST /api/admin/test-push — send a test notification.
+// Body: { user_id? } — when user_id is given, the test goes to THAT user's
+// registered devices (the customer app rejects the admin test number at
+// login, so the admin targets the real user's id instead); when omitted it
+// goes to the calling admin's own devices (the original behaviour).
+// Admin-only, so targeting a user is a safe support action. This is how
+// delivery is verified once FIREBASE_SERVICE_ACCOUNT is set in Railway:
+// register a token from an app, then call this. Never exposes any
+// credential value.
 router.post(
   '/test-push',
   ah(async (req, res) => {
     const { isConfigured, configError, sendToUser } = require('../lib/fcm');
+    const targetId = typeof (req.body || {}).user_id === 'string' && req.body.user_id.trim()
+      ? req.body.user_id.trim()
+      : req.user.id;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(targetId)) {
+      return res.status(400).json({ error: 'user_id must be a UUID' });
+    }
+    if (targetId !== req.user.id) {
+      const u = await db.query('SELECT id FROM users WHERE id = $1', [targetId]);
+      if (!u.rows[0]) return res.status(404).json({ error: 'User not found' });
+    }
     if (!isConfigured()) {
-      const { rows } = await db.query('SELECT COUNT(*) AS n FROM push_tokens WHERE user_id = $1', [req.user.id]);
+      const { rows } = await db.query('SELECT COUNT(*) AS n FROM push_tokens WHERE user_id = $1', [targetId]);
       return res.json({
         ok: false,
         configured: false,
         reason: configError() || 'FCM sender not configured',
+        target_user_id: targetId,
         tokens: Number(rows[0].n),
         sent: 0,
         failed: 0,
         results: [],
       });
     }
-    const result = await sendToUser(req.user.id, {
+    const result = await sendToUser(targetId, {
       title: 'Floop test notification',
       body: 'Push notifications are working.',
       data: { type: 'test' },
     });
+    await audit(req, 'test_push', 'user', targetId, { tokens: result.tokens, sent: result.sent, failed: result.failed });
     res.json({
       ok: result.sent > 0,
       configured: true,
+      target_user_id: targetId,
       tokens: result.tokens,
       sent: result.sent,
       failed: result.failed,
       results: result.results || [],
     });
+  })
+);
+
+// ---- Push notifications (admin) ----
+// Trending / recommendations use REAL data only: trending = dishes actually
+// ordered (delivered) in the last 7 days; recommendations = the dishes in
+// that user's own search history. When there is no data the send is refused
+// with a clear error — never a hardcoded dish, never an invented value.
+
+async function computeTrending(limit) {
+  const { rows } = await db.query(
+    `SELECT mi.id, mi.name, r.name AS restaurant_name,
+            COUNT(DISTINCT o.customer_id)::int AS people_ordered_7d
+     FROM order_items oi
+     JOIN orders o ON o.id = oi.order_id
+     JOIN menu_items mi ON mi.id = oi.menu_item_id
+     JOIN restaurants r ON r.id = mi.restaurant_id
+     WHERE o.status = 'delivered' AND oi.menu_item_id IS NOT NULL
+       AND o.placed_at > now() - interval '7 days'
+       AND COALESCE(r.is_coming_soon, false) = false
+     GROUP BY mi.id, mi.name, r.name
+     ORDER BY people_ordered_7d DESC, mi.name ASC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows;
+}
+
+function trendingCopy(dishes) {
+  const bits = dishes.map((d) => `${d.name} at ${d.restaurant_name}`);
+  return {
+    title: 'Trending in Nellore 🔥',
+    body: dishes.length === 1
+      ? `Most ordered this week: ${bits[0]}.`
+      : `Most ordered this week: ${bits.join(', ')}.`,
+  };
+}
+
+async function computeRecommendations(userId, limit) {
+  const { rows } = await db.query(
+    `SELECT mi.id, mi.name, r.name AS restaurant_name, COUNT(*)::int AS searches
+     FROM search_events se,
+          LATERAL jsonb_array_elements_text(se.dish_ids) AS dish_id
+     JOIN menu_items mi ON mi.id = dish_id::uuid
+     JOIN restaurants r ON r.id = mi.restaurant_id
+     WHERE se.user_id = $1 AND se.created_at > now() - interval '30 days'
+       AND se.dish_ids IS NOT NULL AND jsonb_typeof(se.dish_ids) = 'array'
+       AND COALESCE(r.is_coming_soon, false) = false
+     GROUP BY mi.id, mi.name, r.name
+     ORDER BY searches DESC, mi.name ASC
+     LIMIT $2`,
+    [userId, limit]
+  );
+  return rows;
+}
+
+function recommendationsCopy(dishes) {
+  return {
+    title: 'Recommended for you 🍽️',
+    body: `Based on your recent searches: ${dishes.map((d) => d.name).join(', ')}.`,
+  };
+}
+
+// Send to every CUSTOMER device token (the broadcast audience). Riders,
+// owners and admins get operational pushes, not broadcasts.
+async function sendToAllCustomers(payload) {
+  const { isConfigured, configError, sendToToken } = require('../lib/fcm');
+  if (!isConfigured()) {
+    return { configured: false, reason: configError(), tokens: 0, sent: 0, failed: 0, results: [] };
+  }
+  const { rows } = await db.query("SELECT token FROM push_tokens WHERE role = 'customer'");
+  let sent = 0;
+  let failed = 0;
+  const results = [];
+  for (const r of rows) {
+    const res = await sendToToken(r.token, payload);
+    if (res.ok) sent++;
+    else {
+      failed++;
+      results.push({ error: res.unregistered ? 'unregistered (token removed)' : (res.error || 'send failed') });
+    }
+  }
+  return { configured: true, tokens: rows.length, sent, failed, results };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// GET /api/admin/push/stats — how many phones a broadcast would reach.
+router.get(
+  '/push/stats',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT COUNT(*)::int AS tokens,
+              COUNT(DISTINCT user_id)::int AS users
+       FROM push_tokens WHERE role = 'customer'`
+    );
+    res.json({ customer_tokens: rows[0].tokens, customer_users: rows[0].users });
+  })
+);
+
+// GET /api/admin/push/preview-trending — the real trending dishes, no send.
+router.get(
+  '/push/preview-trending',
+  ah(async (req, res) => {
+    const dishes = await computeTrending(3);
+    if (!dishes.length) {
+      return res.json({ dishes: [], title: null, body: null, message: 'No trending dishes in the last 7 days — nothing to send yet.' });
+    }
+    const copy = trendingCopy(dishes);
+    res.json({ dishes, title: copy.title, body: copy.body });
+  })
+);
+
+// POST /api/admin/push/send-trending — broadcast the real trending dishes.
+router.post(
+  '/push/send-trending',
+  ah(async (req, res) => {
+    const dishes = await computeTrending(3);
+    if (!dishes.length) {
+      return res.status(400).json({ error: 'No trending dishes in the last 7 days — nothing to send.' });
+    }
+    const copy = trendingCopy(dishes);
+    const result = await sendToAllCustomers({ ...copy, data: { type: 'trending' } });
+    await audit(req, 'push_trending', 'broadcast', null, { dishes: dishes.map((d) => d.name), tokens: result.tokens, sent: result.sent, failed: result.failed });
+    res.json({ ok: result.sent > 0, ...result, dishes });
+  })
+);
+
+// GET /api/admin/push/preview-recommendations?user_id= — real dishes from that user's searches.
+router.get(
+  '/push/preview-recommendations',
+  ah(async (req, res) => {
+    const userId = String(req.query.user_id || '');
+    if (!UUID_RE.test(userId)) return res.status(400).json({ error: 'user_id is required' });
+    const u = await db.query('SELECT id, phone, name FROM users WHERE id = $1', [userId]);
+    if (!u.rows[0]) return res.status(404).json({ error: 'User not found' });
+    const dishes = await computeRecommendations(userId, 3);
+    if (!dishes.length) {
+      return res.json({ user: u.rows[0], dishes: [], title: null, body: null, message: 'This user has no recent searches — nothing to recommend yet.' });
+    }
+    const copy = recommendationsCopy(dishes);
+    res.json({ user: u.rows[0], dishes, title: copy.title, body: copy.body });
+  })
+);
+
+// POST /api/admin/push/send-recommendations { user_id }
+router.post(
+  '/push/send-recommendations',
+  ah(async (req, res) => {
+    const { sendToUser } = require('../lib/fcm');
+    const userId = String((req.body || {}).user_id || '');
+    if (!UUID_RE.test(userId)) return res.status(400).json({ error: 'user_id is required' });
+    const u = await db.query('SELECT id, phone, name FROM users WHERE id = $1', [userId]);
+    if (!u.rows[0]) return res.status(404).json({ error: 'User not found' });
+    const dishes = await computeRecommendations(userId, 3);
+    if (!dishes.length) {
+      return res.status(400).json({ error: 'This user has no recent searches — nothing to recommend yet.' });
+    }
+    const copy = recommendationsCopy(dishes);
+    const result = await sendToUser(userId, { ...copy, data: { type: 'recommendations' } });
+    await audit(req, 'push_recommendations', 'user', userId, { dishes: dishes.map((d) => d.name), tokens: result.tokens, sent: result.sent, failed: result.failed });
+    res.json({ ok: result.sent > 0, ...result, user: u.rows[0], dishes });
+  })
+);
+
+// POST /api/admin/push/send { title, body, audience: 'all' | 'user', user_id? }
+router.post(
+  '/push/send',
+  ah(async (req, res) => {
+    const { sendToUser } = require('../lib/fcm');
+    const title = String((req.body || {}).title || '').trim();
+    const body = String((req.body || {}).body || '').trim();
+    const audience = (req.body || {}).audience || 'all';
+    if (!title || !body) return res.status(400).json({ error: 'title and body are required' });
+    if (title.length > 100 || body.length > 300) return res.status(400).json({ error: 'title max 100 chars, body max 300 chars' });
+    if (audience === 'user') {
+      const userId = String((req.body || {}).user_id || '');
+      if (!UUID_RE.test(userId)) return res.status(400).json({ error: 'user_id is required for a single-user send' });
+      const u = await db.query('SELECT id FROM users WHERE id = $1', [userId]);
+      if (!u.rows[0]) return res.status(404).json({ error: 'User not found' });
+      const result = await sendToUser(userId, { title, body, data: { type: 'announcement' } });
+      await audit(req, 'push_send', 'user', userId, { title, tokens: result.tokens, sent: result.sent, failed: result.failed });
+      return res.json({ ok: result.sent > 0, audience: 'user', target_user_id: userId, ...result });
+    }
+    if (audience !== 'all') return res.status(400).json({ error: "audience must be 'all' or 'user'" });
+    const result = await sendToAllCustomers({ title, body, data: { type: 'announcement' } });
+    await audit(req, 'push_send', 'broadcast', null, { title, tokens: result.tokens, sent: result.sent, failed: result.failed });
+    res.json({ ok: result.sent > 0, audience: 'all', ...result });
   })
 );
 
