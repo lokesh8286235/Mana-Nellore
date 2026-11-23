@@ -574,7 +574,7 @@ async function placeMultiGroupOrder(req, res) {
           [order.id, s.menu_item_id, s.name_snapshot, s.unit_price_paise, s.qty, s.instructions]
         );
       }
-      const { delivery_otp_hash: _h1, ...orderSafe } = order;
+      const { delivery_otp_hash: _h1, delivery_otp_plain: _p1, ...orderSafe } = order;
       orders.push({
         order: { ...orderSafe, items: snapshots, delivery_otp: sharedDeliveryOtp },
         group_index: gi,
@@ -830,7 +830,7 @@ router.post(
       await notify(req.user.id, 'Order placed ✅',
         `${restaurant.name} (${orderNumber}) got your order and the kitchen is firing up! 🔥`);
 
-      const { delivery_otp_hash: _h2, ...orderSafe2 } = order;
+      const { delivery_otp_hash: _h2, delivery_otp_plain: _p2, ...orderSafe2 } = order;
       res.status(201).json({
         order: { ...orderSafe2, items: snapshots, ...(pickup ? {} : { delivery_otp: deliveryOtp }) },
         breakdown: {
