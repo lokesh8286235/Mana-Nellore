@@ -179,7 +179,7 @@ CREATE TABLE IF NOT EXISTS orders (
   delivery_photo text,
   share_token text UNIQUE,
   order_type text NOT NULL DEFAULT 'delivery'
-    CHECK (order_type IN ('delivery','dinein')),
+    CHECK (order_type IN ('delivery','dinein','pickup')),
   table_id uuid,
   delivery_note text,
   no_cutlery boolean NOT NULL DEFAULT false,

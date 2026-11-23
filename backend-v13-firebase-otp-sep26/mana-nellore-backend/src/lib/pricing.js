@@ -223,21 +223,22 @@ function computeTax(taxRates, netPaise, deliveryFeePaise, platformFeePaise) {
   };
 }
 
-function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct, deliveryFeePaiseOverride }) {
+function computeQuote({ config, distanceKm, subtotalPaise, discountPaise = 0, commissionPct, deliveryFeePaiseOverride, platformFeePaiseOverride }) {
   const net = subtotalPaise - discountPaise;
   // If distance unknown, use base fee from config (never null — DB requires it)
   const baseFee = Number(config.customerFee && config.customerFee.base_paise) || 2000;
   // FINAL fee model (user 2026-10-15): free-km tiers by order value, Rs 8/km beyond.
   // This matches what the checkout nudge advertises — the bill must equal the promise.
-  // deliveryFeePaiseOverride (e.g. 0 for dine-in) charges GST on the fee actually
-  // charged, never on a fee that was waived.
+  // deliveryFeePaiseOverride (e.g. 0 for dine-in / pickup) and
+  // platformFeePaiseOverride (e.g. 0 for pickup) charge GST on the fees
+  // actually charged, never on a fee that was waived.
   const deliveryFee =
     deliveryFeePaiseOverride != null
       ? deliveryFeePaiseOverride
       : distanceKm == null
         ? baseFee
         : customerDeliveryFeePaise(config.customerFee, distanceKm, net).fee_paise;
-  const platformFeePaise = config.platformFeePaise;
+  const platformFeePaise = platformFeePaiseOverride != null ? platformFeePaiseOverride : config.platformFeePaise;
   const pct = commissionPct != null ? Number(commissionPct) : config.defaultCommissionPct;
   const commissionPaise = Math.round((net * pct) / 100);
   const payout =

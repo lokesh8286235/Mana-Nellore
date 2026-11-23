@@ -1046,6 +1046,7 @@ router.post(
     // order is unassigned / the offer expired) may accept.
     const offerOk = await db.query(
       `SELECT id FROM orders WHERE id = $1 AND status = 'ready' AND rider_id IS NULL
+       AND order_type = 'delivery'
        AND (offered_to_rider_id IS NULL OR offered_to_rider_id = $2 OR offer_expires_at < now())`,
       [req.params.id, rider.id]
     );
@@ -1063,7 +1064,7 @@ router.post(
       // Only succeeds if ALL are still available (prevents partial assignment)
       const { rows } = await db.query(
         `UPDATE orders SET rider_id = $1
-         WHERE trip_id = $2 AND status = 'ready' AND rider_id IS NULL
+         WHERE trip_id = $2 AND status = 'ready' AND rider_id IS NULL AND order_type = 'delivery'
          RETURNING *`,
         [rider.id, tripId]
       );
@@ -1087,7 +1088,7 @@ router.post(
     } else {
       // Single order: atomic assign
       const { rows } = await db.query(
-        "UPDATE orders SET rider_id = $1 WHERE id = $2 AND status = 'ready' AND rider_id IS NULL RETURNING *",
+        "UPDATE orders SET rider_id = $1 WHERE id = $2 AND status = 'ready' AND rider_id IS NULL AND order_type = 'delivery' RETURNING *",
         [rider.id, req.params.id]
       );
       order = rows[0];

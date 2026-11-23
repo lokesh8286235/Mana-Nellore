@@ -179,6 +179,10 @@ router.post(
   ah(async (req, res) => {
     const { restaurant_id, address_id, lat, lng, items, coupon_code, order_type, table_id, tip_paise } = req.body;
     const dineIn = order_type === 'dinein';
+    // b848 pickup: customer collects at the counter — no address, no distance,
+    // no delivery fee, no platform fee (and no GST on either). Tip is a rider
+    // gratuity, so it is 0 for pickup too.
+    const pickup = order_type === 'pickup';
     if (!restaurant_id || !Array.isArray(items) || !items.length) {
       return res.status(400).json({ error: 'restaurant_id and items are required' });
     }
@@ -194,7 +198,7 @@ router.post(
       overrideLat = qLat;
       overrideLng = qLng;
     }
-    if (!dineIn && !address_id && overrideLat == null) {
+    if (!dineIn && !pickup && !address_id && overrideLat == null) {
       return res.status(400).json({ error: 'address_id is required for delivery orders' });
     }
     const rRes = await db.query(
@@ -206,7 +210,7 @@ router.post(
     if (!restaurant.is_open) return res.status(400).json({ error: 'Restaurant is currently closed' });
 
     let address = null;
-    if (!dineIn) {
+    if (!dineIn && !pickup) {
       if (overrideLat != null) {
         // Live location wins for the fee; the saved row (if any) is only a label.
         // A stale address_id no longer 400s the quote when a live location exists.
@@ -219,7 +223,7 @@ router.post(
         address = aRes.rows[0];
         if (!address) return res.status(400).json({ error: 'Delivery address not found' });
       }
-    } else if (table_id) {
+    } else if (dineIn && table_id) {
       const tRes = await db.query('SELECT id FROM tables WHERE id = $1 AND restaurant_id = $2', [
         table_id, restaurant_id
       ]);
@@ -251,7 +255,7 @@ router.post(
     }
 
     let distanceKm = null;
-    if (!dineIn && restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
+    if (!dineIn && !pickup && restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
       distanceKm = haversineKm(
         Number(restaurant.lat),
         Number(restaurant.lng),
@@ -260,14 +264,15 @@ router.post(
       );
     }
     const config = await loadPricingConfig(db);
-    const tipPaise = capTip(tip_paise, config);
+    const tipPaise = pickup ? 0 : capTip(tip_paise, config);
     const quote = computeQuote({
       config,
-      distanceKm: dineIn ? 0 : distanceKm,
+      distanceKm: (dineIn || pickup) ? 0 : distanceKm,
       subtotalPaise: subtotal,
       discountPaise: discount,
       commissionPct: restaurant.commission_pct,
-      deliveryFeePaiseOverride: dineIn ? 0 : undefined
+      deliveryFeePaiseOverride: (dineIn || pickup) ? 0 : undefined,
+      platformFeePaiseOverride: pickup ? 0 : undefined
     });
 
     // Multi-restaurant on-the-way quote: group items by restaurant_id (item-level).
@@ -276,7 +281,7 @@ router.post(
     // fee (Rs 5 default, config-driven). Secondaries beyond 500m stay in the
     // order but pay their FULL normal delivery fee (never removed).
     let groupsOut = null;
-    if (!dineIn) {
+    if (!dineIn && !pickup) {
       const byRest = {};
       for (const it of items) {
         const rid = String(it.restaurant_id || restaurant_id);
@@ -358,7 +363,7 @@ router.post(
       }
     }
 
-    const billDelivery = dineIn ? 0 : quote.deliveryFeePaise;
+    const billDelivery = (dineIn || pickup) ? 0 : quote.deliveryFeePaise;
     const billPlatform = quote.platformFeePaise;
     // When groups exist, the bill sums across ALL groups (not just the primary)
     let billSubtotal = subtotal, totalDelivery = billDelivery, totalPlatform = billPlatform;
@@ -380,12 +385,12 @@ router.post(
       bill: {
         subtotal_paise: billSubtotal,
         discount_paise: discount,
-        delivery_fee_paise: dineIn ? 0 : totalDelivery,
+        delivery_fee_paise: (dineIn || pickup) ? 0 : totalDelivery,
         platform_fee_paise: totalPlatform,
         tax_paise: billTax,
         tax_breakdown: billTaxBreakdown,
         tip_paise: tipPaise,
-        total_paise: (dineIn ? 0 : totalDelivery) + totalPlatform + billTax + tipPaise + (billSubtotal - discount)
+        total_paise: ((dineIn || pickup) ? 0 : totalDelivery) + totalPlatform + billTax + tipPaise + (billSubtotal - discount)
       },
       groups: groupsOut,
       coupon_error: couponError,
@@ -678,15 +683,21 @@ router.post(
     const { restaurant_id, address_id, items, coupon_code, payment_method, lat, lng, delivery_label,
             order_type, table_id, delivery_note, no_cutlery, tip_paise,
             recipient_name, recipient_phone, groups } = req.body;
+    // b848 pickup is chosen on one restaurant page: a multi-restaurant
+    // pickup must fail loudly, never silently become a delivery order.
+    if (order_type === 'pickup' && Array.isArray(groups) && groups.length > 1) {
+      return res.status(400).json({ error: 'Pickup is available for one restaurant at a time' });
+    }
     // Multi-restaurant on-the-way checkout: groups[0] = primary, rest = secondaries.
     if (Array.isArray(groups) && groups.length > 1 && order_type !== 'dinein') {
       return await placeMultiGroupOrder(req, res);
     }
     const dineIn = order_type === 'dinein';
+    const pickup = order_type === 'pickup';
     if (!restaurant_id || !Array.isArray(items) || !items.length) {
       return res.status(400).json({ error: 'restaurant_id and items are required' });
     }
-    if (!dineIn && !address_id) {
+    if (!dineIn && !pickup && !address_id) {
       return res.status(400).json({ error: 'address_id is required for delivery orders' });
     }
 
@@ -713,7 +724,7 @@ router.post(
           'SELECT id FROM tables WHERE id = $1 AND restaurant_id = $2', [table_id, restaurant_id]
         );
         if (!tRes.rows[0]) throw { status: 400, message: 'Table not found for this restaurant' };
-      } else {
+      } else if (!pickup) {
         const aRes = await client.query(
           'SELECT * FROM addresses WHERE id = $1 AND user_id = $2',
           [address_id, req.user.id]
@@ -745,25 +756,26 @@ router.post(
     // When the customer drags the pin and confirms, the order delivers to the pin:
     // fee, rider destination and stored location all follow it. The saved address row is untouched.
     const pinLat = Number(lat), pinLng = Number(lng);
-    const pinValid = !dineIn && Number.isFinite(pinLat) && Number.isFinite(pinLng) && !(pinLat === 0 && pinLng === 0);
+    const pinValid = !dineIn && !pickup && Number.isFinite(pinLat) && Number.isFinite(pinLng) && !(pinLat === 0 && pinLng === 0);
     const deliveryLoc = pinValid ? { lat: pinLat, lng: pinLng }
       : (address && address.lat != null && address.lng != null ? { lat: Number(address.lat), lng: Number(address.lng) } : null);
       // Distance + quote
       let distanceKm = null;
-      if (!dineIn && restaurant.lat != null && restaurant.lng != null && deliveryLoc) {
+      if (!dineIn && !pickup && restaurant.lat != null && restaurant.lng != null && deliveryLoc) {
         distanceKm = haversineKm(restaurant.lat, restaurant.lng, deliveryLoc.lat, deliveryLoc.lng);
       }
       const config = await loadPricingConfig(client);
-      const tipPaise = capTip(tip_paise, config);
+      const tipPaise = pickup ? 0 : capTip(tip_paise, config);
       const quote = computeQuote({
         config,
-        distanceKm: dineIn ? 0 : distanceKm,
+        distanceKm: (dineIn || pickup) ? 0 : distanceKm,
         subtotalPaise: subtotal,
         discountPaise: discount,
         commissionPct: restaurant.commission_pct,
-        deliveryFeePaiseOverride: dineIn ? 0 : undefined
+        deliveryFeePaiseOverride: (dineIn || pickup) ? 0 : undefined,
+        platformFeePaiseOverride: pickup ? 0 : undefined
       });
-      const deliveryFee = dineIn ? 0 : quote.deliveryFeePaise;
+      const deliveryFee = (dineIn || pickup) ? 0 : quote.deliveryFeePaise;
       const finalTotal = (subtotal - discount) + deliveryFee + quote.platformFeePaise + quote.taxPaise + tipPaise;
 
       const timeline = [{ status: 'placed', at: new Date().toISOString(), by: 'customer' }];
@@ -783,7 +795,7 @@ router.post(
          VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
                  now() + ($20 || ' minutes')::interval, $21, $22, $23, $24, $25, $26, $27)
          RETURNING *`,
-        [req.user.id, restaurant_id, dineIn ? null : address_id, dineIn ? 'dinein' : 'delivery',
+        [req.user.id, restaurant_id, (dineIn || pickup) ? null : address_id, dineIn ? 'dinein' : pickup ? 'pickup' : 'delivery',
          dineIn ? table_id : null,
          subtotal, discount, deliveryFee, quote.platformFeePaise,
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
@@ -805,11 +817,11 @@ router.post(
       const ownerRes = await db.query('SELECT owner_id FROM restaurants WHERE id = $1', [restaurant_id]);
       if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
         await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
-          `${dineIn ? 'Dine-in table order' : 'Delivery order'} worth Rs ${(order.total_paise / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
+          `${dineIn ? 'Dine-in table order' : pickup ? 'Pickup order' : 'Delivery order'} worth Rs ${(order.total_paise / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
         // Push: items total only (restaurants see item prices, never fees).
         pushToUser(ownerRes.rows[0].owner_id, {
           title: `New order #${orderNumber}`,
-          body: `${restaurant.name} — new ${dineIn ? 'dine-in' : 'delivery'} order worth Rs ${(subtotal / 100).toFixed(2)}`,
+          body: `${restaurant.name} — new ${dineIn ? 'dine-in' : pickup ? 'pickup' : 'delivery'} order worth Rs ${(subtotal / 100).toFixed(2)}`,
           data: { type: 'new_order', order_id: order.id, status: 'placed' },
         });
       }
@@ -820,7 +832,7 @@ router.post(
 
       const { delivery_otp_hash: _h2, ...orderSafe2 } = order;
       res.status(201).json({
-        order: { ...orderSafe2, items: snapshots, delivery_otp: deliveryOtp },
+        order: { ...orderSafe2, items: snapshots, ...(pickup ? {} : { delivery_otp: deliveryOtp }) },
         breakdown: {
           subtotal_paise: subtotal,
           discount_paise: discount,

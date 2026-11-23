@@ -156,6 +156,12 @@ async function migrate() {
     END IF;
   END $$`);
   await q("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_type text NOT NULL DEFAULT 'delivery'");
+  // b848 pickup: order_type gains 'pickup'. schema.sql's inline CHECK
+  // (delivery/dinein only) is auto-named orders_order_type_check on live DBs;
+  // drop + re-add so a pickup insert is not rejected with 23514.
+  await q('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_order_type_check');
+  await q(`ALTER TABLE orders ADD CONSTRAINT orders_order_type_check
+    CHECK (order_type IN ('delivery','dinein','pickup'))`);
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS table_id uuid');
   // Dine-in table link (added here, not in schema.sql, because on existing
   // databases the table_id column only exists after the line above).

@@ -501,8 +501,9 @@ const OWNER_TRANSITIONS = {
   reject: { from: ['placed'], to: 'rejected' },
   preparing: { from: ['accepted'], to: 'preparing' },
   ready: { from: ['preparing'], to: 'ready' },
-  // Dine-in orders finish at the table, not at a doorstep
-  served: { from: ['ready'], to: 'delivered', dineinOnly: true }
+  // Dine-in orders finish at the table and pickup orders at the counter,
+  // not at a doorstep — no rider ever marks these delivered.
+  served: { from: ['ready'], to: 'delivered', counterOnly: true }
 };
 
 // PUT /api/owner/orders/:id/accept|reject|preparing|ready
@@ -523,8 +524,8 @@ router.put(
     if (!rule.from.includes(order.status)) {
       return res.status(409).json({ error: `Cannot ${req.params.action} an order in status ${order.status}` });
     }
-    if (rule.dineinOnly && order.order_type !== 'dinein') {
-      return res.status(409).json({ error: 'Only dine-in orders can be marked served' });
+    if (rule.counterOnly && !['dinein', 'pickup'].includes(order.order_type)) {
+      return res.status(409).json({ error: 'Only dine-in and pickup orders can be marked served' });
     }
 
     await transition(order.id, rule.to, 'restaurant_owner');
@@ -540,19 +541,25 @@ router.put(
         `Your order was rejected by the restaurant.${refunded ? ' Your payment will be refunded.' : ''}`);
     } else if (rule.to === 'delivered') {
       await db.query('UPDATE orders SET delivered_at = now() WHERE id = $1', [order.id]);
-      await notify(db, order.customer_id, 'Enjoy your meal! 🍽️',
-        'Your food is served fresh at your table. Loved it? Tap to rate ⭐');
+      const servedTitle = order.order_type === 'pickup' ? 'Picked up! Enjoy your meal! 🍽️' : 'Enjoy your meal! 🍽️';
+      const servedBody = order.order_type === 'pickup'
+        ? 'Your order has been handed over at the counter. Loved it? Tap to rate ⭐'
+        : 'Your food is served fresh at your table. Loved it? Tap to rate ⭐';
+      await notify(db, order.customer_id, servedTitle, servedBody);
       pushToUser(order.customer_id, {
-        title: 'Enjoy your meal! 🍽️',
-        body: 'Your food is served fresh at your table. Loved it? Tap to rate ⭐',
+        title: servedTitle,
+        body: servedBody,
         data: { type: 'order_status', order_id: order.id, status: 'delivered' },
       });
     } else {
-      const copy = {
+      let copy = {
         accepted: ['Order accepted ✅', `is firing up the kitchen for you! 🔥`],
         preparing: ['On the flame! 👨‍🍳', 'is preparing your food fresh right now.'],
         ready: ['Packed fresh! 📦', 'packed your order fresh — a rider is on the way to pick it up. 🛵']
       }[rule.to];
+      if (order.order_type === 'pickup' && rule.to === 'ready') {
+        copy = ['Packed fresh! 📦', 'packed your order fresh — ready for pickup! Show your order code at the counter.'];
+      }
       const restName = (await db.query('SELECT name FROM restaurants WHERE id = $1', [id])).rows[0].name;
       await notify(db, order.customer_id, copy[0], `${restName} ${copy[1]}`);
       pushToUser(order.customer_id, {
