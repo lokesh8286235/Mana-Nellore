@@ -40,7 +40,9 @@ router.post('/token', ah(async (req, res) => {
           data: { type: 'welcome' },
         });
         welcome = { sent: r.sent, failed: r.failed, tokens: r.tokens };
-        const dead = (r.results || []).some((x) => x && x.error && /unregistered/.test(x.error));
+        // Permanent token errors (same set the sender treats as dead): the
+        // token will never deliver, so retrying the welcome is pointless.
+        const dead = (r.results || []).some((x) => x && x.error && /unregistered|INVALID_ARGUMENT|SENDER_ID_MISMATCH/i.test(x.error));
         if (r.sent > 0 || dead) {
           await db.query('UPDATE users SET welcome_push_sent_at = now() WHERE id = $1', [req.user.id]);
         }
