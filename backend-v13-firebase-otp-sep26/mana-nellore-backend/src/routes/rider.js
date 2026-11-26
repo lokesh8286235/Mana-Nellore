@@ -244,6 +244,68 @@ router.put(
   })
 );
 
+// "Almost here" push (user 2026-11-26): when the rider is <= 5 minutes
+// from the customer's home, send one push telling them to wash their hands
+// and be ready. Fires ONCE per order, guarded by the atomic
+// almost_here_push_sent_at claim below, so repeated location updates (or
+// the ETA hovering around 5 minutes) can never send it twice.
+// ETA uses the SAME formula as the customer tracking endpoint
+// (GET /api/orders/:id): haversine distance at ~20 km/h city speed.
+// Only for delivery orders in an out-for-delivery state (picked_up /
+// on_way). Never for pickup orders, delivered/cancelled orders, or when
+// the ETA is unknown. Skipped when the rider is already at the door
+// (dist < 0.2 km) — the Delivered push covers arrival.
+const ALMOST_HERE_MINUTES = 5;
+const ALMOST_HERE_CITY_SPEED_KMH = 20;
+const ALMOST_HERE_AT_DOOR_KM = 0.2;
+const ALMOST_HERE_TITLE = 'Almost there! 🛵';
+const ALMOST_HERE_BODY = 'చేతులు గడుక్కొని ready గా ఉండండి food వస్తుంది';
+
+async function checkAlmostHere(riderId, lat, lng) {
+  try {
+    const rLat = Number(lat), rLng = Number(lng);
+    if (!Number.isFinite(rLat) || !Number.isFinite(rLng)) return;
+    // The rider's active out-for-delivery orders, each with its home coords
+    // (a confirmed pin overrides the saved address, same as tracking).
+    const { rows } = await db.query(
+      `SELECT o.id, o.customer_id,
+              COALESCE(o.delivery_lat, a.lat) AS addr_lat,
+              COALESCE(o.delivery_lng, a.lng) AS addr_lng
+       FROM orders o
+       LEFT JOIN addresses a ON a.id = o.address_id
+       WHERE o.rider_id = $1 AND o.order_type = 'delivery'
+         AND o.status IN ('picked_up', 'on_way')
+         AND o.almost_here_push_sent_at IS NULL`,
+      [riderId]
+    );
+    for (const o of rows) {
+      if (o.addr_lat == null || o.addr_lng == null) continue; // ETA unknown: never guess
+      const distKm = haversineKm(rLat, rLng, Number(o.addr_lat), Number(o.addr_lng));
+      if (!Number.isFinite(distKm)) continue;
+      if (distKm < ALMOST_HERE_AT_DOOR_KM) continue; // already at the door
+      const liveEta = Math.max(1, Math.round((distKm / ALMOST_HERE_CITY_SPEED_KMH) * 60));
+      if (liveEta > ALMOST_HERE_MINUTES) continue;
+      // Atomic claim: only the first location update that crosses the
+      // threshold wins; every later update sees the flag and skips.
+      const claimed = await db.query(
+        `UPDATE orders SET almost_here_push_sent_at = now()
+         WHERE id = $1 AND almost_here_push_sent_at IS NULL
+         RETURNING id, customer_id`,
+        [o.id]
+      );
+      if (!claimed.rows[0]) continue;
+      await notify(claimed.rows[0].customer_id, ALMOST_HERE_TITLE, ALMOST_HERE_BODY);
+      pushToUser(claimed.rows[0].customer_id, {
+        title: ALMOST_HERE_TITLE,
+        body: ALMOST_HERE_BODY,
+        data: { type: 'order_status', order_id: claimed.rows[0].id, status: 'almost_here' },
+      });
+    }
+  } catch (e) {
+    console.error('[almost-here] check failed:', e.message);
+  }
+}
+
 // PUT /api/rider/location { lat, lng }
 router.put(
   '/location',
@@ -253,6 +315,9 @@ router.put(
     const { lat, lng } = req.body;
     if (lat == null || lng == null) return res.status(400).json({ error: 'lat and lng are required' });
     await db.query('UPDATE riders SET lat = $1, lng = $2 WHERE id = $3', [lat, lng, rider.id]);
+    // Fire-and-forget: the location response must never wait on the push
+    // check, and the check itself never throws into this request path.
+    checkAlmostHere(rider.id, lat, lng);
     res.json({ ok: true });
   })
 );

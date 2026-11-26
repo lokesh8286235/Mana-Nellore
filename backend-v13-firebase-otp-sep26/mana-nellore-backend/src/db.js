@@ -149,6 +149,9 @@ async function migrate() {
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lat double precision');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lng double precision');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_label text');
+  // "Almost here" push (user 2026-11-26): timestamp flag so the <=5-min
+  // alert fires exactly once per order.
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS almost_here_push_sent_at timestamptz');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS opens_at text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS closes_at text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number text');
