@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, computeQuote, computeTax, otwSecondaryFeePaise, tripPayoutPaise } = require('../lib/pricing');
+const { resolveRestaurantCoords } = require('../lib/geocode');
 const { pointToSegKm } = require('../lib/otw');
 const { pushToUser } = require('../lib/fcm');
 
@@ -202,7 +203,7 @@ router.post(
       return res.status(400).json({ error: 'address_id is required for delivery orders' });
     }
     const rRes = await db.query(
-      "SELECT id, lat, lng, commission_pct, is_open FROM restaurants WHERE id = $1 AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
+      "SELECT id, lat, lng, address, commission_pct, is_open FROM restaurants WHERE id = $1 AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
       [restaurant_id]
     );
     const restaurant = rRes.rows[0];
@@ -254,14 +255,21 @@ router.post(
       couponError = checked.error;
     }
 
+    // b862: a restaurant without a pin still gets a real distance-based fee —
+    // its typed address is geocoded (cached server-side). No pin and no usable
+    // address keeps the existing base-fee fallback (distanceKm stays null).
     let distanceKm = null;
-    if (!dineIn && !pickup && restaurant.lat != null && restaurant.lng != null && address.lat != null && address.lng != null) {
-      distanceKm = haversineKm(
-        Number(restaurant.lat),
-        Number(restaurant.lng),
-        Number(address.lat),
-        Number(address.lng)
-      );
+    let restCoords = null;
+    if (!dineIn && !pickup && address && address.lat != null && address.lng != null) {
+      restCoords = await resolveRestaurantCoords(restaurant);
+      if (restCoords) {
+        distanceKm = haversineKm(
+          restCoords.lat,
+          restCoords.lng,
+          Number(address.lat),
+          Number(address.lng)
+        );
+      }
     }
     const config = await loadPricingConfig(db);
     const tipPaise = pickup ? 0 : capTip(tip_paise, config);
@@ -292,7 +300,7 @@ router.post(
         const primaryRid = String(restaurant_id);
         const ordered = [primaryRid, ...rids.filter((r) => r !== primaryRid)];
         const rAll = await db.query(
-          "SELECT id, lat, lng, commission_pct FROM restaurants WHERE id = ANY($1) AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
+          "SELECT id, lat, lng, address, commission_pct FROM restaurants WHERE id = ANY($1) AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
           [ordered]
         );
         const rMap = Object.fromEntries(rAll.rows.map((r) => [String(r.id), r]));
@@ -310,9 +318,11 @@ router.post(
           );
           const gmById = Object.fromEntries(gmRes.rows.map((m) => [m.id, m]));
           const { subtotal: gSub } = await validateItems(db, gmById, gItems);
+          // b862: same geocoded-address fallback as the primary quote.
+          const rrCoords = await resolveRestaurantCoords(rr);
           let gDist = null;
-          if (rr.lat != null && rr.lng != null && address.lat != null && address.lng != null) {
-            gDist = haversineKm(Number(rr.lat), Number(rr.lng), Number(address.lat), Number(address.lng));
+          if (rrCoords && address.lat != null && address.lng != null) {
+            gDist = haversineKm(rrCoords.lat, rrCoords.lng, Number(address.lat), Number(address.lng));
           }
           const gQuote = computeQuote({
             config,
@@ -325,12 +335,12 @@ router.post(
           // On-the-way check: secondary within 500m of the primary→customer
           // route segment gets the flat fee; beyond 500m it stays at FULL fee.
           let onTheWay = isPrim;
-          if (!isPrim && pR && pR.lat != null && pR.lng != null &&
+          if (!isPrim && restCoords &&
               address.lat != null && address.lng != null &&
-              rr.lat != null && rr.lng != null) {
+              rrCoords) {
             onTheWay = pointToSegKm(
-              Number(rr.lng), Number(rr.lat),
-              Number(pR.lng), Number(pR.lat),
+              rrCoords.lng, rrCoords.lat,
+              restCoords.lng, restCoords.lat,
               Number(address.lng), Number(address.lat)
             ) <= 0.5;
           }
@@ -453,6 +463,15 @@ async function placeMultiGroupOrder(req, res) {
     // Beyond threshold — or missing coords, or API failure with no
     // haversine fallback — the secondary STAYS in the order but pays its FULL
     // normal delivery fee (never removed, never repriced to the flat fee).
+    // b862: resolve restaurant coords (pin, else geocoded typed address)
+    // once, so route validation and fees agree with the quote.
+    const restCoordsById = {};
+    {
+      const _allR = [primary].concat(groups.slice(1).map((g) => restById[String(g.restaurant_id)]).filter(Boolean));
+      for (const _rr of _allR) {
+        restCoordsById[String(_rr.id)] = await resolveRestaurantCoords(_rr);
+      }
+    }
     const removed_off_route = [];
     const validGroups = [{ ...groups[0] }];
     const offRouteSet = new Set();
@@ -467,11 +486,12 @@ async function placeMultiGroupOrder(req, res) {
         continue;
       }
       let onRoute = false;
-      if (primary.lat != null && primary.lng != null && deliveryLoc &&
-          r.lat != null && r.lng != null) {
+      const _pC = restCoordsById[String(primary.id)];
+      const _rC = restCoordsById[String(r.id)];
+      if (_pC && deliveryLoc && _rC) {
         const distKm = pointToSegKm(
-          Number(r.lng), Number(r.lat),
-          Number(primary.lng), Number(primary.lat),
+          _rC.lng, _rC.lat,
+          _pC.lng, _pC.lat,
           Number(deliveryLoc.lng), Number(deliveryLoc.lat)
         );
         onRoute = distKm <= 0.5;
@@ -517,9 +537,11 @@ async function placeMultiGroupOrder(req, res) {
       // Fees: primary = 100% of its own normal fee, platform fee applies.
       // Secondary on-the-way (validated ≤500m above):
       // flat on-the-way fee (Rs 5 default, config-driven). Platform 0.
+      // b862: geocoded typed address when the restaurant has no pin.
       let distanceKm = null;
-      if (restaurant.lat != null && restaurant.lng != null && deliveryLoc) {
-        distanceKm = haversineKm(Number(restaurant.lat), Number(restaurant.lng), Number(deliveryLoc.lat), Number(deliveryLoc.lng));
+      const _gC = restCoordsById[String(restaurant.id)];
+      if (_gC && deliveryLoc) {
+        distanceKm = haversineKm(_gC.lat, _gC.lng, Number(deliveryLoc.lat), Number(deliveryLoc.lng));
       }
       const quote = computeQuote({
         config,
@@ -765,9 +787,13 @@ router.post(
     const deliveryLoc = pinValid ? { lat: pinLat, lng: pinLng }
       : (address && address.lat != null && address.lng != null ? { lat: Number(address.lat), lng: Number(address.lng) } : null);
       // Distance + quote
+      // b862: geocoded typed address when the restaurant has no pin.
       let distanceKm = null;
-      if (!dineIn && !pickup && restaurant.lat != null && restaurant.lng != null && deliveryLoc) {
-        distanceKm = haversineKm(restaurant.lat, restaurant.lng, deliveryLoc.lat, deliveryLoc.lng);
+      if (!dineIn && !pickup && deliveryLoc) {
+        const _pCoords = await resolveRestaurantCoords(restaurant);
+        if (_pCoords) {
+          distanceKm = haversineKm(_pCoords.lat, _pCoords.lng, deliveryLoc.lat, deliveryLoc.lng);
+        }
       }
       const config = await loadPricingConfig(client);
       const tipPaise = pickup ? 0 : capTip(tip_paise, config);
