@@ -938,7 +938,8 @@ router.get(
       where += ` AND o.status = $${params.length}`;
     }
     const { rows } = await db.query(
-      `SELECT o.*, r.name AS restaurant_name, r.image_url AS restaurant_image
+      `SELECT o.*, r.name AS restaurant_name, r.image_url AS restaurant_image,
+              EXISTS (SELECT 1 FROM ratings rt WHERE rt.order_id = o.id) AS rated
        FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 200`,
       params
@@ -962,7 +963,8 @@ router.get(
               ru.name AS rider_name, ru.phone AS rider_phone,
               rd.profile_photo AS rider_photo, rd.rating_avg AS rider_rating,
               (SELECT COUNT(*) FROM orders od
-               WHERE od.rider_id = rd.id AND od.status = 'delivered') AS rider_deliveries
+               WHERE od.rider_id = rd.id AND od.status = 'delivered') AS rider_deliveries,
+              EXISTS (SELECT 1 FROM ratings rt WHERE rt.order_id = o.id) AS rated
        FROM orders o
        JOIN restaurants r ON r.id = o.restaurant_id
        LEFT JOIN addresses a ON a.id = o.address_id

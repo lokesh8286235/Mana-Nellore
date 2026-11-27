@@ -120,6 +120,29 @@ async function rankRiders(orderId, restLat, restLng, excludeRiderIds) {
     return { id: r.id, user_id: r.user_id, distKm, effKm, activeN: Number(r.active_n) };
   });
 
+  // Location-less riders (lat/lng NULL — never reported a position; there is
+  // no separate last-known location to fall back to, riders.lat/lng IS the
+  // last known position). Ranking them at Infinity meant they were always
+  // last: every fresh order's first offer went to the nearest located rider,
+  // and the rotation only reached them after every located rider had timed
+  // out (6 riders x 30s) — in practice never, because someone accepts first.
+  // Fallback: assume a typical intra-city distance (3 km) — a location-less
+  // rider competes AS IF 3 km away: nearer located riders still win, farther
+  // ones lose, and the cascade reaches them once the nearer riders time out.
+  // A MEDIAN of the remaining riders was considered and rejected: as near
+  // riders time out and drop from the set, the median of the remainder drifts
+  // upward, so the location-less rider stays glued behind the pack and still
+  // ends up last. A fixed fallback is stable across cascade rounds.
+  // Treating them as AT the restaurant (0 km) was also rejected: it would
+  // let a rider who never shares location jump ahead of every rider who does.
+  // If the restaurant has no location either, everyone ties at the fallback
+  // and the capacity tiebreak decides. This also removes the NaN hazard of
+  // sorting Infinity against Infinity.
+  const LOCATION_UNKNOWN_FALLBACK_KM = 3;
+  for (const r of ranked) {
+    if (!Number.isFinite(r.effKm)) r.effKm = LOCATION_UNKNOWN_FALLBACK_KM;
+  }
+
   ranked.sort((a, b) => {
     // Within 500m, prefer the rider with fewer active deliveries.
     if (Math.abs(a.effKm - b.effKm) < TIEBREAK_M && a.activeN !== b.activeN) return a.activeN - b.activeN;
@@ -253,5 +276,6 @@ module.exports = {
   sweepExpiredOffers,
   dispatchPendingOrders,
   clearRiderOffer,
+  rankRiders, // exported for tests (dispatch ranking unit test)
   OFFER_WINDOW_SEC,
 };

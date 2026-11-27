@@ -222,6 +222,115 @@ router.put(
   })
 );
 
+// ---- Delete my account ----
+// DELETE /api/customer/account — own account only (req.user.id), customers only.
+// A rider profile or a restaurant ownership blocks deletion (409: contact
+// support) so deleting a customer login can never silently orphan a livelihood.
+// What happens, in ONE transaction:
+//   * Orders are ANONYMIZED, not deleted: customer_id is reassigned to the
+//     "Deleted account" placeholder user (00000000-0000-0000-0000-000000000000,
+//     no phone/email/name of a real person), delivery lat/lng/label, delivery
+//     note and recipient name/phone are nulled, and address_id drops to NULL
+//     when the addresses are deleted. Order ids, order numbers, restaurant,
+//     rider, items, totals, payment fields, timeline and status are kept
+//     untouched for accounting. (The placeholder — not NULL — keeps every
+//     JOIN working: owner/admin order views still list the order, showing
+//     "Deleted account" instead of a name/phone. orders.customer_id is NOT
+//     NULL with no ON DELETE action, so the user row cannot be deleted while
+//     orders still point at it.)
+//   * Personal data is DELETED: the user row, addresses, push tokens,
+//     favorites, coupon issuances, support tickets, ratings + dish ratings
+//     authored by the user, callback requests, open alerts, student
+//     applications, notifications and unused OTP codes. Other users'
+//     referred_by pointers to this user become NULL automatically.
+//   * Group traces are scrubbed, not deleted (other members' data stays):
+//     groups hosted by the user keep running with host_name "Deleted user";
+//     group items the user added lose the added_by link.
+//   * The JWT dies with the row: authenticate() 401s ("Account no longer
+//     exists") on any later call with the old token.
+const DELETED_CUSTOMER_ID = '00000000-0000-0000-0000-000000000000';
+
+router.delete(
+  '/account',
+  ah(async (req, res) => {
+    if (req.user.role !== 'customer') {
+      return res.status(403).json({ error: 'Only customer accounts can be deleted here' });
+    }
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Guards: never orphan a restaurant or a rider profile.
+      const owns = await client.query(
+        'SELECT id FROM restaurants WHERE owner_id = $1 LIMIT 1', [req.user.id]
+      );
+      if (owns.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'This account owns a restaurant — contact support to delete it' });
+      }
+      const rides = await client.query(
+        'SELECT id FROM riders WHERE user_id = $1 LIMIT 1', [req.user.id]
+      );
+      if (rides.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'This account has a rider profile — contact support to delete it' });
+      }
+      // Placeholder "deleted customer" (no phone/email of a real person).
+      await client.query(
+        `INSERT INTO users (id, phone, name, role) VALUES ($1, NULL, 'Deleted account', 'customer')
+         ON CONFLICT (id) DO NOTHING`,
+        [DELETED_CUSTOMER_ID]
+      );
+      // Anonymize orders FIRST (see comment above — the user row cannot be
+      // deleted while orders still point at it).
+      const anon = await client.query(
+        `UPDATE orders SET customer_id = $2, delivery_lat = NULL, delivery_lng = NULL,
+           delivery_label = NULL, delivery_note = NULL, recipient_name = NULL, recipient_phone = NULL
+         WHERE customer_id = $1`,
+        [req.user.id, DELETED_CUSTOMER_ID]
+      );
+      // Scrub group traces (groups themselves stay for the other members).
+      await client.query(
+        `UPDATE group_orders SET host_name = 'Deleted user' WHERE host_user_id = $1`,
+        [req.user.id]
+      );
+      await client.query(
+        `UPDATE group_order_items SET added_by_user_id = NULL WHERE added_by_user_id = $1`,
+        [req.user.id]
+      );
+      // Delete personal data. Most of these also cascade from the users row,
+      // but explicit deletes keep the endpoint correct even where a live FK
+      // differs from the repo schema.
+      await client.query('DELETE FROM push_tokens WHERE user_id = $1', [req.user.id]);
+      await client.query('DELETE FROM addresses WHERE user_id = $1', [req.user.id]);
+      await client.query('DELETE FROM favorites WHERE customer_id = $1', [req.user.id]);
+      await client.query('DELETE FROM coupon_issuances WHERE user_id = $1', [req.user.id]);
+      await client.query('DELETE FROM support_tickets WHERE user_id = $1', [req.user.id]);
+      await client.query('DELETE FROM ratings WHERE rater_id = $1', [req.user.id]);
+      await client.query('DELETE FROM dish_ratings WHERE customer_id = $1', [req.user.id]);
+      await client.query('DELETE FROM callback_requests WHERE user_id = $1', [req.user.id]);
+      await client.query('DELETE FROM restaurant_open_alerts WHERE user_id = $1', [req.user.id]);
+      await client.query('DELETE FROM student_applications WHERE user_id = $1', [req.user.id]);
+      await client.query('DELETE FROM notifications WHERE user_id = $1', [req.user.id]);
+      await client.query(
+        'DELETE FROM otp_codes WHERE phone = (SELECT phone FROM users WHERE id = $1)',
+        [req.user.id]
+      );
+      const del = await client.query('DELETE FROM users WHERE id = $1', [req.user.id]);
+      if (!del.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Account not found' });
+      }
+      await client.query('COMMIT');
+      res.json({ ok: true, anonymized_orders: anon.rowCount });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  })
+);
+
 // ---- Call me back: CUT (user 2026-09-28, permanent). The POST route is
 // removed — customers can no longer file callbacks. The GET below is kept
 // as read-only history for requests filed before the cut.
