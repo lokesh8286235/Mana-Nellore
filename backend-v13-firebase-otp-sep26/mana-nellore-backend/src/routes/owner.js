@@ -551,12 +551,17 @@ const OWNER_TRANSITIONS = {
   reject: { from: ['placed'], to: 'rejected' },
   preparing: { from: ['accepted'], to: 'preparing' },
   ready: { from: ['preparing'], to: 'ready' },
+  // Owner cancel AFTER accept: the kitchen can still call it off while the
+  // food is being made or packed. NOT from 'placed' (reject covers that) and
+  // NOT once a rider has picked it up (picked_up/on_way/delivered) — the
+  // rider is already carrying it by then.
+  cancel: { from: ['accepted', 'preparing', 'ready'], to: 'cancelled' },
   // Dine-in orders finish at the table and pickup orders at the counter,
   // not at a doorstep — no rider ever marks these delivered.
   served: { from: ['ready'], to: 'delivered', counterOnly: true }
 };
 
-// PUT /api/owner/orders/:id/accept|reject|preparing|ready
+// PUT /api/owner/orders/:id/accept|reject|preparing|ready|cancel
 router.put(
   '/orders/:id/:action',
   ah(async (req, res) => {
@@ -592,7 +597,42 @@ router.put(
 
     await transition(order.id, rule.to, 'restaurant_owner');
 
-    if (rule.to === 'rejected') {
+    // Owner cancel after accept: COD-only today, so nothing was ever paid and
+    // there is NO refund to process. Paid orders (once Cashfree goes live)
+    // go to 'refund_pending' — never 'refunded', which is only set once a
+    // real refund has actually happened (see customer cancel in orders.js).
+    // The assigned rider (if any) is released and told, so a cancelled order
+    // never sits in a rider's active list.
+    let refundPending = false;
+    if (rule.to === 'cancelled') {
+      const reason = req.body.reason || 'Cancelled by the restaurant';
+      refundPending = order.payment_status === 'paid';
+      await db.query(
+        "UPDATE orders SET cancel_reason = $1, payment_status = $2, rider_id = NULL, offered_to_rider_id = NULL WHERE id = $3",
+        [reason, refundPending ? 'refund_pending' : order.payment_status, order.id]
+      );
+      const cancelBody = `Your order #${order.order_number || order.id} was cancelled by the restaurant.${refundPending ? ' Your refund is being processed.' : ''}`;
+      await notify(db, order.customer_id, 'Order cancelled', cancelBody);
+      pushToUser(order.customer_id, {
+        title: 'Order cancelled',
+        body: cancelBody,
+        data: { type: 'order_status', order_id: order.id, status: 'cancelled' },
+      });
+      if (order.rider_id) {
+        try {
+          const r = await db.query('SELECT user_id FROM riders WHERE id = $1', [order.rider_id]);
+          if (r.rows[0]) {
+            const riderBody = `Order #${order.order_number || order.id} was cancelled by the restaurant. You no longer need to pick it up.`;
+            await notify(db, r.rows[0].user_id, 'Order cancelled', riderBody);
+            pushToUser(r.rows[0].user_id, {
+              title: 'Order cancelled',
+              body: riderBody,
+              data: { type: 'order_status', order_id: order.id, status: 'cancelled' },
+            });
+          }
+        } catch (e) { console.error('[owner-cancel] rider notify failed', e.message); }
+      }
+    } else if (rule.to === 'rejected') {
       const reason = req.body.reason || 'Restaurant rejected the order';
       const refunded = order.payment_status === 'paid';
       await db.query(
@@ -635,7 +675,7 @@ router.put(
         data: { type: 'order_status', order_id: order.id, status: rule.to },
       });
     }
-    res.json({ ok: true, status: rule.to });
+    res.json({ ok: true, status: rule.to, ...(rule.to === 'cancelled' ? { refund_pending: refundPending } : {}) });
   })
 );
 
