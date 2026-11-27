@@ -6,6 +6,60 @@ const { seedSuggestedCats } = require('../lib/suggested-cats');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const crypto = require('crypto');
+const secure = require('../lib/secure');
+// Confidential fields encrypted at rest (see src/lib/secure.js). Decrypted
+// only for the admin's verification view of pending records.
+const RESTAURANT_SECRET_FIELDS = ['aadhar'];
+const APPLICATION_SECRET_FIELDS = ['aadhar'];
+const RIDER_SECRET_FIELDS = ['aadhaar_no', 'licence_no', 'pan_no', 'bank_account', 'ifsc', 'upi_id'];
+
+// ---- Confidential-data scrub (approved 2026-11-27) ----
+// At approval the full Aadhar is replaced by its last 4 digits + a verified
+// flag, and the document photos are deleted (the approval IS the
+// verification). Idempotent, and NEVER nulls a value it could not read:
+// an encrypted value without a key is skipped + reported, never destroyed.
+async function scrubRestaurant(id) {
+  const { rows } = await db.query('SELECT aadhar FROM restaurants WHERE id = $1', [id]);
+  const r = rows[0];
+  if (!r || !r.aadhar) return { scrubbed: false, reason: 'no aadhar stored' };
+  const l4 = secure.aadharLast4(r.aadhar);
+  if (!l4) {
+    console.warn('[secure] skipping Aadhar scrub for restaurant ' + id + ' — value unreadable (encrypted, no key?)');
+    return { scrubbed: false, reason: 'aadhar unreadable (encrypted, no key?)' };
+  }
+  await db.query('UPDATE restaurants SET aadhar = NULL, aadhar_last4 = $1, aadhar_verified = true WHERE id = $2', [l4, id]);
+  return { scrubbed: true, last4: l4 };
+}
+async function scrubApplication(id) {
+  const { rows } = await db.query('SELECT aadhar FROM restaurant_applications WHERE id = $1', [id]);
+  const r = rows[0];
+  if (!r || !r.aadhar) return { scrubbed: false, reason: 'no aadhar stored' };
+  const l4 = secure.aadharLast4(r.aadhar);
+  if (!l4) {
+    console.warn('[secure] skipping Aadhar scrub for application ' + id + ' — value unreadable (encrypted, no key?)');
+    return { scrubbed: false, reason: 'aadhar unreadable (encrypted, no key?)' };
+  }
+  await db.query('UPDATE restaurant_applications SET aadhar = NULL, aadhar_last4 = $1, aadhar_verified = true WHERE id = $2', [l4, id]);
+  return { scrubbed: true, last4: l4 };
+}
+async function scrubRider(id) {
+  const { rows } = await db.query('SELECT aadhaar_no, aadhaar_photo, aadhaar_front_photo, aadhaar_back_photo, licence_photo, pan_photo, cancelled_cheque_photo FROM riders WHERE id = $1', [id]);
+  const r = rows[0];
+  if (!r) return { scrubbed: false, reason: 'rider not found' };
+  const hadPhotos = !!(r.aadhaar_photo || r.aadhaar_front_photo || r.aadhaar_back_photo || r.licence_photo || r.pan_photo || r.cancelled_cheque_photo);
+  let l4 = null;
+  let skipped = null;
+  if (r.aadhaar_no) {
+    l4 = secure.aadharLast4(r.aadhaar_no);
+    if (!l4) skipped = 'aadhar unreadable (encrypted, no key?)';
+  }
+  if (l4) {
+    await db.query('UPDATE riders SET aadhaar_no = NULL, aadhaar_last4 = $1, aadhaar_verified = true, aadhaar_photo = NULL, aadhaar_front_photo = NULL, aadhaar_back_photo = NULL, licence_photo = NULL, pan_photo = NULL, cancelled_cheque_photo = NULL WHERE id = $2', [l4, id]);
+  } else {
+    await db.query('UPDATE riders SET aadhaar_photo = NULL, aadhaar_front_photo = NULL, aadhaar_back_photo = NULL, licence_photo = NULL, pan_photo = NULL, cancelled_cheque_photo = NULL WHERE id = $1', [id]);
+  }
+  return { scrubbed: !!l4, last4: l4, photosDeleted: hadPhotos, skipped };
+}
 
 // Upload a base64 data URL to Cloudinary, return the secure URL
 async function uploadToCloudinary(dataUrl, folder) {
@@ -409,7 +463,7 @@ router.get(
        ${where} ORDER BY r.created_at DESC`,
       params
     );
-    res.json({ restaurants: rows });
+    res.json({ restaurants: rows.map((r) => secure.decryptRow(r, RESTAURANT_SECRET_FIELDS)) });
   })
 );
 
@@ -426,7 +480,7 @@ router.get(
       [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    res.json({ restaurant: { ...rows[0], rating_avg: Number(rows[0].rating_avg) } });
+    res.json({ restaurant: { ...secure.decryptRow(rows[0], RESTAURANT_SECRET_FIELDS), rating_avg: Number(rows[0].rating_avg) } });
   })
 );
 
@@ -506,11 +560,19 @@ router.put(
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, `restaurant_${status}`, 'restaurant', req.params.id, {});
-    if (rows[0].owner_id) {
-      await notify(rows[0].owner_id, 'Restaurant status update',
-        `Your restaurant "${rows[0].name}" is now ${status}.`);
+    // Approving verifies the Aadhar — keep only last 4 digits + flag.
+    let restaurant = rows[0];
+    if (status === 'approved') {
+      const scrub = await scrubRestaurant(req.params.id);
+      if (scrub.reason) console.warn('[secure] restaurant ' + req.params.id + ' Aadhar scrub skipped: ' + scrub.reason);
+      const fresh = await db.query('SELECT * FROM restaurants WHERE id = $1', [req.params.id]);
+      if (fresh.rows[0]) restaurant = fresh.rows[0];
     }
-    res.json({ restaurant: rows[0] });
+    if (restaurant.owner_id) {
+      await notify(restaurant.owner_id, 'Restaurant status update',
+        `Your restaurant "${restaurant.name}" is now ${status}.`);
+    }
+    res.json({ restaurant: secure.decryptRow(restaurant, RESTAURANT_SECRET_FIELDS) });
   })
 );
 
@@ -531,7 +593,7 @@ router.get(
        ${where} ORDER BY rd.created_at DESC`,
       params
     );
-    res.json({ riders: rows.map((r) => ({ ...r, rating_avg: Number(r.rating_avg) })) });
+    res.json({ riders: rows.map((r) => ({ ...secure.decryptRow(r, RIDER_SECRET_FIELDS), rating_avg: Number(r.rating_avg) })) });
   })
 );
 
@@ -549,7 +611,7 @@ router.get(
     if (!rows.length) return res.status(404).json({ error: 'Rider not found' });
     const r = rows[0];
     r.rating_avg = Number(r.rating_avg);
-    res.json({ rider: r });
+    res.json({ rider: secure.decryptRow(r, RIDER_SECRET_FIELDS) });
   })
 );
 
@@ -565,8 +627,17 @@ router.put(
     );
     if (!rows[0]) return res.status(404).json({ error: 'Rider not found' });
     await audit(req, `rider_${status}`, 'rider', req.params.id, {});
-    await notify(rows[0].user_id, 'Rider account update', `Your rider account is now ${status}.`);
-    res.json({ rider: rows[0] });
+    // Approving verifies the documents — keep only last 4 Aadhar digits +
+    // flag, delete the document photos.
+    let rider = rows[0];
+    if (status === 'approved') {
+      const scrub = await scrubRider(req.params.id);
+      if (scrub.skipped) console.warn('[secure] rider ' + req.params.id + ' Aadhar scrub skipped: ' + scrub.skipped);
+      const fresh = await db.query('SELECT * FROM riders WHERE user_id = $1', [rider.user_id]);
+      if (fresh.rows[0]) rider = fresh.rows[0];
+    }
+    await notify(rider.user_id, 'Rider account update', `Your rider account is now ${status}.`);
+    res.json({ rider: secure.decryptRow(rider, RIDER_SECRET_FIELDS) });
   })
 );
 
@@ -1203,7 +1274,7 @@ router.get(
     const { rows } = await db.query(
       "SELECT * FROM restaurant_applications ORDER BY created_at DESC"
     );
-    res.json({ applications: rows });
+    res.json({ applications: rows.map((r) => secure.decryptRow(r, APPLICATION_SECRET_FIELDS)) });
   })
 );
 
@@ -1238,11 +1309,18 @@ router.put(
         );
         owner = c.rows[0];
       }
+      // Confidential storage: the restaurant keeps only the last 4 Aadhar
+      // digits + a verified flag — never the full number. If the number
+      // cannot be read (encrypted, no key yet) the original value is
+      // preserved as-is so the migration can scrub it later.
+      const appLast4 = secure.aadharLast4(app.aadhar);
       const rRes = await db.query(
-        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, verified, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,'approved') RETURNING *`,
-        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai, app.aadhar || null]
+        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, aadhar_last4, aadhar_verified, verified, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,'approved') RETURNING *`,
+        [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai,
+         appLast4 ? null : (app.aadhar || null), appLast4, !!appLast4]
       );
+      await scrubApplication(app.id);
       await seedSuggestedCats(db, rRes.rows[0].id);
       await notify(owner.id, '🎉 Your restaurant is live!',
         `"${app.restaurant_name}" is verified and open for business on Mana Nellore!`);
@@ -1291,12 +1369,15 @@ router.post(
       );
       owner = c.rows[0];
     }
+    // Confidential storage: the admin just verified the Aadhar — keep only
+    // the last 4 digits + a verified flag, never the full number.
+    const onboardLast4 = /^\d{12}$/.test(cleanAadhar) ? cleanAadhar.slice(-4) : null;
     const rRes = await db.query(
-      `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, verified, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true,'approved') RETURNING *`,
+      `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, aadhar_last4, aadhar_verified, verified, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true,'approved') RETURNING *`,
       [owner.id, String(restaurant_name).trim(), String(address).trim(),
        lat || null, lng || null, cleanPhone,
-       photo_url || null, String(fssai).trim(), cleanAadhar || null]
+       photo_url || null, String(fssai).trim(), null, onboardLast4, !!onboardLast4]
     );
     await seedSuggestedCats(db, rRes.rows[0].id);
     await notify(owner.id, '🎉 Your restaurant is live!',
@@ -1316,7 +1397,7 @@ router.get(
        WHERE image_url IS NULL OR image_url = ''
        ORDER BY created_at DESC`
     );
-    res.json({ restaurants: rows });
+    res.json({ restaurants: rows.map((r) => secure.decryptRow(r, RESTAURANT_SECRET_FIELDS)) });
   })
 );
 
@@ -1863,6 +1944,36 @@ router.put(
     if (!rows[0]) return res.status(404).json({ error: 'Customer not found' });
     await audit(req, blocked ? 'customer_block' : 'customer_unblock', 'customer', req.params.id, { blocked });
     res.json({ ok: true, is_blocked: rows[0].is_blocked });
+  })
+);
+
+// POST /api/admin/migrate/aadhar-scrub — one-time Aadhar minimization for
+// already-approved records. NOT automatic: run ONLY after a verified
+// backup exists (the scrub is irreversible). Idempotent and safe — a
+// record whose Aadhar cannot be read (encrypted, no key) is skipped and
+// reported, never destroyed. Returns a per-record report.
+router.post(
+  '/migrate/aadhar-scrub',
+  ah(async (req, res) => {
+    const report = { restaurants: [], applications: [], riders: [], skipped: [] };
+    const rest = await db.query("SELECT id, name FROM restaurants WHERE status = 'approved' AND aadhar IS NOT NULL");
+    for (const r of rest.rows) {
+      const sc = await scrubRestaurant(r.id);
+      (sc.scrubbed ? report.restaurants : report.skipped).push({ id: r.id, name: r.name, kind: 'restaurant', last4: sc.last4 || null, reason: sc.reason || null });
+    }
+    const apps = await db.query("SELECT id, restaurant_name FROM restaurant_applications WHERE status = 'approved' AND aadhar IS NOT NULL");
+    for (const a of apps.rows) {
+      const sc = await scrubApplication(a.id);
+      (sc.scrubbed ? report.applications : report.skipped).push({ id: a.id, name: a.restaurant_name, kind: 'application', last4: sc.last4 || null, reason: sc.reason || null });
+    }
+    const riders = await db.query("SELECT id FROM riders WHERE status = 'approved' AND (aadhaar_no IS NOT NULL OR aadhaar_photo IS NOT NULL OR aadhaar_front_photo IS NOT NULL OR aadhaar_back_photo IS NOT NULL OR licence_photo IS NOT NULL OR pan_photo IS NOT NULL OR cancelled_cheque_photo IS NOT NULL)");
+    for (const rd of riders.rows) {
+      const sc = await scrubRider(rd.id);
+      const entry = { id: rd.id, kind: 'rider', last4: sc.last4 || null, photosDeleted: !!sc.photosDeleted, reason: sc.reason || sc.skipped || null };
+      (sc.scrubbed || sc.photosDeleted ? report.riders : report.skipped).push(entry);
+    }
+    await audit(req, 'aadhar_scrub_migration', 'system', 'all', { restaurants: report.restaurants.length, applications: report.applications.length, riders: report.riders.length, skipped: report.skipped.length });
+    res.json({ ok: true, ...report });
   })
 );
 

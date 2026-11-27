@@ -213,6 +213,10 @@ async function migrate() {
   await q('ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS staff_name text');
 
   await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_no text');
+  // Confidential storage (2026-11-27): Aadhar is minimized at approval — only
+  // the last 4 digits + a verified flag are kept. See src/lib/secure.js.
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_last4 text');
+  await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_verified boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS aadhaar_photo text');
   await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS profile_photo text');
   await q('ALTER TABLE riders ADD COLUMN IF NOT EXISTS cancelled_deliveries int NOT NULL DEFAULT 0');
@@ -241,7 +245,11 @@ async function migrate() {
   await q('CREATE INDEX IF NOT EXISTS idx_orders_group_code ON orders(group_code)');
   await q('ALTER TABLE order_items ADD COLUMN IF NOT EXISTS person_name text');
   await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS aadhar text');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS aadhar_last4 text');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS aadhar_verified boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar_last4 text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar_verified boolean NOT NULL DEFAULT false');
 
   // Customer memory: preferences, favorites, coupon issuances (survive reinstalls)
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS veg_only boolean NOT NULL DEFAULT false');

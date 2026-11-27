@@ -4,6 +4,7 @@ const express = require('express');
 const db = require('../db');
 const { ah, optionalAuth } = require('../middleware/auth');
 const { normalizeTaxRates } = require('../lib/pricing');
+const secure = require('../lib/secure');
 
 const router = express.Router();
 
@@ -99,7 +100,7 @@ router.post(
          (restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, status`,
       [restaurant_name, owner_name, digits, address || null, lat || null, lng || null,
-       fssai || null, String(aadhar).replace(/\D/g, ''), photo_url]
+       fssai || null, secure.encryptField(String(aadhar).replace(/\D/g, '')), photo_url]
     );
     res.status(201).json({ application: rows[0] });
   })

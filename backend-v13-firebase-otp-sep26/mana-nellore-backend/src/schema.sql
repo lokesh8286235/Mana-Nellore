@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS restaurants (
   image_url text,
   fssai text,
   aadhar text,
+  aadhar_last4 text,
+  aadhar_verified boolean NOT NULL DEFAULT false,
   status text NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','approved','suspended','rejected')),
   is_open boolean NOT NULL DEFAULT true,
@@ -137,6 +139,8 @@ CREATE TABLE IF NOT EXISTS riders (
   vehicle_number text,
   licence_no text,
   aadhaar_no text,
+  aadhaar_last4 text,
+  aadhaar_verified boolean NOT NULL DEFAULT false,
   aadhaar_photo text,
   profile_photo text,
   status text NOT NULL DEFAULT 'pending'
@@ -374,6 +378,8 @@ CREATE TABLE IF NOT EXISTS restaurant_applications (
   fssai text,
   photo_url text NOT NULL,
   aadhar text,
+  aadhar_last4 text,
+  aadhar_verified boolean NOT NULL DEFAULT false,
   status text NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','approved','rejected')),
   admin_note text,

@@ -6,6 +6,10 @@ const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, riderPayoutPaise } = require('../lib/pricing');
 const { dispatchOrder, sweepExpiredOffers, dispatchPendingOrders, clearRiderOffer } = require('../lib/dispatch');
+const secure = require('../lib/secure');
+// Confidential fields encrypted at rest (see src/lib/secure.js). Decrypted
+// only for the rider's own view / the admin's verification view.
+const RIDER_SECRET_FIELDS = ['aadhaar_no', 'licence_no', 'pan_no', 'bank_account', 'ifsc', 'upi_id'];
 const { pushToUser } = require('../lib/fcm');
 
 const router = express.Router();
@@ -76,7 +80,7 @@ router.get(
     const rider = await myRider(req.user.id);
     if (!rider) return res.status(404).json({ error: 'Rider profile not found' });
     const { rows } = await db.query('SELECT id, phone, name FROM users WHERE id = $1', [req.user.id]);
-    res.json({ rider: { ...rider, rating_avg: Number(rider.rating_avg), user: rows[0] } });
+    res.json({ rider: { ...secure.decryptRow(rider, RIDER_SECRET_FIELDS), rating_avg: Number(rider.rating_avg), user: rows[0] } });
   })
 );
 
@@ -112,15 +116,15 @@ router.put(
       [
         vehicle_type || null,
         vehicle_number || null,
-        licence_no || null,
-        aadhaar_no || null,
+        secure.encryptField(licence_no) || null,
+        secure.encryptField(aadhaar_no) || null,
         checkPhoto(aadhaar_photo),
         checkPhoto(profile_photo),
         req.user.id,
       ]
     );
     const uRows = await db.query('SELECT id, phone, name FROM users WHERE id = $1', [req.user.id]);
-    res.json({ rider: { ...rows[0], user: uRows.rows[0] } });
+    res.json({ rider: { ...secure.decryptRow(rows[0], RIDER_SECRET_FIELDS), user: uRows.rows[0] } });
   })
 );
 
@@ -192,27 +196,27 @@ router.put(
         str(b.gender, 20),
         str(b.email, 120),
         str(b.address, 300),
-        b.aadhaar_no ? String(b.aadhaar_no).replace(/\s/g, '') : null,
+        b.aadhaar_no ? secure.encryptField(String(b.aadhaar_no).replace(/\s/g, '')) : null,
         checkPhoto(b.aadhaar_front_photo),
         checkPhoto(b.aadhaar_back_photo),
-        b.pan_no ? String(b.pan_no).replace(/\s/g, '').toUpperCase() : null,
+        b.pan_no ? secure.encryptField(String(b.pan_no).replace(/\s/g, '').toUpperCase()) : null,
         checkPhoto(b.pan_photo),
         checkPhoto(b.profile_photo),
         str(b.vehicle_type, 30),
         str(b.vehicle_number, 20),
-        str(b.licence_no, 30),
+        secure.encryptField(str(b.licence_no, 30)),
         checkPhoto(b.licence_photo),
         checkPhoto(b.rc_photo),
-        str(b.bank_account, 30),
-        b.ifsc ? String(b.ifsc).replace(/\s/g, '').toUpperCase() : null,
+        secure.encryptField(str(b.bank_account, 30)),
+        b.ifsc ? secure.encryptField(String(b.ifsc).replace(/\s/g, '').toUpperCase()) : null,
         checkPhoto(b.cancelled_cheque_photo),
-        str(b.upi_id, 60),
+        secure.encryptField(str(b.upi_id, 60)),
         step,
         completed,
         req.user.id,
       ]
     );
-    res.json({ ok: true, rider: rows[0] || null, step, completed });
+    res.json({ ok: true, rider: rows[0] ? secure.decryptRow(rows[0], RIDER_SECRET_FIELDS) : null, step, completed });
   })
 );
 

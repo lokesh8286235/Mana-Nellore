@@ -776,7 +776,7 @@ router.get(
       detailDist = Math.round(haversineKm(dLat, dLng, Number(restaurant.lat), Number(restaurant.lng)) * 10) / 10;
     }
     // Strip PII/sensitive fields before sending to client
-    const { aadhar, gstin, owner_id, commission_pct, bank_account, ifsc, phone, fssai, fssai_license, ...safeRestaurant } = restaurant;
+    const { aadhar, aadhar_last4, gstin, owner_id, commission_pct, bank_account, ifsc, phone, fssai, fssai_license, ...safeRestaurant } = restaurant;
     res.json({
       restaurant: { ...safeRestaurant, rating_avg: Number(restaurant.rating_avg), is_open: isOpenNow(restaurant),
         verified: !!restaurant.verified, distance_km: detailDist,
