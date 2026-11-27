@@ -1523,15 +1523,17 @@ router.get(
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
     const { rows } = await db.query(
-      `SELECT r.id, r.name,
+      `SELECT r.id, u.name,
               COUNT(o.id)::int AS trips,
-              COALESCE(SUM(o.rider_payout_paise), 0)::int AS earned_paise
+              COALESCE(SUM(rp.amount_paise), 0)::int AS earned_paise
        FROM riders r
+       JOIN users u ON u.id = r.user_id
        LEFT JOIN orders o ON o.rider_id = r.id
          AND o.status = 'delivered'
          AND o.delivered_at > now() - interval '7 days'
-       WHERE r.active = true
-       GROUP BY r.id, r.name
+       LEFT JOIN rider_payouts rp ON rp.order_id = o.id
+       WHERE r.status = 'approved'
+       GROUP BY r.id, u.name
        HAVING COUNT(o.id) > 0
        ORDER BY earned_paise DESC
        LIMIT 10`
