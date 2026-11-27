@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS restaurants (
   chef_story text,
   gstin text,
   birthday_dessert boolean NOT NULL DEFAULT false,
+  cuisines text[] NOT NULL DEFAULT '{}',
+  is_pure_veg boolean NOT NULL DEFAULT false,
+  late_cancels int NOT NULL DEFAULT 0,
+  scheduling_suspended boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -190,7 +194,8 @@ CREATE TABLE IF NOT EXISTS orders (
   offered_to_rider_id uuid REFERENCES riders(id) ON DELETE SET NULL,
   offer_expires_at timestamptz,
   offer_history uuid[] NOT NULL DEFAULT '{}',
-  dispatch_attempted_at timestamptz
+  dispatch_attempted_at timestamptz,
+  group_code text
 );
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_restaurant ON orders(restaurant_id);
@@ -206,7 +211,8 @@ CREATE TABLE IF NOT EXISTS order_items (
   name_snapshot text NOT NULL,
   unit_price_paise int NOT NULL,
   qty int NOT NULL CHECK (qty > 0),
-  instructions text
+  instructions text,
+  person_name text
 );
 CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
 

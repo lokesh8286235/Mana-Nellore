@@ -129,7 +129,8 @@ async function validateItems(dbClient, menuById, items) {
       name_snapshot: m.name + (custNames.length ? ' (' + custNames.join(', ') + ')' : ''),
       unit_price_paise: m.price_paise + custExtra,
       qty,
-      instructions: it.instructions || null
+      instructions: it.instructions || null,
+      person_name: (it.person_name ? String(it.person_name).trim().slice(0, 50) : null) || null
     });
   }
   return { subtotal, snapshots };
@@ -420,7 +421,7 @@ router.post(
 async function placeMultiGroupOrder(req, res) {
   const { groups, address_id, coupon_code, payment_method, lat, lng, delivery_label,
           delivery_note, no_cutlery, tip_paise,
-          recipient_name, recipient_phone } = req.body;
+          recipient_name, recipient_phone, group_code } = req.body;
   const OFF_ROUTE_MSG = "You entered a new address, so the cart restaurants are not on the way and can't be delivered.";
 
   const client = await db.pool.connect();
@@ -508,6 +509,7 @@ async function placeMultiGroupOrder(req, res) {
     // Trip grouping: one trip_id and ONE shared delivery OTP for all orders
     const crypto = require('crypto');
     const tripId = crypto.randomUUID();
+    const groupCode = (typeof group_code === 'string' && group_code.trim()) ? group_code.trim().slice(0, 12) : null;
     const { code: sharedDeliveryOtp, hash: sharedDeliveryOtpHash } = await freshDeliveryOtp();
 
     for (let gi = 0; gi < validGroups.length; gi++) {
@@ -577,23 +579,23 @@ async function placeMultiGroupOrder(req, res) {
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label, trip_id, is_primary)
+            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label, trip_id, is_primary, group_code)
          VALUES ($1,$2,$3,'placed','delivery',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17::jsonb,
-                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
          RETURNING *`,
         [req.user.id, restaurant.id, address_id,
          subtotal, discount, deliveryFee, platformFee,
          tax.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payMethod, JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null, tripId, isPrimary]
+         orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null, tripId, isPrimary, groupCode]
       );
       const order = oRes.rows[0];
       for (const s of snapshots) {
         await client.query(
-          `INSERT INTO order_items (order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
-          [order.id, s.menu_item_id, s.name_snapshot, s.unit_price_paise, s.qty, s.instructions]
+          `INSERT INTO order_items (order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions, person_name)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [order.id, s.menu_item_id, s.name_snapshot, s.unit_price_paise, s.qty, s.instructions, s.person_name]
         );
       }
       const { delivery_otp_hash: _h1, delivery_otp_plain: _p1, ...orderSafe } = order;
@@ -610,7 +612,7 @@ async function placeMultiGroupOrder(req, res) {
       const ownerRes = await client.query('SELECT owner_id FROM restaurants WHERE id = $1', [restaurant.id]);
       if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
         await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
-          `Delivery order worth Rs ${(finalTotal / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
+          `Delivery order worth Rs ${(subtotal / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
         // Push: items total only (restaurants see item prices, never fees).
         pushToUser(ownerRes.rows[0].owner_id, {
           title: `New order #${orderNumber}`,
@@ -709,7 +711,7 @@ router.post(
     }
     const { restaurant_id, address_id, items, coupon_code, payment_method, lat, lng, delivery_label,
             order_type, table_id, delivery_note, no_cutlery, tip_paise,
-            recipient_name, recipient_phone, groups } = req.body;
+            recipient_name, recipient_phone, groups, group_code } = req.body;
     // b848 pickup is chosen on one restaurant page: a multi-restaurant
     // pickup must fail loudly, never silently become a delivery order.
     if (order_type === 'pickup' && Array.isArray(groups) && groups.length > 1) {
@@ -813,6 +815,7 @@ router.post(
       const etaMinutes = Number(config.etaMinutes) || 30;
       const shareToken = require('crypto').randomBytes(6).toString('hex');
       const orderNumber = await newOrderNumber(client);
+      const groupCode = (typeof group_code === 'string' && group_code.trim()) ? group_code.trim().slice(0, 12) : null;
       const { code: deliveryOtp, hash: deliveryOtpHash } = await freshDeliveryOtp();
 
       const oRes = await client.query(
@@ -822,9 +825,9 @@ router.post(
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label)
+            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label, group_code)
          VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
-                 now() + ($20 || ' minutes')::interval, $21, $22, $23, $24, $25, $26, $27)
+                 now() + ($20 || ' minutes')::interval, $21, $22, $23, $24, $25, $26, $27, $28)
          RETURNING *`,
         [req.user.id, restaurant_id, (dineIn || pickup) ? null : address_id, dineIn ? 'dinein' : pickup ? 'pickup' : 'delivery',
          dineIn ? table_id : null,
@@ -832,15 +835,15 @@ router.post(
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payMethod, JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, deliveryOtpHash, deliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null]
+         orderNumber, deliveryOtpHash, deliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null, groupCode]
       );
       const order = oRes.rows[0];
 
       for (const s of snapshots) {
         await client.query(
-          `INSERT INTO order_items (order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
-          [order.id, s.menu_item_id, s.name_snapshot, s.unit_price_paise, s.qty, s.instructions]
+          `INSERT INTO order_items (order_id, menu_item_id, name_snapshot, unit_price_paise, qty, instructions, person_name)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [order.id, s.menu_item_id, s.name_snapshot, s.unit_price_paise, s.qty, s.instructions, s.person_name]
         );
       }
       await client.query('COMMIT');
@@ -848,7 +851,7 @@ router.post(
       const ownerRes = await db.query('SELECT owner_id FROM restaurants WHERE id = $1', [restaurant_id]);
       if (ownerRes.rows[0] && ownerRes.rows[0].owner_id) {
         await notify(ownerRes.rows[0].owner_id, '🔔 New order!',
-          `${dineIn ? 'Dine-in table order' : pickup ? 'Pickup order' : 'Delivery order'} worth Rs ${(order.total_paise / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
+          `${dineIn ? 'Dine-in table order' : pickup ? 'Pickup order' : 'Delivery order'} worth Rs ${(subtotal / 100).toFixed(2)} — the kitchen needs you! 👨‍🍳`);
         // Push: items total only (restaurants see item prices, never fees).
         pushToUser(ownerRes.rows[0].owner_id, {
           title: `New order #${orderNumber}`,
@@ -1122,6 +1125,24 @@ router.post(
         body: `Your order #${order.order_number || order.id} was cancelled.${refundPending ? ' Your refund is being processed.' : ''}`,
         data: { type: 'order_status', status: 'cancelled', order_id: order.id },
       });
+      // Owners learn of the cancel immediately, not only on the next 2.5s poll.
+      try {
+        const ownRes = await db.query(
+          `SELECT r.owner_id, r.name, o.order_number FROM orders o
+           JOIN restaurants r ON r.id = o.restaurant_id WHERE o.id = ANY($1)`,
+          [cancelIds]
+        );
+        for (const ow of ownRes.rows) {
+          if (!ow.owner_id) continue;
+          await notify(ow.owner_id, 'Order cancelled',
+            `Order #${ow.order_number || ''} at ${ow.name} was cancelled by the customer.`);
+          pushToUser(ow.owner_id, {
+            title: 'Order cancelled',
+            body: `Order #${ow.order_number || ''} at ${ow.name} was cancelled by the customer.`,
+            data: { type: 'order_status', status: 'cancelled' },
+          });
+        }
+      } catch (e) { console.error('[cancel] owner notify failed', e.message); }
       res.json({ ok: true, refund_pending: refundPending, cancelled_orders: cancelIds.length });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});

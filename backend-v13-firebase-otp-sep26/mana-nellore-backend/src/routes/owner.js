@@ -139,7 +139,7 @@ router.put(
     if (!id) return;
     const fields = ['name', 'description', 'address', 'lat', 'lng', 'phone', 'image_url', 'fssai',
       'chef_name', 'chef_photo', 'chef_story', 'gstin', 'birthday_dessert',
-      'opens_at', 'closes_at', 'opens_at_we', 'closes_at_we'];
+      'opens_at', 'closes_at', 'opens_at_we', 'closes_at_we', 'cuisines', 'is_pure_veg'];
     const sets = [];
     const params = [];
     for (const f of fields) {
@@ -281,7 +281,7 @@ router.get(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const { rows } = await db.query(
-      `SELECT mi.*,
+      `SELECT mi.*, mi.calories AS calories_kcal,
               COALESCE(dr.avg_rating, 0)::float AS rating_avg,
               COALESCE(dr.rating_count, 0)::int AS rating_count
        FROM menu_items mi
@@ -301,7 +301,7 @@ router.post(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const { category_id, name, description, image_url, price_paise, veg, available, prep_minutes, sort_order,
-      meal_slot, is_combo, allergens } = req.body;
+      meal_slot, is_combo, allergens, calories, calories_kcal, protein_g, protein } = req.body;
     if (!name || price_paise == null) {
       return res.status(400).json({ error: 'Name and price_paise are required' });
     }
@@ -311,16 +311,33 @@ router.post(
       ]);
       if (!c.rows[0]) return res.status(400).json({ error: 'Category does not belong to this restaurant' });
     }
+    // Nutrition (mirrors admin validation): calories 0-5000 int, protein 0-500.
+    let cal = null;
+    const calRaw = calories !== undefined ? calories : calories_kcal;
+    if (calRaw !== undefined && calRaw !== null && calRaw !== '') {
+      cal = parseInt(calRaw, 10);
+      if (!Number.isFinite(cal) || cal < 0 || cal > 5000) {
+        return res.status(400).json({ error: 'Calories must be a whole number 0-5000' });
+      }
+    }
+    let prot = null;
+    const protRaw = protein_g !== undefined ? protein_g : protein;
+    if (protRaw !== undefined && protRaw !== null && protRaw !== '') {
+      prot = parseFloat(protRaw);
+      if (!Number.isFinite(prot) || prot < 0 || prot > 500) {
+        return res.status(400).json({ error: 'Protein must be a number 0-500' });
+      }
+    }
     const { rows } = await db.query(
       `INSERT INTO menu_items
          (restaurant_id, category_id, name, description, image_url, price_paise, veg, available, prep_minutes, sort_order,
-          meal_slot, is_combo, allergens)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) RETURNING *`,
+          meal_slot, is_combo, allergens, calories, protein_g)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15) RETURNING *`,
       [id, category_id || null, name, description || null, image_url || null,
        Math.round(Number(price_paise)), !!veg, available !== false,
        prep_minutes || 20, sort_order || 0,
        normSlots(meal_slot),
-       !!is_combo, JSON.stringify(Array.isArray(allergens) ? allergens : [])]
+       !!is_combo, JSON.stringify(Array.isArray(allergens) ? allergens : []), cal, prot]
     );
     res.status(201).json({ item: rows[0] });
   })
@@ -332,16 +349,38 @@ router.put(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const fields = ['category_id', 'name', 'description', 'image_url', 'price_paise', 'veg', 'available', 'prep_minutes', 'sort_order',
-      'meal_slot', 'is_combo', 'allergens'];
+      'meal_slot', 'is_combo', 'allergens', 'calories', 'calories_kcal', 'protein_g', 'protein'];
     const sets = [];
     const params = [];
     for (const f of fields) {
       if (req.body[f] !== undefined) {
+        // Aliases share one column: plain name wins over the alias.
+        if (f === 'calories_kcal' && req.body.calories !== undefined) continue;
+        if (f === 'protein' && req.body.protein_g !== undefined) continue;
         let v = req.body[f];
+        const col = f === 'calories_kcal' ? 'calories' : (f === 'protein' ? 'protein_g' : f);
         if (f === 'price_paise') v = Math.round(Number(v));
         if (f === 'meal_slot') v = normSlots(v);
+        if (f === 'calories' || f === 'calories_kcal') {
+          if (v === null || v === '') v = null;
+          else {
+            v = parseInt(v, 10);
+            if (!Number.isFinite(v) || v < 0 || v > 5000) {
+              return res.status(400).json({ error: 'Calories must be a whole number 0-5000' });
+            }
+          }
+        }
+        if (f === 'protein_g' || f === 'protein') {
+          if (v === null || v === '') v = null;
+          else {
+            v = parseFloat(v);
+            if (!Number.isFinite(v) || v < 0 || v > 500) {
+              return res.status(400).json({ error: 'Protein must be a number 0-500' });
+            }
+          }
+        }
         params.push(v);
-        sets.push(`${f} = $${params.length}`);
+        sets.push(`${col} = $${params.length}`);
       }
     }
     if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
@@ -443,11 +482,22 @@ function sanitizeOwnerOrder(o) {
   if (!o) return o;
   delete o.delivery_otp_hash;
   delete o.delivery_otp_plain;
+  // Restaurants see item prices only — never the customer bill.
+  delete o.subtotal_paise;
+  delete o.discount_paise;
+  delete o.delivery_fee_paise;
+  delete o.platform_fee_paise;
+  delete o.tax_paise;
+  delete o.commission_paise;
+  delete o.total_paise;
+  delete o.tip_paise;
   return o;
 }
 function orderDetailQuery(where, params) {
   return db.query(
     `SELECT o.*, r.name AS restaurant_name,
+            (SELECT r2.name FROM orders o2 JOIN restaurants r2 ON r2.id = o2.restaurant_id
+              WHERE o2.trip_id = o.trip_id AND o2.is_primary ORDER BY o2.placed_at LIMIT 1) AS trip_primary_name,
             u.name AS customer_name, u.phone AS customer_phone,
             a.line1, a.line2, a.city, a.lat AS addr_lat, a.lng AS addr_lng,
             ru.name AS rider_name, ru.phone AS rider_phone
@@ -527,7 +577,6 @@ router.put(
     if (rule.counterOnly && !['dinein', 'pickup'].includes(order.order_type)) {
       return res.status(409).json({ error: 'Only dine-in and pickup orders can be marked served' });
     }
-
     await transition(order.id, rule.to, 'restaurant_owner');
 
     if (rule.to === 'rejected') {
@@ -687,7 +736,8 @@ router.get(
         const km = haversineKm(Number(x.rider_lat), Number(x.rider_lng), Number(x.rest_lat), Number(x.rest_lng));
         etaMin = Math.max(1, Math.round(km * 3)); // ~20 km/h city average
       }
-      return { order_id: x.order_id, rider_name: x.rider_name, status: x.status, eta_minutes: etaMin };
+      return { order_id: x.order_id, rider_name: x.rider_name, status: x.status, eta_minutes: etaMin,
+               rider_lat: x.rider_lat, rider_lng: x.rider_lng, rest_lat: x.rest_lat, rest_lng: x.rest_lng };
     });
     res.json({ approaching: list });
   })

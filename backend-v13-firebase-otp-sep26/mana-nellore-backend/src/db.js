@@ -85,6 +85,12 @@ async function migrate() {
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS is_coming_soon boolean NOT NULL DEFAULT false');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS opens_at_we time');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS closes_at_we time');
+  // Restaurant QA (2026-11-27): profile fields the app sends but the repo
+  // never created — the live DB has them out-of-band; make the repo reproduce it.
+  await q("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS cuisines text[] NOT NULL DEFAULT '{}'");
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS is_pure_veg boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS late_cancels int NOT NULL DEFAULT 0');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS scheduling_suspended boolean NOT NULL DEFAULT false');
 
   // Menu items: meal slots, combos, allergens
   await q("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS meal_slot text[] NOT NULL DEFAULT '{all}'");
@@ -231,6 +237,9 @@ async function migrate() {
   await q('ALTER TABLE coupons ADD COLUMN IF NOT EXISTS requires_student boolean NOT NULL DEFAULT false');
   // Trip grouping for on-the-way multi-restaurant orders
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS trip_id uuid');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS group_code text');
+  await q('CREATE INDEX IF NOT EXISTS idx_orders_group_code ON orders(group_code)');
+  await q('ALTER TABLE order_items ADD COLUMN IF NOT EXISTS person_name text');
   await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS aadhar text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar text');
 
