@@ -973,10 +973,16 @@ router.get(
     );
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    // The plain delivery OTP is never exposed here — the customer gets it once
-    // in the place response, or re-issues it during delivery.
+    // The delivery OTP is returned to the requesting customer only (this
+    // endpoint already enforces o.customer_id = $2). The place response
+    // returns it once, but the tracking page reloads via this endpoint, so
+    // the code must be readable here too — otherwise the customer has no
+    // way to see the code they must share with the rider at handover.
+    // The hash is never exposed. Pickup orders use pickup_otp instead.
+    const deliveryOtp = order.delivery_otp_plain;
     delete order.delivery_otp_hash;
     delete order.delivery_otp_plain;
+    if (deliveryOtp && order.order_type !== 'pickup') order.delivery_otp = deliveryOtp;
     const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
     // Queue transparency: orders at this restaurant placed before mine, still active
     let queueAhead = 0;
