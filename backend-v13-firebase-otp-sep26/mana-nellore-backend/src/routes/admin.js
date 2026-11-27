@@ -7,10 +7,11 @@ const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
 const crypto = require('crypto');
 const secure = require('../lib/secure');
+const bank = require('../lib/bank');
 // Confidential fields encrypted at rest (see src/lib/secure.js). Decrypted
 // only for the admin's verification view of pending records.
-const RESTAURANT_SECRET_FIELDS = ['aadhar'];
-const APPLICATION_SECRET_FIELDS = ['aadhar'];
+const RESTAURANT_SECRET_FIELDS = ['aadhar', 'bank_account', 'ifsc', 'upi_id'];
+const APPLICATION_SECRET_FIELDS = ['aadhar', 'bank_account', 'ifsc', 'upi_id'];
 const RIDER_SECRET_FIELDS = ['aadhaar_no', 'licence_no', 'pan_no', 'bank_account', 'ifsc', 'upi_id'];
 
 // ---- Confidential-data scrub (approved 2026-11-27) ----
@@ -18,6 +19,10 @@ const RIDER_SECRET_FIELDS = ['aadhaar_no', 'licence_no', 'pan_no', 'bank_account
 // flag, and the document photos are deleted (the approval IS the
 // verification). Idempotent, and NEVER nulls a value it could not read:
 // an encrypted value without a key is skipped + reported, never destroyed.
+// Bank fields are intentionally NOT scrubbed here — settlements need them;
+// only the cancelled cheque photo is deleted, and only when the bank is
+// verified (PUT /api/admin/restaurants/:id/bank, or at approval if the
+// application was already bank-verified).
 async function scrubRestaurant(id) {
   const { rows } = await db.query('SELECT aadhar FROM restaurants WHERE id = $1', [id]);
   const r = rows[0];
@@ -573,6 +578,29 @@ router.put(
         `Your restaurant "${restaurant.name}" is now ${status}.`);
     }
     res.json({ restaurant: secure.decryptRow(restaurant, RESTAURANT_SECRET_FIELDS) });
+  })
+);
+
+// PUT /api/admin/restaurants/:id/bank { bank_verified: boolean }
+// Verifying the bank deletes the cancelled cheque photo (minimize rule —
+// the cheque was only needed to verify the account). Unverifying just
+// clears the flag; the (already deleted) photo is not restored.
+router.put(
+  '/restaurants/:id/bank',
+  ah(async (req, res) => {
+    const verified = req.body.bank_verified;
+    if (typeof verified !== 'boolean') {
+      return res.status(400).json({ error: 'bank_verified must be true or false' });
+    }
+    const { rows } = await db.query(
+      verified
+        ? 'UPDATE restaurants SET bank_verified = true, cancelled_cheque_photo = NULL, updated_at = NOW() WHERE id = $1 RETURNING *'
+        : 'UPDATE restaurants SET bank_verified = false, updated_at = NOW() WHERE id = $1 RETURNING *',
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
+    await audit(req, 'restaurant_bank_verified', 'restaurant', req.params.id, { bank_verified: verified });
+    res.json({ restaurant: secure.decryptRow(rows[0], RESTAURANT_SECRET_FIELDS) });
   })
 );
 
@@ -1267,6 +1295,15 @@ router.get(
   })
 );
 
+// GET /api/admin/encryption-status — proves the DATA_ENC_KEY is live.
+// Returns ONLY { keySet: boolean } — no key material ever leaves the server.
+router.get(
+  '/encryption-status',
+  ah(async (req, res) => {
+    res.json({ keySet: !!secure.getKey() });
+  })
+);
+
 // ---- Restaurant onboarding applications ----
 router.get(
   '/applications',
@@ -1313,12 +1350,20 @@ router.put(
       // digits + a verified flag — never the full number. If the number
       // cannot be read (encrypted, no key yet) the original value is
       // preserved as-is so the migration can scrub it later.
+      // Bank details are NOT scrubbed at approval — settlements need them.
+      // They are copied verbatim (already encrypted with the same key).
+      // If the bank was already verified, the cheque photo is deleted now
+      // (minimize rule); otherwise it is kept until PUT .../bank verifies it.
       const appLast4 = secure.aadharLast4(app.aadhar);
       const rRes = await db.query(
-        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, aadhar_last4, aadhar_verified, verified, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,'approved') RETURNING *`,
+        `INSERT INTO restaurants (owner_id, name, address, lat, lng, image_url, fssai, aadhar, aadhar_last4, aadhar_verified, verified, status,
+           account_holder_name, bank_account, bank_account_last4, ifsc, upi_id, cancelled_cheque_photo, bank_verified)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,'approved',$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
         [owner.id, app.restaurant_name, app.address, app.lat, app.lng, app.photo_url, app.fssai,
-         appLast4 ? null : (app.aadhar || null), appLast4, !!appLast4]
+         appLast4 ? null : (app.aadhar || null), appLast4, !!appLast4,
+         app.account_holder_name || null, app.bank_account || null, app.bank_account_last4 || null,
+         app.ifsc || null, app.upi_id || null,
+         app.bank_verified ? null : (app.cancelled_cheque_photo || null), !!app.bank_verified]
       );
       await scrubApplication(app.id);
       await seedSuggestedCats(db, rRes.rows[0].id);
@@ -1338,7 +1383,8 @@ router.put(
 router.post(
   '/restaurants/onboard',
   ah(async (req, res) => {
-    const { restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url } = req.body || {};
+    const { restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url,
+      account_holder_name, bank_account, ifsc, upi_id, cancelled_cheque_photo } = req.body || {};
     if (!restaurant_name || !String(restaurant_name).trim() ||
         !owner_name || !String(owner_name).trim()) {
       return res.status(400).json({ error: 'Restaurant name and owner name are required' });
@@ -1357,6 +1403,10 @@ router.post(
     if (cleanAadhar && !/^\d{12}$/.test(cleanAadhar)) {
       return res.status(400).json({ error: 'Aadhar must be 12 digits' });
     }
+    // Optional bank details (settlements): validated + encrypted on write.
+    const bankErr = bank.validateBankFields({ bank_account, ifsc, upi_id });
+    if (bankErr) return res.status(400).json({ error: bankErr });
+    const bw = bank.bankWriteValues({ account_holder_name, bank_account, ifsc, upi_id, cancelled_cheque_photo });
     // Find or create the owner's restaurant_owner profile (same phone, own profile)
     let uRes = await db.query(
       "SELECT * FROM users WHERE phone = $1 AND role = 'restaurant_owner'", [cleanPhone]
@@ -1373,11 +1423,14 @@ router.post(
     // the last 4 digits + a verified flag, never the full number.
     const onboardLast4 = /^\d{12}$/.test(cleanAadhar) ? cleanAadhar.slice(-4) : null;
     const rRes = await db.query(
-      `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, aadhar_last4, aadhar_verified, verified, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true,'approved') RETURNING *`,
+      `INSERT INTO restaurants (owner_id, name, address, lat, lng, phone, image_url, fssai, aadhar, aadhar_last4, aadhar_verified, verified, status,
+         account_holder_name, bank_account, bank_account_last4, ifsc, upi_id, cancelled_cheque_photo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true,'approved',$12,$13,$14,$15,$16,$17) RETURNING *`,
       [owner.id, String(restaurant_name).trim(), String(address).trim(),
        lat || null, lng || null, cleanPhone,
-       photo_url || null, String(fssai).trim(), null, onboardLast4, !!onboardLast4]
+       photo_url || null, String(fssai).trim(), null, onboardLast4, !!onboardLast4,
+       bw.account_holder_name, bw.bank_account, bw.bank_account_last4, bw.ifsc, bw.upi_id,
+       bw.cancelled_cheque_photo]
     );
     await seedSuggestedCats(db, rRes.rows[0].id);
     await notify(owner.id, '🎉 Your restaurant is live!',

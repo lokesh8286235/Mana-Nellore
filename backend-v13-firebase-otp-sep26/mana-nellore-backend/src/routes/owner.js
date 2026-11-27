@@ -9,6 +9,7 @@ router.use(authenticate, requireRole('restaurant_owner'));
 
 const { dispatchOrder } = require('../lib/dispatch');
 const { pushToUser } = require('../lib/fcm');
+const bank = require('../lib/bank');
 
 async function ownRestaurantId(userId) {
   const { rows } = await db.query('SELECT id FROM restaurants WHERE owner_id = $1', [userId]);
@@ -105,18 +106,26 @@ router.post(
   ah(async (req, res) => {
     const existing = await ownRestaurantId(req.user.id);
     if (existing) return res.status(409).json({ error: 'Restaurant already registered' });
-    const { name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at, opens_at_we, closes_at_we } = req.body;
+    const { name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at, opens_at_we, closes_at_we,
+      account_holder_name, bank_account, ifsc, upi_id, cancelled_cheque_photo } = req.body;
     if (!name) return res.status(400).json({ error: 'Restaurant name is required' });
+    // Optional bank details (settlements): validated + encrypted on write.
+    const bankErr = bank.validateBankFields({ bank_account, ifsc, upi_id });
+    if (bankErr) return res.status(400).json({ error: bankErr });
+    const bw = bank.bankWriteValues({ account_holder_name, bank_account, ifsc, upi_id, cancelled_cheque_photo });
     const { rows } = await db.query(
       `INSERT INTO restaurants
-         (owner_id, name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at, opens_at_we, closes_at_we)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+         (owner_id, name, description, address, lat, lng, phone, image_url, fssai, opens_at, closes_at, opens_at_we, closes_at_we,
+          account_holder_name, bank_account, bank_account_last4, ifsc, upi_id, cancelled_cheque_photo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
       [req.user.id, name, description || null, address || null, lat || null, lng || null,
        phone || null, image_url || null, fssai || null, opens_at || null, closes_at || null,
-       opens_at_we || null, closes_at_we || null]
+       opens_at_we || null, closes_at_we || null,
+       bw.account_holder_name, bw.bank_account, bw.bank_account_last4, bw.ifsc, bw.upi_id,
+       bw.cancelled_cheque_photo]
     );
     await seedSuggestedCats(db, rows[0].id);
-    res.status(201).json({ restaurant: rows[0] });
+    res.status(201).json({ restaurant: bank.shapeOwnerRestaurant(rows[0]) });
   })
 );
 
@@ -127,7 +136,9 @@ router.get(
     const id = await requireRestaurant(req, res);
     if (!id) return;
     const { rows } = await db.query('SELECT * FROM restaurants WHERE id = $1', [id]);
-    res.json({ restaurant: rows[0] });
+    // Bank account is masked to last-4 only — the full number never leaves
+    // the server toward the owner app (see src/lib/bank.js).
+    res.json({ restaurant: bank.shapeOwnerRestaurant(rows[0]) });
   })
 );
 
@@ -148,13 +159,32 @@ router.put(
         sets.push(`${f} = $${params.length}`);
       }
     }
+    // Bank details: validated + encrypted on write. Setting a new account /
+    // IFSC / UPI resets bank_verified — the new details need re-verification.
+    if (req.body.bank_account !== undefined || req.body.ifsc !== undefined ||
+        req.body.upi_id !== undefined || req.body.account_holder_name !== undefined ||
+        req.body.cancelled_cheque_photo !== undefined) {
+      const bankErr = bank.validateBankFields(req.body);
+      if (bankErr) return res.status(400).json({ error: bankErr });
+      const bw = bank.bankWriteValues(req.body);
+      const bankCols = ['account_holder_name', 'bank_account', 'bank_account_last4', 'ifsc', 'upi_id', 'cancelled_cheque_photo'];
+      for (const c of bankCols) {
+        if (bw[c] !== null) {
+          params.push(bw[c]);
+          sets.push(`${c} = $${params.length}`);
+        }
+      }
+      if (req.body.bank_account !== undefined || req.body.ifsc !== undefined || req.body.upi_id !== undefined) {
+        sets.push('bank_verified = false');
+      }
+    }
     if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
     params.push(id);
     const { rows } = await db.query(
       `UPDATE restaurants SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`,
       params
     );
-    res.json({ restaurant: rows[0] });
+    res.json({ restaurant: bank.shapeOwnerRestaurant(rows[0]) });
   })
 );
 

@@ -14,6 +14,12 @@
 //   record. When payouts start, the payout provider holds account numbers;
 //   we keep only a beneficiary reference ID. The legacy rider bank columns
 //   are encrypted, not extended; no new bank columns are added.
+//   REVERSAL (2026-11-27, user-directed, RESTAURANT OWNERS ONLY): restaurant
+//   owners' bank details ARE now stored (restaurants + restaurant_applications
+//   bank_account/ifsc/upi_id, encrypted with this same mechanism, plus plain
+//   account_holder_name / bank_account_last4 / cancelled_cheque_photo and a
+//   bank_verified flag) because settlements need the account on file. The
+//   rider rule above is unchanged. See src/lib/bank.js.
 // - MINIMIZE: Aadhar is verified once, then only the last 4 digits + a
 //   verified flag are kept; the full number and the Aadhar photo are deleted
 //   at approval time. Same for the licence photo (deleted after verification).

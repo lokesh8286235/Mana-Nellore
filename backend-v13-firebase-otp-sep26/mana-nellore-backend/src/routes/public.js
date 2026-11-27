@@ -5,6 +5,7 @@ const db = require('../db');
 const { ah, optionalAuth } = require('../middleware/auth');
 const { normalizeTaxRates } = require('../lib/pricing');
 const secure = require('../lib/secure');
+const bank = require('../lib/bank');
 
 const router = express.Router();
 
@@ -53,7 +54,8 @@ router.get(
 router.post(
   '/applications',
   ah(async (req, res) => {
-    const { restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url } = req.body || {};
+    const { restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url,
+      account_holder_name, bank_account, ifsc, upi_id, cancelled_cheque_photo } = req.body || {};
     if (!restaurant_name || !owner_name || !phone) {
       return res.status(400).json({ error: 'Restaurant name, owner name and phone are required' });
     }
@@ -95,12 +97,19 @@ router.post(
     if (!photo_url) {
       return res.status(400).json({ error: 'A restaurant photo is required to apply' });
     }
+    // Optional bank details (settlements): validated + encrypted on write.
+    const bankErr = bank.validateBankFields({ bank_account, ifsc, upi_id });
+    if (bankErr) return res.status(400).json({ error: bankErr });
+    const bw = bank.bankWriteValues({ account_holder_name, bank_account, ifsc, upi_id, cancelled_cheque_photo });
     const { rows } = await db.query(
       `INSERT INTO restaurant_applications
-         (restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, status`,
+         (restaurant_name, owner_name, phone, address, lat, lng, fssai, aadhar, photo_url,
+          account_holder_name, bank_account, bank_account_last4, ifsc, upi_id, cancelled_cheque_photo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id, status`,
       [restaurant_name, owner_name, digits, address || null, lat || null, lng || null,
-       fssai || null, secure.encryptField(String(aadhar).replace(/\D/g, '')), photo_url]
+       fssai || null, secure.encryptField(String(aadhar).replace(/\D/g, '')), photo_url,
+       bw.account_holder_name, bw.bank_account, bw.bank_account_last4, bw.ifsc, bw.upi_id,
+       bw.cancelled_cheque_photo]
     );
     res.status(201).json({ application: rows[0] });
   })

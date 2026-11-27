@@ -250,6 +250,24 @@ async function migrate() {
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar_last4 text');
   await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS aadhar_verified boolean NOT NULL DEFAULT false');
+  // Restaurant-owner bank details (2026-11-27, user-directed reversal of the
+  // "never store bank details" rule — owners only, for settlements).
+  // bank_account/ifsc/upi_id are encrypted at rest via src/lib/secure.js;
+  // account_holder_name and cancelled_cheque_photo are plain; see src/lib/bank.js.
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS account_holder_name text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS bank_account text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS bank_account_last4 text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS ifsc text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS upi_id text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS cancelled_cheque_photo text');
+  await q('ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS bank_verified boolean NOT NULL DEFAULT false');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS account_holder_name text');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS bank_account text');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS bank_account_last4 text');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS ifsc text');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS upi_id text');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS cancelled_cheque_photo text');
+  await q('ALTER TABLE restaurant_applications ADD COLUMN IF NOT EXISTS bank_verified boolean NOT NULL DEFAULT false');
 
   // Customer memory: preferences, favorites, coupon issuances (survive reinstalls)
   await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS veg_only boolean NOT NULL DEFAULT false');
