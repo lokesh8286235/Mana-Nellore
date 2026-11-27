@@ -1556,7 +1556,7 @@ router.get(
       [rider.id, from.toISOString(), to.toISOString()]
     );
     const list = await db.query(
-      `SELECT rp.*, o.total_paise AS order_total
+      `SELECT rp.*, o.total_paise AS order_total, o.order_number AS order_number
        FROM rider_payouts rp JOIN orders o ON o.id = rp.order_id
        WHERE rp.rider_id = $1 AND rp.created_at BETWEEN $2 AND $3
        ORDER BY rp.created_at DESC`,
