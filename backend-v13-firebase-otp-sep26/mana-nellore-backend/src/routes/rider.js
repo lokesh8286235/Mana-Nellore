@@ -4,7 +4,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireRole, ah } = require('../middleware/auth');
-const { haversineKm, loadPricingConfig, riderPayoutPaise } = require('../lib/pricing');
+const { haversineKm, loadPricingConfig, riderPayoutPaise, tripPayoutPaise } = require('../lib/pricing');
 const { dispatchOrder, sweepExpiredOffers, dispatchPendingOrders, clearRiderOffer } = require('../lib/dispatch');
 const secure = require('../lib/secure');
 // Confidential fields encrypted at rest (see src/lib/secure.js). Decrypted
@@ -401,6 +401,25 @@ router.get(
       [rider.id]
     );
     const config = await loadPricingConfig(db);
+    // Group rows by trip so a multi-order trip's route is measured once
+    // (single orders have no trip_id and form their own group). Live trip
+    // payout for orders whose place-time value was never stored.
+    const tripGroups = new Map();
+    rows.forEach((o) => {
+      const key = o.trip_id || `single:${o.id}`;
+      if (!tripGroups.has(key)) tripGroups.set(key, []);
+      tripGroups.get(key).push(o);
+    });
+    const livePayoutById = new Map();
+    for (const group of tripGroups.values()) {
+      if (group.some((o) => o.trip_payout_paise != null)) continue;
+      const first = group[0];
+      const live = tripPayoutForRoute(
+        group.map((o) => ({ is_primary: !!o.is_primary, lat: o.rest_lat, lng: o.rest_lng })),
+        first.addr_lat, first.addr_lng, config
+      );
+      if (live) group.forEach((o) => livePayoutById.set(o.id, live));
+    }
     const list = rows.map((o) => {
       let distanceKm = null;
       let payout = null;
@@ -409,10 +428,13 @@ router.get(
       if (o.trip_payout_paise != null) {
         payout = o.trip_payout_paise;
         distanceKm = o.trip_distance_km != null ? Number(o.trip_distance_km) : null;
-      } else if (o.rest_lat != null && o.rest_lng != null && o.addr_lat != null && o.addr_lng != null) {
-        // Fallback: legacy per-order calculation for old orders without trip payout
-        distanceKm = haversineKm(o.rest_lat, o.rest_lng, o.addr_lat, o.addr_lng);
-        payout = riderPayoutPaise(config.riderPayout, distanceKm);
+      } else if (livePayoutById.has(o.id)) {
+        // Fallback: live trip payout for orders placed before trip payout was
+        // stored (single-restaurant orders never get one at place time).
+        // Same Rs 20-base rule — never the legacy distance-only formula.
+        const live = livePayoutById.get(o.id);
+        payout = live.payout_paise;
+        distanceKm = live.total_km;
       }
       // Rider-to-restaurant distance drives nearest-first sorting
       if (rider.lat != null && rider.lng != null && o.rest_lat != null && o.rest_lng != null) {
@@ -1326,6 +1348,38 @@ router.put(
   })
 );
 
+// Trip payout (user 2026-10-15, FINAL): Rs 20 base (first 2 km) + Rs 8/km
+// beyond + Rs 5 per intermediate stop. Measured on the trip route:
+// primary restaurant -> secondaries (nearest-first from primary) -> customer.
+// Pure function: stops are { is_primary, lat, lng }, addrLat/addrLng the
+// customer's delivery coordinates. Returns null when the route cannot be
+// measured from real coordinates — never invent a payout.
+// { payout_paise, total_km, intermediate_stops, breakdown }
+function tripPayoutForRoute(stops, addrLat, addrLng, config) {
+  const withCoords = stops.filter((s) => s.lat != null && s.lng != null);
+  if (!withCoords.length || addrLat == null || addrLng == null) return null;
+  const primary = withCoords.find((s) => s.is_primary) || withCoords[0];
+  const secondaries = withCoords.filter((s) => s !== primary);
+  secondaries.sort((x, y) =>
+    haversineKm(primary.lat, primary.lng, x.lat, x.lng) -
+    haversineKm(primary.lat, primary.lng, y.lat, y.lng));
+  const route = [primary, ...secondaries];
+  let totalKm = 0;
+  let prevLat = route[0].lat, prevLng = route[0].lng;
+  for (let i = 1; i < route.length; i++) {
+    totalKm += haversineKm(prevLat, prevLng, route[i].lat, route[i].lng);
+    prevLat = route[i].lat; prevLng = route[i].lng;
+  }
+  totalKm += haversineKm(prevLat, prevLng, Number(addrLat), Number(addrLng));
+  const result = tripPayoutPaise(config.tripPayout, totalKm, secondaries.length);
+  return {
+    payout_paise: result.payout_paise,
+    total_km: Math.round(totalKm * 100) / 100,
+    intermediate_stops: secondaries.length,
+    breakdown: result.breakdown
+  };
+}
+
 // POST /api/rider/deliveries/:id/complete { otp }
 router.post(
   '/deliveries/:id/complete',
@@ -1343,20 +1397,41 @@ router.post(
       return res.status(400).json({ error: 'Invalid delivery OTP' });
     }
 
-    // Compute payout from live pricing config
-    const loc = await db.query(
-      `SELECT r.lat AS rest_lat, r.lng AS rest_lng, COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng
-       FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
-       LEFT JOIN addresses a ON a.id = o.address_id WHERE o.id = $1`,
-      [order.id]
-    );
-    const l = loc.rows[0];
+    // Payout — trip formula (user 2026-10-15, FINAL): Rs 20 base (first 2 km)
+    // + Rs 8/km beyond + Rs 5 per intermediate stop. Prefer the trip payout
+    // stored at place time; otherwise compute it live from the trip route.
+    // Never invent a payout when the route cannot be measured.
     const config = await loadPricingConfig(db);
     let distanceKm = null;
     let payout = null; // No hardcoded fallback: null when locations unknown
-    if (l.rest_lat != null && l.rest_lng != null && l.addr_lat != null && l.addr_lng != null) {
-      distanceKm = haversineKm(l.rest_lat, l.rest_lng, l.addr_lat, l.addr_lng);
-      payout = riderPayoutPaise(config.riderPayout, distanceKm);
+    let tripComputed = null;
+    if (order.trip_payout_paise != null) {
+      payout = Number(order.trip_payout_paise);
+      distanceKm = order.trip_distance_km != null ? Number(order.trip_distance_km) : null;
+    } else {
+      const tripRows = (await db.query(
+        order.trip_id
+          ? `SELECT o.is_primary, r.lat, r.lng,
+                    COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng
+             FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
+             LEFT JOIN addresses a ON a.id = o.address_id WHERE o.trip_id = $1`
+          : `SELECT o.is_primary, r.lat, r.lng,
+                    COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng
+             FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
+             LEFT JOIN addresses a ON a.id = o.address_id WHERE o.id = $1`,
+        [order.trip_id || order.id]
+      )).rows;
+      const first = tripRows[0];
+      if (first) {
+        tripComputed = tripPayoutForRoute(
+          tripRows.map((r) => ({ is_primary: !!r.is_primary, lat: r.lat, lng: r.lng })),
+          first.addr_lat, first.addr_lng, config
+        );
+      }
+      if (tripComputed) {
+        payout = tripComputed.payout_paise;
+        distanceKm = tripComputed.total_km;
+      }
     }
 
     // COD: validate cash collection BEFORE any mutation — a failed confirmation
@@ -1383,6 +1458,22 @@ router.post(
          VALUES ($1, $2, $3, $4) ON CONFLICT (order_id) DO NOTHING`,
         [rider.id, order.id, payout, distanceKm]
       );
+      // Backfill the trip payout onto the order(s) so the offer list, detail
+      // and earnings all read the same Rs 20-base value. Only when computed
+      // live here — place-time values are already stored.
+      if (tripComputed) {
+        await db.query(
+          order.trip_id
+            ? `UPDATE orders SET trip_payout_paise = $1, trip_distance_km = $2,
+               trip_intermediate_stops = $3, trip_payout_breakdown = $4::jsonb
+               WHERE trip_id = $5`
+            : `UPDATE orders SET trip_payout_paise = $1, trip_distance_km = $2,
+               trip_intermediate_stops = $3, trip_payout_breakdown = $4::jsonb
+               WHERE id = $5`,
+          [tripComputed.payout_paise, tripComputed.total_km, tripComputed.intermediate_stops,
+           JSON.stringify(tripComputed.breakdown), order.trip_id || order.id]
+        );
+      }
     } else {
       console.warn(`[payout] Skipped payout for order ${order.id}: location unknown, no payout recorded`);
     }
