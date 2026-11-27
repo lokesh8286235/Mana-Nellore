@@ -577,6 +577,19 @@ router.put(
     if (rule.counterOnly && !['dinein', 'pickup'].includes(order.order_type)) {
       return res.status(409).json({ error: 'Only dine-in and pickup orders can be marked served' });
     }
+    // Pickup handover: the customer shows a 4-digit code; verify it like the
+    // rider pickup OTP (rider.js) — a bare tap must never mark it collected.
+    // Dine-in has no code, so it stays a bare tap.
+    if (req.params.action === 'served' && order.order_type === 'pickup') {
+      const code = String(req.body.pickup_otp || '').trim();
+      if (!/^\d{4}$/.test(code)) {
+        return res.status(400).json({ error: 'Enter the 4-digit pickup code from the customer' });
+      }
+      if (!order.pickup_otp || code !== String(order.pickup_otp)) {
+        return res.status(400).json({ error: 'Wrong pickup code. Ask the customer for the correct code.' });
+      }
+    }
+
     await transition(order.id, rule.to, 'restaurant_owner');
 
     if (rule.to === 'rejected') {
