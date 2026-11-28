@@ -18,6 +18,24 @@ async function notify(userId, title, body) {
   ]);
 }
 
+// Customer snapshot (2026-11-27): freeze the ordering customer's name,
+// phone and delivery address onto the order at placement. Account deletion
+// anonymizes the live columns (recipient_*, delivery_*) but never touches
+// these three, so the restaurant / rider / admin still know who ordered.
+// `addressRow` may be null (dine-in/pickup); `pinLabel` is the confirmed
+// pin label when the customer dragged the pin. Order-for-someone-else
+// (recipient_name/phone) snapshots the recipient, not the account holder.
+async function customerSnapshot(dbClient, userId, addressRow, pinLabel, recipientName, recipientPhone) {
+  const u = await dbClient.query('SELECT name, phone FROM users WHERE id = $1', [userId]);
+  const name = (recipientName && String(recipientName).trim()) || (u.rows[0] && u.rows[0].name) || null;
+  const phone = (recipientPhone && String(recipientPhone).trim()) || (u.rows[0] && u.rows[0].phone) || null;
+  let addr = pinLabel && String(pinLabel).trim() ? String(pinLabel).trim() : null;
+  if (!addr && addressRow) {
+    addr = [addressRow.line1, addressRow.line2, addressRow.city].filter(Boolean).join(', ') || null;
+  }
+  return { name, phone, address: addr };
+}
+
 async function transition(orderId, status, by) {
   const { rows } = await db.query('SELECT timeline FROM orders WHERE id = $1', [orderId]);
   const timeline = rows[0].timeline || [];
@@ -363,6 +381,7 @@ router.post(
             restaurant_id: rid,
             is_primary: isPrim,
             on_the_way: onTheWay,
+            distance_km: gDist == null ? null : Math.round(gDist * 100) / 100,
             subtotal_paise: gSub,
             normal_fee_paise: gQuote.deliveryFeePaise,
             delivery_fee_paise: secFee,
@@ -511,6 +530,8 @@ async function placeMultiGroupOrder(req, res) {
     const tripId = crypto.randomUUID();
     const groupCode = (typeof group_code === 'string' && group_code.trim()) ? group_code.trim().slice(0, 12) : null;
     const { code: sharedDeliveryOtp, hash: sharedDeliveryOtpHash } = await freshDeliveryOtp();
+    // Customer snapshot (2026-11-27): same snapshot on every order in the trip.
+    const snap = await customerSnapshot(client, req.user.id, address, pinValid ? delivery_label : null, recipient_name, recipient_phone);
 
     for (let gi = 0; gi < validGroups.length; gi++) {
       const g = validGroups[gi];
@@ -579,16 +600,18 @@ async function placeMultiGroupOrder(req, res) {
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label, trip_id, is_primary, group_code)
+            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label, trip_id, is_primary, group_code,
+            customer_name, customer_phone, customer_address)
          VALUES ($1,$2,$3,'placed','delivery',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17::jsonb,
-                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+                 now() + ($18 || ' minutes')::interval, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
          RETURNING *`,
         [req.user.id, restaurant.id, address_id,
          subtotal, discount, deliveryFee, platformFee,
          tax.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payMethod, JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null, tripId, isPrimary, groupCode]
+         orderNumber, sharedDeliveryOtpHash, sharedDeliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null, tripId, isPrimary, groupCode,
+         snap.name, snap.phone, snap.address]
       );
       const order = oRes.rows[0];
       for (const s of snapshots) {
@@ -817,6 +840,8 @@ router.post(
       const orderNumber = await newOrderNumber(client);
       const groupCode = (typeof group_code === 'string' && group_code.trim()) ? group_code.trim().slice(0, 12) : null;
       const { code: deliveryOtp, hash: deliveryOtpHash } = await freshDeliveryOtp();
+      // Customer snapshot (2026-11-27): frozen at placement (see helper above).
+      const snap = await customerSnapshot(client, req.user.id, address, pinValid ? delivery_label : null, recipient_name, recipient_phone);
 
       const oRes = await client.query(
         `INSERT INTO orders
@@ -825,9 +850,10 @@ router.post(
             tax_paise, commission_paise, total_paise, tip_paise,
             delivery_note, no_cutlery, recipient_name, recipient_phone,
             payment_method, payment_status, timeline, eta_at, share_token,
-            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label, group_code)
+            order_number, delivery_otp_hash, delivery_otp_plain, delivery_lat, delivery_lng, delivery_label, group_code,
+            customer_name, customer_phone, customer_address)
          VALUES ($1,$2,$3,'placed',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending',$19::jsonb,
-                 now() + ($20 || ' minutes')::interval, $21, $22, $23, $24, $25, $26, $27, $28)
+                 now() + ($20 || ' minutes')::interval, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
          RETURNING *`,
         [req.user.id, restaurant_id, (dineIn || pickup) ? null : address_id, dineIn ? 'dinein' : pickup ? 'pickup' : 'delivery',
          dineIn ? table_id : null,
@@ -835,7 +861,8 @@ router.post(
          quote.taxPaise, quote.commissionPaise, finalTotal, tipPaise,
          delivery_note || null, !!no_cutlery, recipient_name || null, recipient_phone || null,
          payMethod, JSON.stringify(timeline), String(etaMinutes), shareToken,
-         orderNumber, deliveryOtpHash, deliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null, groupCode]
+         orderNumber, deliveryOtpHash, deliveryOtp, pinValid ? pinLat : null, pinValid ? pinLng : null, pinValid ? (delivery_label || null) : null, groupCode,
+         snap.name, snap.phone, snap.address]
       );
       const order = oRes.rows[0];
 

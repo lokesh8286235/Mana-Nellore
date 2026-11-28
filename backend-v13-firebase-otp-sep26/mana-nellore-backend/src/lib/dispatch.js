@@ -21,7 +21,7 @@
 // first-tap-wins guard, plus an offer-membership check.
 
 const db = require('../db');
-const { haversineKm } = require('./pricing');
+const { haversineKm, loadPricingConfig } = require('./pricing');
 const { pushToUser } = require('./fcm');
 
 const OFFER_WINDOW_SEC = 30;   // how long one rider holds the offer
@@ -241,10 +241,61 @@ async function sweepExpiredOffers() {
   return rows.length;
 }
 
+// Ready-order expiry (2026-11-27, mechanism only): a ready, unassigned
+// delivery order that no rider takes within the configured window is
+// cancelled so the customer is not left hanging and the kitchen does not
+// hold food forever. The threshold comes from pricing_config
+// 'ready_order_expiry_minutes'; NULL/absent = DISABLED (no expiry) — the
+// threshold is the user's call, never guessed here. Ready time is packed_at
+// (set the moment the kitchen taps Ready). Orders holding a live offer are
+// spared until the offer lapses, so a rider about to accept is never cut off.
+async function sweepExpiredReadyOrders() {
+  await ensureDispatchSchema();
+  let minutes = null;
+  try {
+    const cfg = await loadPricingConfig(db);
+    minutes = cfg.readyOrderExpiryMinutes;
+  } catch (e) { console.error('[dispatch] ready-expiry config load failed', e.message); return 0; }
+  if (minutes == null || !Number.isFinite(minutes) || minutes <= 0) return 0; // disabled
+  const mins = Math.floor(minutes);
+  const { rows } = await db.query(
+    `UPDATE orders SET status = 'cancelled', cancel_reason = 'No rider available — order expired',
+       offered_to_rider_id = NULL, offer_expires_at = NULL, offer_history = '{}'
+     WHERE rider_id IS NULL AND status = 'ready' AND order_type = 'delivery'
+       AND packed_at IS NOT NULL AND packed_at < now() - ($1 || ' minutes')::interval
+       AND (offered_to_rider_id IS NULL OR offer_expires_at < now())
+     RETURNING id, customer_id, restaurant_id, order_number`,
+    [mins]
+  );
+  for (const o of rows) {
+    // Timeline stamp + notify both sides; best-effort, never breaks dispatch.
+    try {
+      const t = await db.query('SELECT timeline FROM orders WHERE id = $1', [o.id]);
+      const timeline = (t.rows[0] && t.rows[0].timeline) || [];
+      timeline.push({ status: 'cancelled', at: new Date().toISOString(), by: 'system', reason: 'ready_order_expired' });
+      await db.query('UPDATE orders SET timeline = $1::jsonb WHERE id = $2', [JSON.stringify(timeline), o.id]);
+    } catch (e) { console.error('[dispatch] ready-expiry timeline failed', o.id, e.message); }
+    try {
+      await notifyUser(o.customer_id, 'Order cancelled',
+        `Your order #${o.order_number || o.id} was cancelled — no rider was available in time. Please try again.`);
+      const own = await db.query('SELECT owner_id, name FROM restaurants WHERE id = $1', [o.restaurant_id]);
+      if (own.rows[0] && own.rows[0].owner_id) {
+        await notifyUser(own.rows[0].owner_id, 'Order expired',
+          `Order #${o.order_number || o.id} expired unassigned after ${mins} minutes without a rider.`);
+      }
+    } catch (e) { console.error('[dispatch] ready-expiry notify failed', o.id, e.message); }
+  }
+  if (rows.length) console.log(`[dispatch] expired ${rows.length} ready order(s) older than ${mins}m`);
+  return rows.length;
+}
+
 // Dispatch ready orders that have never been offered (or whose retry throttle elapsed).
 // force=true ignores the throttle (e.g. rider just came online).
 async function dispatchPendingOrders(force) {
   await ensureDispatchSchema();
+  // Ready-order expiry runs on every dispatch pass (rider poll / rider
+  // online) — disabled (0 rows) until a threshold is configured.
+  try { await sweepExpiredReadyOrders(); } catch (e) { console.error('[dispatch] ready-expiry sweep failed', e.message); }
   const { rows } = await db.query(
     `SELECT id FROM orders
      WHERE rider_id IS NULL AND status = 'ready' AND order_type = 'delivery'
@@ -274,6 +325,7 @@ module.exports = {
   ensureDispatchSchema,
   dispatchOrder,
   sweepExpiredOffers,
+  sweepExpiredReadyOrders,
   dispatchPendingOrders,
   clearRiderOffer,
   rankRiders, // exported for tests (dispatch ranking unit test)

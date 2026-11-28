@@ -68,6 +68,19 @@ async function loadPricingConfig(db) {
     // Accepts both food_pct and food_gst_pct namings (the live row predates this
     // change and uses *_gst_pct); always normalized to food/delivery/platform_pct.
     taxRates: normalizeTaxRates(m.tax_rates),
+    // Offer quality thresholds (Rs/km) the rider app shows on offers:
+    // payout/km >= good = "good offer", >= ok = "ok offer". Admin-editable
+    // via pricing_config keys 'offer_good_per_km' / 'offer_ok_per_km'.
+    offerGoodPerKm: m.offer_good_per_km != null ? Number(m.offer_good_per_km) : 15,
+    offerOkPerKm: m.offer_ok_per_km != null ? Number(m.offer_ok_per_km) : 10,
+    // Ready-order expiry (minutes a ready, unassigned delivery order may sit
+    // before it is cancelled). NULL = DISABLED (no expiry) until the owner
+    // sets a value — the threshold is the user's call, never guessed here.
+    readyOrderExpiryMinutes: m.ready_order_expiry_minutes != null
+      ? Number(m.ready_order_expiry_minutes) : null,
+    // Dish-ratings aggregate visibility for customers. false = the customer
+    // aggregate endpoint stays 403 (gated) until the owner opens it.
+    dishRatingsCustomerVisible: m.dish_ratings_customer_visible === true,
   };
 }
 

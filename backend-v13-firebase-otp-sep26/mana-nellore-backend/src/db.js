@@ -187,6 +187,13 @@ async function migrate() {
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS tip_paise int NOT NULL DEFAULT 0');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_name text');
   await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_phone text');
+  // Customer snapshot (2026-11-27): name/phone/address frozen onto the order
+  // at placement, so a later account deletion (which anonymizes the live
+  // columns) can never erase who ordered. The deletion flow deliberately
+  // leaves these three columns alone.
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_name text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_phone text');
+  await q('ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_address text');
   // COD 'collected' status
   await q('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_status_check');
   await q(`ALTER TABLE orders ADD CONSTRAINT orders_payment_status_check
@@ -417,7 +424,15 @@ function defaultPricingRows() {
     platform_fee_paise: 700, // Rs 7
     default_commission_pct: 12,
     eta_minutes: 30,              // Honest ETA estimate shown to customers (not a guarantee)
-    call_to_order_phone: ''       // support / phone-order line shown in the customer app
+    call_to_order_phone: '',       // support / phone-order line shown in the customer app
+    // Offer quality thresholds (Rs/km) for the rider app offer cards.
+    offer_good_per_km: 15,
+    offer_ok_per_km: 10,
+    // Ready-order expiry (minutes). NULL = DISABLED — no expiry until the
+    // owner sets a value; the threshold is the user's call, never guessed.
+    ready_order_expiry_minutes: null,
+    // Dish-ratings aggregate visibility for customers. false = gated (403).
+    dish_ratings_customer_visible: false
   };
 }
 

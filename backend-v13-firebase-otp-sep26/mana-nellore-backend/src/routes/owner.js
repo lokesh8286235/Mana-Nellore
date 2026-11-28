@@ -161,17 +161,36 @@ router.put(
     }
     // Bank details: validated + encrypted on write. Setting a new account /
     // IFSC / UPI resets bank_verified — the new details need re-verification.
+    // EXPLICIT-CLEAR semantics (2026-11-27): a bank field PRESENT in the
+    // body with an empty value CLEARS the stored column (sets NULL); an
+    // absent field is untouched. The old code skipped null write-values, so
+    // clearing a saved field silently kept it — the fake test details on
+    // Test Kitchen could not be removed from the app at all.
     if (req.body.bank_account !== undefined || req.body.ifsc !== undefined ||
         req.body.upi_id !== undefined || req.body.account_holder_name !== undefined ||
         req.body.cancelled_cheque_photo !== undefined) {
       const bankErr = bank.validateBankFields(req.body);
       if (bankErr) return res.status(400).json({ error: bankErr });
       const bw = bank.bankWriteValues(req.body);
-      const bankCols = ['account_holder_name', 'bank_account', 'bank_account_last4', 'ifsc', 'upi_id', 'cancelled_cheque_photo'];
-      for (const c of bankCols) {
-        if (bw[c] !== null) {
-          params.push(bw[c]);
-          sets.push(`${c} = $${params.length}`);
+      // body field -> stored columns (bank_account also drives last4).
+      const bankColFor = {
+        account_holder_name: ['account_holder_name'],
+        bank_account: ['bank_account', 'bank_account_last4'],
+        ifsc: ['ifsc'],
+        upi_id: ['upi_id'],
+        cancelled_cheque_photo: ['cancelled_cheque_photo'],
+      };
+      for (const [bodyField, cols] of Object.entries(bankColFor)) {
+        if (req.body[bodyField] === undefined) continue;
+        const cleared = req.body[bodyField] === null || req.body[bodyField] === '';
+        for (const c of cols) {
+          if (cleared) {
+            params.push(null);
+            sets.push(`${c} = $${params.length}`);
+          } else if (bw[c] !== null) {
+            params.push(bw[c]);
+            sets.push(`${c} = $${params.length}`);
+          }
         }
       }
       if (req.body.bank_account !== undefined || req.body.ifsc !== undefined || req.body.upi_id !== undefined) {
@@ -506,6 +525,73 @@ router.delete(
   })
 );
 
+// PUT /api/owner/menu/customizations/:groupId — edit a customisation group
+// (name / required / max_select). When `options` is provided it REPLACES
+// the group's options wholesale (delete + insert in the given order) so the
+// restaurant app can edit a group in one call instead of delete + recreate.
+router.put(
+  '/menu/customizations/:groupId',
+  ah(async (req, res) => {
+    const id = await requireRestaurant(req, res);
+    if (!id) return;
+    const { name, required, max_select, options } = req.body || {};
+    const gRes = await db.query(
+      `SELECT g.* FROM customization_groups g JOIN menu_items mi ON mi.id = g.menu_item_id
+       WHERE g.id = $1 AND mi.restaurant_id = $2`,
+      [req.params.groupId, id]
+    );
+    const group = gRes.rows[0];
+    if (!group) return res.status(404).json({ error: 'Customization group not found' });
+    if (name !== undefined && !String(name).trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    if (max_select !== undefined) {
+      const ms = Number(max_select);
+      if (!Number.isInteger(ms) || ms < 1 || ms > 20) {
+        return res.status(400).json({ error: 'max_select must be an integer 1-20' });
+      }
+    }
+    if (options !== undefined) {
+      if (!Array.isArray(options)) return res.status(400).json({ error: 'options must be an array' });
+      for (const o of options) {
+        if (!o || !String(o.name || '').trim()) {
+          return res.status(400).json({ error: 'Every option needs a name' });
+        }
+        const p = Number(o.price_paise || 0);
+        if (!Number.isFinite(p) || p < 0 || p > 100000) {
+          return res.status(400).json({ error: 'Option price must be 0-100000 paise' });
+        }
+      }
+    }
+    const upd = await db.query(
+      `UPDATE customization_groups SET name = COALESCE($1, name),
+         required = COALESCE($2, required), max_select = COALESCE($3, max_select)
+       WHERE id = $4 RETURNING *`,
+      [name !== undefined ? String(name).trim() : null,
+       required !== undefined ? !!required : null,
+       max_select !== undefined ? Number(max_select) : null,
+       req.params.groupId]
+    );
+    const out = upd.rows[0];
+    if (options !== undefined) {
+      await db.query('DELETE FROM customization_options WHERE group_id = $1', [req.params.groupId]);
+      for (let i = 0; i < options.length; i++) {
+        await db.query(
+          `INSERT INTO customization_options (group_id, name, price_paise, sort)
+           VALUES ($1, $2, $3, $4)`,
+          [req.params.groupId, String(options[i].name).trim(), Math.round(Number(options[i].price_paise || 0)), i]
+        );
+      }
+    }
+    const opts = await db.query(
+      'SELECT * FROM customization_options WHERE group_id = $1 ORDER BY sort, name',
+      [req.params.groupId]
+    );
+    out.options = opts.rows;
+    res.json({ group: out });
+  })
+);
+
 // ---- Orders ----
 // Strip fields the restaurant must never see (customer delivery OTP, hashes)
 function sanitizeOwnerOrder(o) {
@@ -528,7 +614,7 @@ function orderDetailQuery(where, params) {
     `SELECT o.*, r.name AS restaurant_name,
             (SELECT r2.name FROM orders o2 JOIN restaurants r2 ON r2.id = o2.restaurant_id
               WHERE o2.trip_id = o.trip_id AND o2.is_primary ORDER BY o2.placed_at LIMIT 1) AS trip_primary_name,
-            u.name AS customer_name, u.phone AS customer_phone,
+            COALESCE(o.customer_name, u.name) AS customer_name, COALESCE(o.customer_phone, u.phone) AS customer_phone,
             a.line1, a.line2, a.city, a.lat AS addr_lat, a.lng AS addr_lng,
             ru.name AS rider_name, ru.phone AS rider_phone
      FROM orders o

@@ -13,6 +13,11 @@ const bank = require('../lib/bank');
 const RESTAURANT_SECRET_FIELDS = ['aadhar', 'bank_account', 'ifsc', 'upi_id'];
 const APPLICATION_SECRET_FIELDS = ['aadhar', 'bank_account', 'ifsc', 'upi_id'];
 const RIDER_SECRET_FIELDS = ['aadhaar_no', 'licence_no', 'pan_no', 'bank_account', 'ifsc', 'upi_id'];
+// Admin responses mask confidential values to last-4 (bank account, Aadhar,
+// licence, PAN). IFSC is not secret and UPI stays as-is — admins verify
+// against them. See src/lib/secure.js decryptAndMaskRow.
+const RESTAURANT_MASK_FIELDS = ['aadhar', 'bank_account'];
+const RIDER_MASK_FIELDS = ['aadhaar_no', 'licence_no', 'pan_no', 'bank_account'];
 
 // ---- Confidential-data scrub (approved 2026-11-27) ----
 // At approval the full Aadhar is replaced by its last 4 digits + a verified
@@ -468,7 +473,7 @@ router.get(
        ${where} ORDER BY r.created_at DESC`,
       params
     );
-    res.json({ restaurants: rows.map((r) => secure.decryptRow(r, RESTAURANT_SECRET_FIELDS)) });
+    res.json({ restaurants: rows.map((r) => secure.decryptAndMaskRow(r, RESTAURANT_SECRET_FIELDS, RESTAURANT_MASK_FIELDS)) });
   })
 );
 
@@ -485,7 +490,7 @@ router.get(
       [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
-    res.json({ restaurant: { ...secure.decryptRow(rows[0], RESTAURANT_SECRET_FIELDS), rating_avg: Number(rows[0].rating_avg) } });
+    res.json({ restaurant: { ...secure.decryptAndMaskRow(rows[0], RESTAURANT_SECRET_FIELDS, RESTAURANT_MASK_FIELDS), rating_avg: Number(rows[0].rating_avg) } });
   })
 );
 
@@ -518,7 +523,7 @@ router.put(
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, 'restaurant_update', 'restaurant', req.params.id, req.body);
-    res.json({ restaurant: rows[0] });
+    res.json({ restaurant: secure.decryptAndMaskRow(rows[0], RESTAURANT_SECRET_FIELDS, RESTAURANT_MASK_FIELDS) });
   })
 );
 
@@ -533,7 +538,7 @@ router.put(
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, 'restaurant_coming_soon', 'restaurant', req.params.id, { is_coming_soon: !!is_coming_soon });
-    res.json({ restaurant: rows[0] });
+    res.json({ restaurant: secure.decryptAndMaskRow(rows[0], RESTAURANT_SECRET_FIELDS, RESTAURANT_MASK_FIELDS) });
   })
 );
 
@@ -548,7 +553,7 @@ router.put(
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, 'restaurant_photo', 'restaurant', req.params.id, { image_url });
-    res.json({ restaurant: rows[0] });
+    res.json({ restaurant: secure.decryptAndMaskRow(rows[0], RESTAURANT_SECRET_FIELDS, RESTAURANT_MASK_FIELDS) });
   })
 );
 
@@ -577,7 +582,7 @@ router.put(
       await notify(restaurant.owner_id, 'Restaurant status update',
         `Your restaurant "${restaurant.name}" is now ${status}.`);
     }
-    res.json({ restaurant: secure.decryptRow(restaurant, RESTAURANT_SECRET_FIELDS) });
+    res.json({ restaurant: secure.decryptAndMaskRow(restaurant, RESTAURANT_SECRET_FIELDS, RESTAURANT_MASK_FIELDS) });
   })
 );
 
@@ -600,7 +605,7 @@ router.put(
     );
     if (!rows[0]) return res.status(404).json({ error: 'Restaurant not found' });
     await audit(req, 'restaurant_bank_verified', 'restaurant', req.params.id, { bank_verified: verified });
-    res.json({ restaurant: secure.decryptRow(rows[0], RESTAURANT_SECRET_FIELDS) });
+    res.json({ restaurant: secure.decryptAndMaskRow(rows[0], RESTAURANT_SECRET_FIELDS, RESTAURANT_MASK_FIELDS) });
   })
 );
 
@@ -621,7 +626,7 @@ router.get(
        ${where} ORDER BY rd.created_at DESC`,
       params
     );
-    res.json({ riders: rows.map((r) => ({ ...secure.decryptRow(r, RIDER_SECRET_FIELDS), rating_avg: Number(r.rating_avg) })) });
+    res.json({ riders: rows.map((r) => ({ ...secure.decryptAndMaskRow(r, RIDER_SECRET_FIELDS, RIDER_MASK_FIELDS), rating_avg: Number(r.rating_avg) })) });
   })
 );
 
@@ -639,7 +644,7 @@ router.get(
     if (!rows.length) return res.status(404).json({ error: 'Rider not found' });
     const r = rows[0];
     r.rating_avg = Number(r.rating_avg);
-    res.json({ rider: secure.decryptRow(r, RIDER_SECRET_FIELDS) });
+    res.json({ rider: secure.decryptAndMaskRow(r, RIDER_SECRET_FIELDS, RIDER_MASK_FIELDS) });
   })
 );
 
@@ -665,7 +670,7 @@ router.put(
       if (fresh.rows[0]) rider = fresh.rows[0];
     }
     await notify(rider.user_id, 'Rider account update', `Your rider account is now ${status}.`);
-    res.json({ rider: secure.decryptRow(rider, RIDER_SECRET_FIELDS) });
+    res.json({ rider: secure.decryptAndMaskRow(rider, RIDER_SECRET_FIELDS, RIDER_MASK_FIELDS) });
   })
 );
 
@@ -769,6 +774,61 @@ router.post(
 );
 
 // ---- Pricing ----
+// Server-side range validation (2026-11-27): an admin typo must never set
+// a ₹1,00,000 platform fee or a -50% commission. Returns an error string
+// or null. Bounds are sanity limits, not business policy.
+function validatePricingValue(key, value) {
+  const intIn = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
+  const numIn = (v, lo, hi) => typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi;
+  switch (key) {
+    case 'platform_fee_paise': return intIn(value, 0, 10000) ? null : 'platform_fee_paise must be an integer 0-10000 paise';
+    case 'default_commission_pct': return numIn(value, 0, 100) ? null : 'default_commission_pct must be 0-100';
+    case 'eta_minutes': return intIn(value, 1, 240) ? null : 'eta_minutes must be an integer 1-240';
+    case 'otw_flat_fee_paise': return intIn(value, 0, 10000) ? null : 'otw_flat_fee_paise must be an integer 0-10000 paise';
+    case 'offer_good_per_km': return numIn(value, 0, 100) ? null : 'offer_good_per_km must be 0-100';
+    case 'offer_ok_per_km': return numIn(value, 0, 100) ? null : 'offer_ok_per_km must be 0-100';
+    case 'ready_order_expiry_minutes':
+      return value === null || intIn(value, 5, 1440) ? null : 'ready_order_expiry_minutes must be null or an integer 5-1440';
+    case 'dish_ratings_customer_visible':
+      return typeof value === 'boolean' ? null : 'dish_ratings_customer_visible must be a boolean';
+    case 'call_to_order_phone':
+      return typeof value === 'string' && value.length <= 20 ? null : 'call_to_order_phone must be a string of at most 20 characters';
+    case 'tax_rates': {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return 'tax_rates must be an object';
+      for (const k of Object.keys(value)) {
+        if (!numIn(value[k], 0, 100)) return `tax_rates.${k} must be 0-100`;
+      }
+      return null;
+    }
+    case 'customer_fee': {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return 'customer_fee must be an object';
+      if (value.base_paise !== undefined && !intIn(value.base_paise, 0, 10000)) return 'customer_fee.base_paise must be an integer 0-10000';
+      if (value.free_km !== undefined && !numIn(value.free_km, 0, 50)) return 'customer_fee.free_km must be 0-50';
+      if (value.per_km_paise !== undefined && !intIn(value.per_km_paise, 0, 10000)) return 'customer_fee.per_km_paise must be an integer 0-10000';
+      if (value.tiers !== undefined) {
+        if (!Array.isArray(value.tiers)) return 'customer_fee.tiers must be an array';
+        for (const t of value.tiers) {
+          if (!t || typeof t !== 'object') return 'customer_fee.tiers entries must be objects';
+          if (t.min_paise !== undefined && !intIn(t.min_paise, 0, 10000000)) return 'customer_fee.tiers.min_paise must be an integer >= 0';
+          if (t.free_km !== undefined && !numIn(t.free_km, 0, 50)) return 'customer_fee.tiers.free_km must be 0-50';
+        }
+      }
+      return null;
+    }
+    case 'delivery_tiers':
+    case 'rider_payout_tiers': {
+      if (!Array.isArray(value)) return `${key} must be an array`;
+      for (const t of value) {
+        if (!t || typeof t !== 'object') return `${key} entries must be objects`;
+        if (t.upto_km !== undefined && !numIn(t.upto_km, 0, 1000)) return `${key}.upto_km must be 0-1000`;
+        if (t.rate_paise !== undefined && !intIn(t.rate_paise, 0, 10000)) return `${key}.rate_paise must be an integer 0-10000`;
+      }
+      return null;
+    }
+    default: return 'Unknown pricing key';
+  }
+}
+
 router.get(
   '/pricing',
   ah(async (req, res) => {
@@ -782,10 +842,15 @@ router.put(
   '/pricing',
   ah(async (req, res) => {
     const { key, value } = req.body;
-    const allowed = ['delivery_tiers', 'rider_payout_tiers', 'platform_fee_paise', 'default_commission_pct', 'eta_minutes', 'call_to_order_phone', 'tax_rates', 'otw_flat_fee_paise', 'customer_fee'];
+    const allowed = ['delivery_tiers', 'rider_payout_tiers', 'platform_fee_paise', 'default_commission_pct', 'eta_minutes', 'call_to_order_phone', 'tax_rates', 'otw_flat_fee_paise', 'customer_fee', 'offer_good_per_km', 'offer_ok_per_km', 'ready_order_expiry_minutes', 'dish_ratings_customer_visible'];
     if (!allowed.includes(key)) return res.status(400).json({ error: 'Unknown pricing key' });
+    const err = validatePricingValue(key, value);
+    if (err) return res.status(400).json({ error: err });
+    // Upsert: new keys (offer_*, ready_order_expiry_minutes, dish_ratings_*)
+    // must be settable even though they were only just seeded.
     const { rows } = await db.query(
-      'UPDATE pricing_config SET value = $1::jsonb WHERE key = $2 RETURNING *',
+      `INSERT INTO pricing_config (key, value) VALUES ($2, $1::jsonb)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value RETURNING *`,
       [JSON.stringify(value), key]
     );
     await audit(req, 'pricing_update', 'pricing_config', key, { value });
@@ -794,6 +859,35 @@ router.put(
 );
 
 // ---- Coupons ----
+// Server-side coupon validation (2026-11-27): bounds on value/min/max and
+// a valid_from < valid_to window. `merged` is the create body or the
+// existing row merged with the update body.
+function validateCoupon(merged) {
+  if (merged.code !== undefined && (typeof merged.code !== 'string' || !merged.code.trim() || merged.code.trim().length > 30)) {
+    return 'code must be 1-30 characters';
+  }
+  if (merged.discount_type !== undefined && !['flat', 'percent'].includes(merged.discount_type)) {
+    return 'discount_type must be flat or percent';
+  }
+  if (merged.value !== undefined) {
+    const v = Number(merged.value);
+    if (!Number.isInteger(v) || v < 1) return 'value must be an integer >= 1';
+    if (merged.discount_type === 'percent' && v > 100) return 'percent value must be 1-100';
+    if (merged.discount_type === 'flat' && v > 100000) return 'flat value must be 1-100000 paise';
+  }
+  if (merged.min_order_paise !== undefined && merged.min_order_paise !== null) {
+    const v = Number(merged.min_order_paise);
+    if (!Number.isInteger(v) || v < 0) return 'min_order_paise must be an integer >= 0';
+  }
+  if (merged.max_discount_paise !== undefined && merged.max_discount_paise !== null) {
+    const v = Number(merged.max_discount_paise);
+    if (!Number.isInteger(v) || v < 0) return 'max_discount_paise must be an integer >= 0';
+  }
+  if (merged.valid_from && merged.valid_to && new Date(merged.valid_from) >= new Date(merged.valid_to)) {
+    return 'valid_from must be before valid_to';
+  }
+  return null;
+}
 router.get(
   '/coupons',
   ah(async (req, res) => {
@@ -812,6 +906,8 @@ router.post(
     if (!['flat', 'percent'].includes(discount_type)) {
       return res.status(400).json({ error: 'discount_type must be flat or percent' });
     }
+    const couponErr = validateCoupon({ code, discount_type, value, min_order_paise, max_discount_paise, valid_from, valid_to });
+    if (couponErr) return res.status(400).json({ error: couponErr });
     const { rows } = await db.query(
       `INSERT INTO coupons (code, discount_type, value, min_order_paise, max_discount_paise, valid_from, valid_to, active, requires_student)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
@@ -828,6 +924,14 @@ router.put(
   '/coupons/:id',
   ah(async (req, res) => {
     const fields = ['discount_type', 'value', 'min_order_paise', 'max_discount_paise', 'valid_from', 'valid_to', 'active', 'requires_student'];
+    const existing = await db.query('SELECT * FROM coupons WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Coupon not found' });
+    // Validate the merged row so a partial update (e.g. value only) is
+    // still checked against the coupon's real discount_type.
+    const merged = { ...existing.rows[0] };
+    for (const f of fields) if (req.body[f] !== undefined) merged[f] = req.body[f];
+    const couponErr = validateCoupon(merged);
+    if (couponErr) return res.status(400).json({ error: couponErr });
     const sets = [];
     const params = [];
     for (const f of fields) {
@@ -925,7 +1029,8 @@ router.get(
   ah(async (req, res) => {
     const { rows } = await db.query(
       `SELECT o.id, o.total_paise, o.payment_status, o.placed_at, o.customer_id,
-              u.phone AS customer_phone, u.name AS customer_name,
+              COALESCE(o.customer_phone, u.phone) AS customer_phone,
+              COALESCE(o.customer_name, u.name) AS customer_name,
               r.name AS restaurant_name
        FROM orders o
        LEFT JOIN users u ON u.id = o.customer_id
@@ -1311,7 +1416,7 @@ router.get(
     const { rows } = await db.query(
       "SELECT * FROM restaurant_applications ORDER BY created_at DESC"
     );
-    res.json({ applications: rows.map((r) => secure.decryptRow(r, APPLICATION_SECRET_FIELDS)) });
+    res.json({ applications: rows.map((r) => secure.decryptAndMaskRow(r, APPLICATION_SECRET_FIELDS, RESTAURANT_MASK_FIELDS)) });
   })
 );
 
@@ -1450,7 +1555,7 @@ router.get(
        WHERE image_url IS NULL OR image_url = ''
        ORDER BY created_at DESC`
     );
-    res.json({ restaurants: rows.map((r) => secure.decryptRow(r, RESTAURANT_SECRET_FIELDS)) });
+    res.json({ restaurants: rows.map((r) => secure.decryptAndMaskRow(r, RESTAURANT_SECRET_FIELDS, RESTAURANT_MASK_FIELDS)) });
   })
 );
 
@@ -1931,74 +2036,6 @@ router.delete(
   })
 );
 
-
-// ---- Customer management ----
-// GET /api/admin/customers — list customers with order stats
-router.get(
-  '/customers',
-  ah(async (req, res) => {
-    const q = (req.query.q || '').trim();
-    const params = [];
-    let where = "u.role = 'customer'";
-    if (q) {
-      params.push('%' + q + '%');
-      where += ' AND (u.name ILIKE $1 OR u.phone ILIKE $1)';
-    }
-    const { rows } = await db.query(
-      `SELECT u.id, u.phone, u.name, u.is_blocked, u.created_at,
-              COUNT(o.id) AS order_count,
-              COALESCE(SUM(CASE WHEN o.status = 'delivered' THEN o.total_paise ELSE 0 END), 0) AS spent_paise,
-              MAX(o.placed_at) AS last_order_at
-       FROM users u
-       LEFT JOIN orders o ON o.customer_id = u.id
-       WHERE ${where}
-       GROUP BY u.id, u.phone, u.name, u.is_blocked, u.created_at
-       ORDER BY MAX(o.placed_at) DESC NULLS LAST, u.created_at DESC
-       LIMIT 100`,
-      params
-    );
-    res.json({ customers: rows });
-  })
-);
-
-// GET /api/admin/customers/:id — customer detail with order history
-router.get(
-  '/customers/:id',
-  ah(async (req, res) => {
-    const { rows: urows } = await db.query(
-      `SELECT u.id, u.phone, u.name, u.is_blocked, u.created_at, u.referral_code,
-              (SELECT name FROM users r WHERE r.id = u.referred_by) AS referred_by_name
-       FROM users u WHERE u.id = $1 AND u.role = 'customer'`,
-      [req.params.id]
-    );
-    if (!urows[0]) return res.status(404).json({ error: 'Customer not found' });
-    const { rows: orders } = await db.query(
-      `SELECT o.id, o.order_number, o.status, o.total_paise, o.placed_at,
-              r.name AS restaurant_name
-       FROM orders o
-       LEFT JOIN restaurants r ON r.id = o.restaurant_id
-       WHERE o.customer_id = $1
-       ORDER BY o.placed_at DESC LIMIT 50`,
-      [req.params.id]
-    );
-    res.json({ customer: urows[0], orders });
-  })
-);
-
-// PUT /api/admin/customers/:id/block — block/unblock a customer
-router.put(
-  '/customers/:id/block',
-  ah(async (req, res) => {
-    const blocked = !!req.body.blocked;
-    const { rows } = await db.query(
-      `UPDATE users SET is_blocked = $1 WHERE id = $2 AND role = 'customer' RETURNING id, is_blocked`,
-      [blocked, req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Customer not found' });
-    await audit(req, blocked ? 'customer_block' : 'customer_unblock', 'customer', req.params.id, { blocked });
-    res.json({ ok: true, is_blocked: rows[0].is_blocked });
-  })
-);
 
 // POST /api/admin/migrate/aadhar-scrub — one-time Aadhar minimization for
 // already-approved records. NOT automatic: run ONLY after a verified

@@ -166,4 +166,30 @@ function decryptBuffer(buf) {
   return Buffer.concat([decipher.update(ct), decipher.final()]);
 }
 
-module.exports = { getKey, isEncrypted, encryptField, decryptField, aadharLast4, decryptRow, encryptBuffer, decryptBuffer, MASKED };
+// Last 4 characters of a decrypted confidential value ("••••1234").
+// Null/empty stays null; an unreadable (MASKED) value stays MASKED.
+// Used by admin responses so a full bank account / Aadhar / licence / PAN
+// never leaves the server toward an admin token.
+function maskLast4(v) {
+  if (v == null || v === '') return null;
+  const s = String(v);
+  if (s === MASKED) return MASKED;
+  const tail = s.replace(/[^A-Za-z0-9]/g, '').slice(-4);
+  if (!tail) return MASKED;
+  return '••••' + tail;
+}
+
+// Decrypt the listed fields of a DB row, then mask the sensitive ones to
+// last-4 (fields in `maskFields`; the rest stay fully decrypted — IFSC and
+// UPI are not secret and admins verify against them). Returns a shallow
+// copy; the stored row is never mutated.
+function decryptAndMaskRow(row, fields, maskFields) {
+  const out = decryptRow(row, fields);
+  const toMask = maskFields || fields;
+  for (const f of toMask) {
+    if (out[f] != null) out[f] = maskLast4(out[f]);
+  }
+  return out;
+}
+
+module.exports = { getKey, isEncrypted, encryptField, decryptField, aadharLast4, decryptRow, encryptBuffer, decryptBuffer, MASKED, maskLast4, decryptAndMaskRow };

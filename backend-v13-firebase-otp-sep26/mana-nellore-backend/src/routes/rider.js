@@ -311,11 +311,17 @@ async function checkAlmostHere(riderId, lat, lng) {
 }
 
 // PUT /api/rider/location { lat, lng }
+// A rider who is offline shares no location: the app must not track (or
+// report) a rider who is off duty. Rejected server-side, not just in the
+// app — a stale client or a replayed request cannot leak positions.
 router.put(
   '/location',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
+    if (!rider.online) {
+      return res.status(409).json({ error: 'Go online to share your location' });
+    }
     const { lat, lng } = req.body;
     if (lat == null || lng == null) return res.status(400).json({ error: 'lat and lng are required' });
     await db.query('UPDATE riders SET lat = $1, lng = $2 WHERE id = $3', [lat, lng, rider.id]);
@@ -348,6 +354,42 @@ router.post(
   })
 );
 
+// ---- Notifications (rider's own, same shape as the customer endpoint) ----
+router.get(
+  '/notifications',
+  ah(async (req, res) => {
+    const { rows } = await db.query(
+      'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
+      [req.user.id]
+    );
+    const unread = await db.query(
+      'SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = $1 AND COALESCE(read, false) = false',
+      [req.user.id]
+    );
+    res.json({ notifications: rows, unread_count: unread.rows[0].n });
+  })
+);
+
+router.put(
+  '/notifications/:id/read',
+  ah(async (req, res) => {
+    const upd = await db.query('UPDATE notifications SET read = true WHERE id = $1 AND user_id = $2', [
+      req.params.id, req.user.id
+    ]);
+    if (!upd.rowCount) return res.status(404).json({ error: 'Notification not found' });
+    res.json({ ok: true });
+  })
+);
+
+// DELETE /api/rider/notifications — clear all my notifications
+router.delete(
+  '/notifications',
+  ah(async (req, res) => {
+    await db.query('DELETE FROM notifications WHERE user_id = $1', [req.user.id]);
+    res.json({ ok: true });
+  })
+);
+
 // Delivery detail (scoped to this rider's deliveries)
 async function deliveryDetail(orderId, riderId) {
   const { rows } = await db.query(
@@ -355,7 +397,7 @@ async function deliveryDetail(orderId, riderId) {
             r.lat AS rest_lat, r.lng AS rest_lng, r.phone AS restaurant_phone,
             a.label AS addr_label, COALESCE(o.delivery_label, a.line1) AS line1, a.line2, a.city,
             COALESCE(o.delivery_lat, a.lat) AS addr_lat, COALESCE(o.delivery_lng, a.lng) AS addr_lng,
-            u.name AS customer_name, u.phone AS customer_phone
+            COALESCE(o.customer_name, u.name) AS customer_name, COALESCE(o.customer_phone, u.phone) AS customer_phone
      FROM orders o
      JOIN restaurants r ON r.id = o.restaurant_id
      LEFT JOIN addresses a ON a.id = o.address_id
@@ -366,6 +408,11 @@ async function deliveryDetail(orderId, riderId) {
   const order = rows[0];
   if (!order) return null;
   delete order.delivery_otp_hash;
+  delete order.delivery_otp_plain;
+  // The live row also carries a `delivery_otp` field (legacy plain-code
+  // column) — the rider must never see the plain code in ANY field. The
+  // rider verifies the customer's code against the hash (complete endpoint).
+  delete order.delivery_otp;
   delete order.pickup_otp; // rider must get this verbally from restaurant staff
   const items = await db.query('SELECT name_snapshot, qty, unit_price_paise FROM order_items WHERE order_id = $1', [order.id]);
   return { ...order, items: items.rows };
@@ -481,7 +528,7 @@ router.get(
       where += ` AND o.status = $${params.length}`;
     }
     const { rows } = await db.query(
-      `SELECT o.id, o.status, o.total_paise, o.placed_at, o.trip_id, o.order_number, r.name AS restaurant_name
+      `SELECT o.id, o.status, o.total_paise, o.placed_at, o.delivered_at, o.trip_id, o.order_number, r.name AS restaurant_name
        FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
        WHERE ${where} ORDER BY o.placed_at DESC LIMIT 50`,
       params

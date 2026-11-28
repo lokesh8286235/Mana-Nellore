@@ -201,6 +201,11 @@ CREATE TABLE IF NOT EXISTS orders (
   tip_paise int NOT NULL DEFAULT 0,
   recipient_name text,
   recipient_phone text,
+  -- Customer snapshot (2026-11-27): frozen at placement; account deletion
+  -- anonymizes the live columns but never touches these three.
+  customer_name text,
+  customer_phone text,
+  customer_address text,
   -- Proximity dispatch (nearest-rider offer cascade)
   offered_to_rider_id uuid REFERENCES riders(id) ON DELETE SET NULL,
   offer_expires_at timestamptz,

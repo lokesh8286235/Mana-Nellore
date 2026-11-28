@@ -255,6 +255,48 @@ router.post(
   })
 );
 
+// GET /api/dishes/:id/ratings/aggregate — customer-safe aggregate only
+// (average + count, no individual rater names). GATED: customers get 403
+// until the owner opens it (pricing_config 'dish_ratings_customer_visible').
+// Owners of the dish's restaurant and admins always see the aggregate.
+router.get(
+  '/:id/ratings/aggregate',
+  ah(async (req, res) => {
+    const dishId = req.params.id;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(dishId)) {
+      return res.status(404).json({ error: 'Dish not found' });
+    }
+    const dish = await db.query(
+      `SELECT mi.id, mi.restaurant_id, r.owner_id FROM menu_items mi
+       JOIN restaurants r ON r.id = mi.restaurant_id WHERE mi.id = $1`,
+      [dishId]
+    );
+    if (!dish.rows[0]) return res.status(404).json({ error: 'Dish not found' });
+    const isOwner = req.user.role === 'restaurant_owner'
+      && String(dish.rows[0].owner_id) === String(req.user.id);
+    const isAdmin = req.user.role === 'admin';
+    if (!isOwner && !isAdmin) {
+      // Customers: gated behind the config flag (default false = 403).
+      const flag = await db.query(
+        "SELECT value FROM pricing_config WHERE key = 'dish_ratings_customer_visible'"
+      );
+      if (!(flag.rows[0] && flag.rows[0].value === true)) {
+        return res.status(403).json({ error: 'Dish ratings are not public yet' });
+      }
+    }
+    const agg = await db.query(
+      `SELECT COALESCE(AVG(rating), 0)::float AS avg, COUNT(*)::int AS count
+       FROM dish_ratings WHERE dish_id = $1`,
+      [dishId]
+    );
+    res.json({
+      dish_id: dishId,
+      rating_avg: Math.round(agg.rows[0].avg * 10) / 10,
+      rating_count: agg.rows[0].count,
+    });
+  })
+);
+
 // GET /api/dishes/:id/ratings — recent ratings for a dish (for the restaurant app feed)
 router.get(
   '/:id/ratings',

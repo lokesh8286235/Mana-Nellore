@@ -4,6 +4,17 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { authenticate, ah } = require('../middleware/auth');
+const { resolveRestaurantCoords } = require('../lib/geocode');
+const { haversineKm } = require('../lib/pricing');
+
+// Group orders only start at restaurants inside the Nellore service area
+// (same 50 km cut as the group picker): a group is a shared delivery, and
+// a restaurant with no resolvable location — or 174 km away in chennai —
+// cannot be delivered from. The picker filters these out; this check is
+// the backstop for direct API calls.
+const NELLORE_LAT = 14.4426;
+const NELLORE_LNG = 79.9865;
+const GROUP_MAX_KM = 50;
 
 const router = express.Router();
 
@@ -37,10 +48,14 @@ router.post(
     if (!restaurant_id) return res.status(400).json({ error: 'restaurant_id required' });
     // A group can only start at a restaurant that exists and can take orders.
     const rRes = await db.query(
-      "SELECT id FROM restaurants WHERE id = $1 AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
+      "SELECT id, lat, lng, address FROM restaurants WHERE id = $1 AND status = 'approved' AND COALESCE(is_coming_soon, false) = false",
       [restaurant_id]
     );
     if (!rRes.rows[0]) return res.status(400).json({ error: 'Restaurant is not available for ordering' });
+    const coords = await resolveRestaurantCoords(rRes.rows[0]);
+    if (!coords || haversineKm(NELLORE_LAT, NELLORE_LNG, coords.lat, coords.lng) > GROUP_MAX_KM) {
+      return res.status(400).json({ error: 'This restaurant is outside the Nellore delivery area and cannot host a group order' });
+    }
     const code = newCode();
     const { rows } = await db.query(
       `INSERT INTO group_orders (code, restaurant_id, host_user_id, host_name, status)

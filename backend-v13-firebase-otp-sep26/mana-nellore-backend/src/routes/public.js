@@ -146,7 +146,7 @@ router.get(
   '/config',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'customer_fee', 'budget_threshold_paise', 'referral_reward_paise', 'tip_min_paise', 'tip_max_paise', 'prep_lead_minutes', 'tax_rates', 'otw_flat_fee_paise')"
+      "SELECT key, value FROM pricing_config WHERE key IN ('call_to_order_phone', 'customer_fee', 'budget_threshold_paise', 'referral_reward_paise', 'tip_min_paise', 'tip_max_paise', 'prep_lead_minutes', 'tax_rates', 'otw_flat_fee_paise', 'offer_good_per_km', 'offer_ok_per_km', 'ready_order_expiry_minutes', 'dish_ratings_customer_visible')"
     );
     const m = Object.fromEntries(rows.map((r) => [r.key, r.value]));
     // Customer delivery fee tiers (user 2026-10-15): backend-configurable, nothing hardcoded in apps
@@ -173,6 +173,13 @@ router.get(
     // flat fee — backend-driven, admin-editable, single source of truth.
     const taxRates = normalizeTaxRates(m.tax_rates);
     const otwFlatFeePaise = m.otw_flat_fee_paise != null ? Number(m.otw_flat_fee_paise) : 500;
+    // Offer quality thresholds (Rs/km) for rider offer cards. Defaults 15/10.
+    const offerGoodPerKm = m.offer_good_per_km != null ? Number(m.offer_good_per_km) : 15;
+    const offerOkPerKm = m.offer_ok_per_km != null ? Number(m.offer_ok_per_km) : 10;
+    // Ready-order expiry (minutes). null = DISABLED — no expiry until the
+    // owner sets a value; the threshold is the user's call, never guessed.
+    const readyOrderExpiryMinutes = m.ready_order_expiry_minutes != null
+      ? Number(m.ready_order_expiry_minutes) : null;
     res.json({
       call_to_order_phone: (m.call_to_order_phone) || '',
       maps_key: process.env.GOOGLE_MAPS_KEY || '',
@@ -184,7 +191,11 @@ router.get(
       tip_max_paise: tipMax,
       prep_lead_minutes: prepLead,
       tax_rates: taxRates,
-      otw_flat_fee_paise: otwFlatFeePaise
+      otw_flat_fee_paise: otwFlatFeePaise,
+      offer_good_per_km: offerGoodPerKm,
+      offer_ok_per_km: offerOkPerKm,
+      ready_order_expiry_minutes: readyOrderExpiryMinutes,
+      dish_ratings_customer_visible: m.dish_ratings_customer_visible === true
     });
   })
 );

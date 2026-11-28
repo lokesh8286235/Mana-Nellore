@@ -5,6 +5,13 @@ const db = require('../db');
 const { ah } = require('../middleware/auth');
 const { haversineKm, loadPricingConfig, deliveryFeePaise, customerDeliveryFeePaise, otwSecondaryFeePaise } = require('../lib/pricing');
 const { pointToSegKm } = require('../lib/otw');
+const { resolveRestaurantCoords } = require('../lib/geocode');
+
+// Nellore service-area centre (same as the 15 km delivery radius and the
+// 50 km "in Nellore" cut used by Popular / group orders).
+const NELLORE_LAT = 14.4426;
+const NELLORE_LNG = 79.9865;
+const GROUP_PICKER_MAX_KM = 50;
 
 const router = express.Router();
 
@@ -93,7 +100,7 @@ async function fetchRealDriveETAs(custLat, custLng, rows, gkey) {
 router.get(
   '/',
   ah(async (req, res) => {
-    const { q, veg, open, lat, lng, meal, sort } = req.query;
+    const { q, veg, open, lat, lng, meal, sort, for_group } = req.query;
     // Optional identity for personalization: decode the token when present,
     // but never reject anonymous browsing (this route is public).
     let customerId = null;
@@ -107,7 +114,7 @@ router.get(
     // Grid-round coords to ~100m so the cache actually hits (raw GPS jitters every reading)
     const glat = lat != null && Number.isFinite(Number(lat)) ? Math.round(Number(lat) * 1000) / 1000 : null;
     const glng = lng != null && Number.isFinite(Number(lng)) ? Math.round(Number(lng) * 1000) / 1000 : null;
-    const cacheKey = JSON.stringify({ q, veg, open, lat: glat, lng: glng, meal, sort, customerId });
+    const cacheKey = JSON.stringify({ q, veg, open, lat: glat, lng: glng, meal, sort, customerId, for_group });
     const cached = cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
@@ -177,7 +184,7 @@ router.get(
     // sort=rating keeps the legacy highest-rated order; the DB order only
     // matters for that case — reco/fast are sorted in JS after scoring.
     const dbOrder = sort === 'rating' ? 'ORDER BY r.rating_avg DESC, r.name ASC' : '';
-    const { rows } = await db.query(
+    let { rows } = await db.query(
       `SELECT r.*,
               COALESCE(ao.cnt, 0)::int AS active_orders,
               NULLIF(ap.avg_min, 0)::int AS avg_pack_minutes,
@@ -224,6 +231,19 @@ router.get(
        WHERE ${conditions.join(' AND ')} ${dbOrder}`,
       params
     );
+
+    // for_group=1 (group-start picker): only restaurants inside the service
+    // area — resolved coords (pin, else geocoded typed address) within
+    // 50 km of Nellore centre. Unresolvable addresses (Abc, Alla) and
+    // far-away restaurants (chennai, ~174 km) drop out of the picker.
+    // The customer app must pass ?for_group=1 to use this filter.
+    if (for_group === '1') {
+      const resolved = await Promise.all(rows.map((r) => resolveRestaurantCoords(r)));
+      rows = rows.filter((r, i) => {
+        const c = resolved[i];
+        return c && haversineKm(NELLORE_LAT, NELLORE_LNG, c.lat, c.lng) <= GROUP_PICKER_MAX_KM;
+      });
+    }
 
     let config = null;
     const custLat = parseFloat(lat);

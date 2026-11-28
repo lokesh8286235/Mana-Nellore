@@ -187,9 +187,13 @@ router.get(
       'SELECT id, phone, email, name, role, dob, is_student, referral_code, created_at FROM users WHERE id = $1',
       [req.user.id]
     );
+    // Delivered-only stats (2026-11-27): placed/cancelled orders never count
+    // toward "orders" or "total spent" — the old query counted every order
+    // and summed every non-cancelled one, so a placed-then-cancelled order
+    // inflated "Total spent" with money never paid.
     const stats = await db.query(
-      `SELECT COUNT(*) AS orders,
-              COALESCE(SUM(total_paise) FILTER (WHERE status != 'cancelled'), 0) AS spent_paise
+      `SELECT COUNT(*) FILTER (WHERE status = 'delivered') AS orders,
+              COALESCE(SUM(total_paise) FILTER (WHERE status = 'delivered'), 0) AS spent_paise
        FROM orders WHERE customer_id = $1`, [req.user.id]
     );
     res.json({
