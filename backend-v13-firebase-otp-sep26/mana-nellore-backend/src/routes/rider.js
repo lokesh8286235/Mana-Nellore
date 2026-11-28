@@ -1629,25 +1629,43 @@ router.get(
   })
 );
 
+// ?from/&to= accept a bare IST calendar day (YYYY-MM-DD) or a full ISO
+// datetime. A bare day means that whole IST day: [00:00 IST, next 00:00 IST).
+// The old code blindly appended 'T00:00:00+05:30' to whatever arrived, so any
+// datetime input became an Invalid Date and the endpoint 500'd ("Invalid time
+// value", verified live 20261128). Returns null for unparseable input.
+function parseEarningBound(raw, isTo) {
+  const s = String(raw).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const day = new Date(s + 'T00:00:00+05:30');
+    if (Number.isNaN(day.getTime())) return null;
+    return isTo ? new Date(day.getTime() + 864e5) : day;
+  }
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 // GET /api/rider/earnings?from=&to=
 router.get(
   '/earnings',
   ah(async (req, res) => {
     const rider = await requireActiveRider(req, res);
     if (!rider) return;
-    const from = req.query.from ? new Date(req.query.from + 'T00:00:00+05:30') : new Date(Date.now() - 30 * 864e5);
-    let to = req.query.to ? new Date(req.query.to + 'T00:00:00+05:30') : new Date();
-    // Make 'to' inclusive of the full day (start of next day)
-    to = new Date(to.getTime() + 864e5);
+    const from = req.query.from ? parseEarningBound(req.query.from, false) : new Date(Date.now() - 30 * 864e5);
+    const to = req.query.to ? parseEarningBound(req.query.to, true) : new Date();
+    if ((req.query.from && !from) || (req.query.to && !to)) {
+      return res.status(400).json({ error: 'Invalid from/to date — use YYYY-MM-DD or an ISO datetime' });
+    }
+    if (from > to) return res.status(400).json({ error: 'from must not be after to' });
     const sum = await db.query(
       `SELECT COALESCE(SUM(amount_paise), 0) AS total_paise, COUNT(*) AS trips
-       FROM rider_payouts WHERE rider_id = $1 AND created_at BETWEEN $2 AND $3`,
+       FROM rider_payouts WHERE rider_id = $1 AND created_at >= $2 AND created_at < $3`,
       [rider.id, from.toISOString(), to.toISOString()]
     );
     const list = await db.query(
       `SELECT rp.*, o.total_paise AS order_total, o.order_number AS order_number
        FROM rider_payouts rp JOIN orders o ON o.id = rp.order_id
-       WHERE rp.rider_id = $1 AND rp.created_at BETWEEN $2 AND $3
+       WHERE rp.rider_id = $1 AND rp.created_at >= $2 AND rp.created_at < $3
        ORDER BY rp.created_at DESC`,
       [rider.id, from.toISOString(), to.toISOString()]
     );

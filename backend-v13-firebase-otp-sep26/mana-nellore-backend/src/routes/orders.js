@@ -1124,6 +1124,11 @@ router.post(
         await client.query('ROLLBACK');
         return res.status(409).json({ error: 'Order can no longer be cancelled' });
       }
+      // Cancelled + never paid = terminal non-payable ('void'). A 'pending'
+      // payment_status must not survive a cancel — it reads as an outstanding
+      // payment to every other consumer (admin, reports, rider COD checks).
+      // 'paid' still goes to 'refund_pending'; anything else keeps its value.
+      const terminalPayment = (ps) => (ps === 'paid' ? 'refund_pending' : ps === 'pending' ? 'void' : ps);
       // For trips: cancel ALL orders in the trip (bulletproof - no partial trips)
       const cancelIds = [order.id];
       if (order.trip_id) {
@@ -1136,10 +1141,9 @@ router.post(
             await transitionTx(client, to.id, 'cancelled', 'customer');
             // Paid orders go to refund_pending — 'refunded' is only set once a
             // real refund has happened (admin refund action).
-            const toRefundPending = to.payment_status === 'paid';
             await client.query(
               'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
-              [req.body.reason || 'Cancelled by customer (trip)', toRefundPending ? 'refund_pending' : to.payment_status, to.id]
+              [req.body.reason || 'Cancelled by customer (trip)', terminalPayment(to.payment_status), to.id]
             );
             cancelIds.push(to.id);
           }
@@ -1149,7 +1153,7 @@ router.post(
       const refundPending = order.payment_status === 'paid';
       await client.query(
         'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
-        [req.body.reason || 'Cancelled by customer', refundPending ? 'refund_pending' : order.payment_status, order.id]
+        [req.body.reason || 'Cancelled by customer', terminalPayment(order.payment_status), order.id]
       );
       await client.query('COMMIT');
       // Bell notification: the customer must see the cancellation, not just "Order placed".

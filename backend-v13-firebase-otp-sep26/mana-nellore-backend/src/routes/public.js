@@ -121,7 +121,7 @@ router.get(
   '/track/:token',
   ah(async (req, res) => {
     const { rows } = await db.query(
-      `SELECT o.id, o.status, o.placed_at, o.packed_at, o.eta_at, o.timeline,
+      `SELECT o.id, o.order_number, o.status, o.placed_at, o.packed_at, o.eta_at, o.timeline,
               r.name AS restaurant_name,
               ru.name AS rider_name, rd.profile_photo AS rider_photo
        FROM orders o
@@ -133,7 +133,6 @@ router.get(
     );
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    delete order.share_token;
     res.json({ order });
   })
 );

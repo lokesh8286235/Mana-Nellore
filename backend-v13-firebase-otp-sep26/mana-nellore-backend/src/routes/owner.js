@@ -719,13 +719,18 @@ router.put(
     // real refund has actually happened (see customer cancel in orders.js).
     // The assigned rider (if any) is released and told, so a cancelled order
     // never sits in a rider's active list.
+    // Cancelled/rejected + never paid = terminal non-payable ('void').
+    // 'pending' must not survive a terminal state — it reads as an
+    // outstanding payment to every other consumer. Paid value differs per
+    // branch: cancel -> 'refund_pending', reject -> 'refunded'.
+    const terminalPayment = (ps, paidValue) => (ps === 'paid' ? paidValue : ps === 'pending' ? 'void' : ps);
     let refundPending = false;
     if (rule.to === 'cancelled') {
       const reason = req.body.reason || 'Cancelled by the restaurant';
       refundPending = order.payment_status === 'paid';
       await db.query(
         "UPDATE orders SET cancel_reason = $1, payment_status = $2, rider_id = NULL, offered_to_rider_id = NULL WHERE id = $3",
-        [reason, refundPending ? 'refund_pending' : order.payment_status, order.id]
+        [reason, terminalPayment(order.payment_status, 'refund_pending'), order.id]
       );
       const cancelBody = `Your order #${order.order_number || order.id} was cancelled by the restaurant.${refundPending ? ' Your refund is being processed.' : ''}`;
       await notify(db, order.customer_id, 'Order cancelled', cancelBody);
@@ -753,7 +758,7 @@ router.put(
       const refunded = order.payment_status === 'paid';
       await db.query(
         "UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3",
-        [reason, refunded ? 'refunded' : order.payment_status, order.id]
+        [reason, terminalPayment(order.payment_status, 'refunded'), order.id]
       );
       await notify(db, order.customer_id, 'Order rejected',
         `Your order was rejected by the restaurant.${refunded ? ' Your payment will be refunded.' : ''}`);

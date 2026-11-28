@@ -386,6 +386,7 @@ router.get(
     const iso = new Date(istNow.getTime() - istOffsetMs).toISOString();
 
     const q = async (text, params = []) => (await db.query(text, params)).rows[0];
+    const qr = async (text, params = []) => (await db.query(text, params)).rows;
 
     // All independent counts run in parallel — sequential awaits made this
     // endpoint ~9x slower than the database actually needs.
@@ -398,7 +399,10 @@ router.get(
       refundsToday,
       openTickets,
       contribution,
-      counts
+      counts,
+      activeOrdersToday,
+      nonCancelledToday,
+      topRestaurants
     ] = await Promise.all([
       q("SELECT COUNT(*) AS c FROM orders WHERE placed_at >= $1", [iso]),
       q("SELECT COALESCE(SUM(total_paise),0) AS s FROM orders WHERE placed_at >= $1 AND status != 'cancelled'", [iso]),
@@ -413,13 +417,30 @@ router.get(
       q(`SELECT
            (SELECT COUNT(*) FROM restaurants WHERE status = 'approved') AS restaurants,
            (SELECT COUNT(*) FROM riders WHERE status = 'approved') AS riders,
-           (SELECT COUNT(DISTINCT customer_id) FROM orders) AS customers`)
+           (SELECT COUNT(DISTINCT customer_id) FROM orders) AS customers`),
+      // (18) Full-table IST-today figures — the frontend used to derive these
+      // from GET /api/admin/orders, which is LIMIT 100, so they went silently
+      // wrong once today exceeded 100 orders. Same definitions the frontend
+      // used: active = ACTIVE_STATUSES placed today; top-5 by non-cancelled
+      // orders today (revenue breaks ties); avg = revenue / non-cancelled.
+      q("SELECT COUNT(*) AS c FROM orders WHERE placed_at >= $1 AND status = ANY($2)", [iso, ACTIVE_STATUSES]),
+      q("SELECT COUNT(*) AS n, COALESCE(SUM(total_paise),0) AS s FROM orders WHERE placed_at >= $1 AND status != 'cancelled'", [iso]),
+      qr(`SELECT r.id AS restaurant_id, r.name AS restaurant_name,
+                 COUNT(*) AS orders, COALESCE(SUM(o.total_paise), 0) AS revenue_paise
+          FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
+          WHERE o.placed_at >= $1 AND o.status != 'cancelled'
+          GROUP BY r.id, r.name
+          ORDER BY COUNT(*) DESC, SUM(o.total_paise) DESC
+          LIMIT 5`, [iso])
     ]);
 
     res.json({
       orders_today: Number(ordersToday.c),
       sales_today_paise: Number(salesToday.s),
       active_orders: Number(activeOrders.c),
+      active_orders_today: Number(activeOrdersToday.c),
+      top_restaurants_today: topRestaurants.map((r) => ({ restaurant_id: r.restaurant_id, restaurant_name: r.restaurant_name, orders: Number(r.orders), revenue_paise: Number(r.revenue_paise) })),
+      avg_order_paise: Number(nonCancelledToday.n) ? Math.round(Number(nonCancelledToday.s) / Number(nonCancelledToday.n)) : 0,
       online_riders: Number(onlineRiders.c),
       cancellations_today: Number(cancellationsToday.c),
       refunds_today: { count: Number(refundsToday.c), total_paise: Number(refundsToday.s) },
@@ -762,9 +783,12 @@ router.post(
     }
     await transition(order.id, 'cancelled', 'admin');
     const refunded = order.payment_status === 'paid';
+    // Same 'void' rule as customer/owner cancels: a cancelled order that was
+    // never paid must store a terminal non-payable value, not 'pending'.
+    const paymentAfterCancel = refunded ? 'refunded' : order.payment_status === 'pending' ? 'void' : order.payment_status;
     await db.query(
       'UPDATE orders SET cancel_reason = $1, payment_status = $2 WHERE id = $3',
-      [req.body.reason || 'Cancelled by operations', refunded ? 'refunded' : order.payment_status, order.id]
+      [req.body.reason || 'Cancelled by operations', paymentAfterCancel, order.id]
     );
     await audit(req, 'cancel_order', 'order', order.id, { reason: req.body.reason });
     await notify(order.customer_id, 'Order cancelled',
