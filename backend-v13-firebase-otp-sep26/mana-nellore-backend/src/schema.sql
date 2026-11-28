@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS orders (
   total_paise int NOT NULL,
   payment_method text,
   payment_status text NOT NULL DEFAULT 'pending'
-    CHECK (payment_status IN ('pending','paid','failed','refunded','collected','refund_pending')),
+    CHECK (payment_status IN ('pending','paid','failed','refunded','collected','refund_pending','void')),
   delivery_otp_hash text,
   delivery_lat double precision,
   delivery_lng double precision,

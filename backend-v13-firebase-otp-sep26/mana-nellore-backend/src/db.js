@@ -197,7 +197,7 @@ async function migrate() {
   // COD 'collected' status
   await q('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_status_check');
   await q(`ALTER TABLE orders ADD CONSTRAINT orders_payment_status_check
-    CHECK (payment_status IN ('pending','paid','failed','refunded','collected','refund_pending'))`);
+    CHECK (payment_status IN ('pending','paid','failed','refunded','collected','refund_pending','void'))`);
   // Remove wallet/credit remnants
   await q('ALTER TABLE orders DROP COLUMN IF EXISTS credits_used_paise');
   await q('DROP TABLE IF EXISTS customer_credits');
