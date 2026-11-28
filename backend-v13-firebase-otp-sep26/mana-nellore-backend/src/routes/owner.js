@@ -667,11 +667,12 @@ const OWNER_TRANSITIONS = {
   reject: { from: ['placed'], to: 'rejected' },
   preparing: { from: ['accepted'], to: 'preparing' },
   ready: { from: ['preparing'], to: 'ready' },
-  // Owner cancel AFTER accept: the kitchen can still call it off while the
-  // food is being made or packed. NOT from 'placed' (reject covers that) and
-  // NOT once a rider has picked it up (picked_up/on_way/delivered) — the
-  // rider is already carrying it by then.
-  cancel: { from: ['accepted', 'preparing', 'ready'], to: 'cancelled' },
+  // Owner cancel is ONLY from 'placed' (before accept) — once the restaurant
+  // has accepted an order, NOBODY can cancel it: not the restaurant, not the
+  // customer (customer cancel is 409 unless placed, orders.js). Reject covers
+  // turning down a placed order; cancel covers calling off a placed order
+  // before the kitchen starts. After accept the order must run to completion.
+  cancel: { from: ['placed'], to: 'cancelled' },
   // Dine-in orders finish at the table and pickup orders at the counter,
   // not at a doorstep — no rider ever marks these delivered.
   served: { from: ['ready'], to: 'delivered', counterOnly: true }
@@ -713,12 +714,13 @@ router.put(
 
     await transition(order.id, rule.to, 'restaurant_owner');
 
-    // Owner cancel after accept: COD-only today, so nothing was ever paid and
-    // there is NO refund to process. Paid orders (once Cashfree goes live)
-    // go to 'refund_pending' — never 'refunded', which is only set once a
-    // real refund has actually happened (see customer cancel in orders.js).
-    // The assigned rider (if any) is released and told, so a cancelled order
-    // never sits in a rider's active list.
+    // Owner cancel (placed only — see OWNER_TRANSITIONS): COD-only today, so
+    // nothing was ever paid and there is NO refund to process. Paid orders
+    // (once Cashfree goes live) go to 'refund_pending' — never 'refunded',
+    // which is only set once a real refund has actually happened (see
+    // customer cancel in orders.js). The assigned rider (if any) is released
+    // and told, so a cancelled order never sits in a rider's active list —
+    // defensive only now (a placed order has no rider yet).
     // Cancelled/rejected + never paid = terminal non-payable ('void').
     // 'pending' must not survive a terminal state — it reads as an
     // outstanding payment to every other consumer. Paid value differs per
