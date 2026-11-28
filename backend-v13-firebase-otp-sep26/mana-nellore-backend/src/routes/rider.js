@@ -1452,12 +1452,51 @@ router.post(
 
     // Only record payout when we could calculate it from real coordinates.
     // Never invent a payout value when location is unknown.
+    //
+    // BUG 11 (2026-11-27, trip 17f50b6a): the FULL trip payout is stored on
+    // EVERY order in the trip (trip_payout_paise, set at place time), and
+    // this handler used to insert that full amount once PER completed order
+    // — so a 2-order trip paid Rs 29.04 twice (Rs 58.08). Pickup / on_way
+    // are per-order, so the second order can legitimately complete in a
+    // separate call after the first (the "mark all delivered" loop below
+    // only covers siblings already on_way). One trip pays its trip payout
+    // exactly ONCE: insert only if no payout row exists yet for ANY order
+    // in this trip. The check + insert run in one transaction with the
+    // trip's order rows locked, so two concurrent completions cannot both
+    // slip through. Single orders have no trip_id, so the guard never
+    // matches and the payout is recorded exactly as before (Rs 20 base).
+    let payoutRecordedPaise = payout; // null when location unknown (unchanged)
     if (payout != null) {
-      await db.query(
-        `INSERT INTO rider_payouts (rider_id, order_id, amount_paise, distance_km)
-         VALUES ($1, $2, $3, $4) ON CONFLICT (order_id) DO NOTHING`,
-        [rider.id, order.id, payout, distanceKm]
-      );
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+        if (order.trip_id) {
+          await client.query('SELECT id FROM orders WHERE trip_id = $1 FOR UPDATE', [order.trip_id]);
+        } else {
+          await client.query('SELECT id FROM orders WHERE id = $1 FOR UPDATE', [order.id]);
+        }
+        const ins = await client.query(
+          `INSERT INTO rider_payouts (rider_id, order_id, amount_paise, distance_km)
+           SELECT $1, $2, $3, $4
+           WHERE NOT EXISTS (
+             SELECT 1 FROM rider_payouts rp
+             JOIN orders o2 ON o2.id = rp.order_id
+             WHERE rp.rider_id = $1 AND o2.trip_id = $5
+           )
+           ON CONFLICT (order_id) DO NOTHING`,
+          [rider.id, order.id, payout, distanceKm, order.trip_id]
+        );
+        await client.query('COMMIT');
+        payoutRecordedPaise = ins.rowCount > 0 ? payout : 0;
+        if (order.trip_id && ins.rowCount === 0) {
+          console.log(`[payout] Trip ${order.trip_id} already paid — no second payout row for order ${order.id}`);
+        }
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
       // Backfill the trip payout onto the order(s) so the offer list, detail
       // and earnings all read the same Rs 20-base value. Only when computed
       // live here — place-time values are already stored.
@@ -1511,7 +1550,10 @@ router.post(
       data: { type: 'order_status', order_id: order.id, status: 'delivered' },
     });
     await checkQuests(rider.id);
-    res.json({ ok: true, status: 'delivered', payout_paise: payout });
+    // payout_paise = amount THIS completion actually recorded (0 when the
+    // trip was already paid on a sibling order); trip_payout_paise = the
+    // full trip payout, so the client can still show the trip total.
+    res.json({ ok: true, status: 'delivered', payout_paise: payoutRecordedPaise, trip_payout_paise: payout });
   })
 );
 
